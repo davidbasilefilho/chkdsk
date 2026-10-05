@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 
@@ -228,30 +229,127 @@ def gh_json(arguments: list[str]) -> dict:
     return json.loads(result.stdout)
 
 
-def release_id_for_tag(repository: str, tag: str) -> str | None:
-    result = run(
-        ["gh", "api", "--paginate", "--slurp", f"repos/{repository}/releases"],
-        capture=True,
-    )
-    pages = json.loads(result.stdout)
-    matches = [release for page in pages for release in page if release.get("tag_name") == tag]
-    if len(matches) > 1:
-        raise RuntimeError(f"multiple GitHub releases found for tag {tag}")
-    return str(matches[0]["id"]) if matches else None
+def release_id_for_tag(repository: str, tag: str, *, retries: int = 3) -> str | None:
+    for attempt in range(retries + 1):
+        result = run(
+            ["gh", "api", "--paginate", "--slurp", f"repos/{repository}/releases"],
+            capture=True,
+        )
+        pages = json.loads(result.stdout)
+        matches = [release for page in pages for release in page if release.get("tag_name") == tag]
+        if len(matches) > 1:
+            raise RuntimeError(f"multiple GitHub releases found for tag {tag}")
+        if matches:
+            return str(matches[0]["id"])
+        if attempt < retries:
+            time.sleep(0.25 * (attempt + 1))
+    return None
 
 
-def verify_remote_assets(draft: dict, assets: list[Path]) -> None:
+def create_draft(repository: str, tag: str, sha: str, notes: str, prerelease: bool) -> dict:
+    return gh_json([
+        "--method", "POST", f"repos/{repository}/releases",
+        "-F", f"tag_name={tag}", "-F", f"target_commitish={sha}",
+        "-F", f"name={tag}", "-F", f"body={notes}",
+        "-F", "draft=true", "-F", f"prerelease={str(prerelease).lower()}",
+    ])
+
+
+def publish_draft(repository: str, release_id: str, tag: str, sha: str, prerelease: bool) -> None:
+    run([
+        "gh", "api", "--method", "PATCH", f"repos/{repository}/releases/{release_id}",
+        "-F", f"tag_name={tag}", "-F", f"name={tag}", "-F", f"target_commitish={sha}",
+        "-F", "draft=false", "-F", f"prerelease={str(prerelease).lower()}",
+    ], capture=True)
+
+
+def correct_draft_prerelease(
+    repository: str, release_id: str, tag: str, sha: str, draft: dict, prerelease: bool
+) -> None:
+    if not draft.get("draft"):
+        raise RuntimeError("cannot change prerelease status on a published release")
+    if draft.get("prerelease") is prerelease:
+        return
+    run([
+        "gh", "api", "--method", "PATCH", f"repos/{repository}/releases/{release_id}",
+        "-F", f"tag_name={tag}", "-F", f"name={tag}", "-F", f"target_commitish={sha}",
+        "-F", "draft=true", "-F", f"prerelease={str(prerelease).lower()}",
+    ], capture=True)
+
+
+def gh_json_retry(arguments: list[str], *, retries: int = 3) -> dict:
+    for attempt in range(retries + 1):
+        try:
+            return gh_json(arguments)
+        except subprocess.CalledProcessError as error:
+            if "404" not in str(error.stderr) or attempt == retries:
+                raise
+            time.sleep(0.25 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def sha256_file(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def remote_asset_matches(repository: str, tag: str, remote_asset: dict, local_path: Path) -> bool:
+    local_digest = sha256_file(local_path)
+    remote_digest = remote_asset.get("digest")
+    if isinstance(remote_digest, str) and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", remote_digest):
+        return remote_digest.lower() == f"sha256:{local_digest}"
+
+    with tempfile.TemporaryDirectory() as directory:
+        run([
+            "gh", "release", "download", tag, "--repo", repository,
+            "--pattern", local_path.name, "--dir", directory,
+        ])
+        downloaded = Path(directory) / local_path.name
+        if not downloaded.is_file():
+            raise RuntimeError(f"GitHub did not download release asset for verification: {local_path.name}")
+        return sha256_file(downloaded) == local_digest
+
+
+def verify_release_identity(release: dict, tag: str, sha: str, prerelease: bool) -> None:
+    expected = {
+        "tag_name": tag,
+        "name": tag,
+        "target_commitish": sha,
+        "prerelease": prerelease,
+    }
+    mismatches = {
+        field: (expected_value, release.get(field))
+        for field, expected_value in expected.items()
+        if release.get(field) != expected_value
+    }
+    if mismatches:
+        raise RuntimeError(f"release identity mismatch (expected, found): {mismatches}")
+
+
+def verify_remote_assets(
+    repository: str, tag: str, sha: str, draft: dict, assets: list[Path], prerelease: bool
+) -> None:
     if not draft.get("draft"):
         raise RuntimeError("new GitHub release was not retained as a draft")
+    verify_release_identity(draft, tag, sha, prerelease)
     remote_assets = draft.get("assets", [])
     remote = {asset.get("name"): asset for asset in remote_assets}
-    required = {path.name: path.stat().st_size for path in assets}
+    required_assets = {path.name: path for path in assets}
+    required = {name: path.stat().st_size for name, path in required_assets.items()}
     if set(remote) != set(required):
         raise RuntimeError(f"draft asset names mismatch: expected {sorted(required)}, found {sorted(remote)}")
     for filename, size in required.items():
         asset = remote[filename]
         if asset.get("state") != "uploaded" or asset.get("size") != size:
             raise RuntimeError(f"draft asset is incomplete: {filename}")
+        if not remote_asset_matches(repository, tag, asset, required_assets[filename]):
+            raise RuntimeError(f"draft asset content does not match the local asset: {filename}")
+
+
+def verify_published_release(release: dict, tag: str, sha: str, prerelease: bool) -> None:
+    if release.get("draft"):
+        raise RuntimeError("GitHub did not publish the verified release draft")
+    verify_release_identity(release, tag, sha, prerelease)
 
 
 def resume_remote_assets(repository: str, tag: str, draft: dict, assets: list[Path]) -> None:
@@ -271,6 +369,7 @@ def resume_remote_assets(repository: str, tag: str, draft: dict, assets: list[Pa
         if filename not in remote
         or remote[filename].get("state") != "uploaded"
         or remote[filename].get("size") != path.stat().st_size
+        or not remote_asset_matches(repository, tag, remote[filename], path)
     ]
     if to_upload:
         run(["gh", "release", "upload", tag, *(str(path) for path in to_upload),
@@ -287,27 +386,32 @@ def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> 
         raise ValueError("GITHUB_REPOSITORY is required to publish")
     notes = f"Development build for commit {sha[:7]}." if mode == "dev" else f"Stable chkdsk release {version}."
 
-    # Reuse an existing draft on retries: uploading the same names again is
-    # not idempotent. The by-tag REST endpoint omits drafts, so resolve the
-    # authenticated release list to a database ID and fetch it by ID instead.
+    prerelease = mode == "dev"
+    # Reuse an existing draft on retries. If absent, create it through the API
+    # and use the returned ID directly; release-list visibility can lag creation.
     release_id = release_id_for_tag(repository, tag)
+    created_draft = None
     if release_id is None:
-        # Create a draft before attaching anything. It becomes public only
-        # after the release API confirms the complete, uploaded asset set.
-        run(["gh", "release", "create", tag, "--draft", "--title", tag,
-             "--notes", notes, "--target", sha])
-        release_id = release_id_for_tag(repository, tag)
-        if release_id is None:
-            raise RuntimeError(f"GitHub did not return the newly created draft for tag {tag}")
+        try:
+            created_draft = create_draft(repository, tag, sha, notes, prerelease)
+            release_id = str(created_draft["id"])
+        except subprocess.CalledProcessError:
+            # A parallel retry may have created the tag after our last list
+            # response; make a bounded lookup before surfacing the API failure.
+            release_id = release_id_for_tag(repository, tag)
+            if release_id is None:
+                raise
 
-    draft = gh_json([f"repos/{repository}/releases/{release_id}"])
+    draft = created_draft or gh_json_retry([f"repos/{repository}/releases/{release_id}"])
+    correct_draft_prerelease(repository, release_id, tag, sha, draft, prerelease)
+    draft = gh_json_retry([f"repos/{repository}/releases/{release_id}"])
+    verify_release_identity(draft, tag, sha, prerelease)
     resume_remote_assets(repository, tag, draft, assets)
-    draft = gh_json([f"repos/{repository}/releases/{release_id}"])
-    verify_remote_assets(draft, assets)
-    run(["gh", "api", "--method", "PATCH", f"repos/{repository}/releases/{release_id}", "-F", "draft=false"])
-    published = gh_json([f"repos/{repository}/releases/{release_id}"])
-    if published.get("draft"):
-        raise RuntimeError("GitHub did not publish the verified release draft")
+    draft = gh_json_retry([f"repos/{repository}/releases/{release_id}"])
+    verify_remote_assets(repository, tag, sha, draft, assets, prerelease)
+    publish_draft(repository, release_id, tag, sha, prerelease)
+    published = gh_json_retry([f"repos/{repository}/releases/{release_id}"])
+    verify_published_release(published, tag, sha, prerelease)
     print(f"published verified release {tag}")
 
 
@@ -368,6 +472,7 @@ def self_check() -> None:
     global run
     original_run = run
     mock_commands: list[list[str]] = []
+    mock_capture_flags: list[bool] = []
     try:
         def mock_run(command: list[str], *, env: dict[str, str] | None = None, capture: bool = False) -> subprocess.CompletedProcess[str]:
             mock_commands.append(command)
@@ -379,11 +484,74 @@ def self_check() -> None:
 
         run = mock_run
         assert release_id_for_tag("owner/repo", "v1.2.3-dev-abcdef0") == "42"
-        assert release_id_for_tag("owner/repo", "missing") is None
+        assert release_id_for_tag("owner/repo", "missing", retries=0) is None
         assert mock_commands == [
             ["gh", "api", "--paginate", "--slurp", "repos/owner/repo/releases"],
             ["gh", "api", "--paginate", "--slurp", "repos/owner/repo/releases"],
         ]
+
+        mock_commands.clear()
+        responses = iter((json.dumps([[]]), json.dumps([[{"id": 43, "tag_name": "v1.2.3-dev-abcdef0"}]])))
+        run = lambda command, *, env=None, capture=False: (
+            mock_commands.append(command)
+            or subprocess.CompletedProcess(command, 0, stdout=next(responses), stderr="")
+        )
+        original_sleep = time.sleep
+        time.sleep = lambda _: None
+        try:
+            assert release_id_for_tag("owner/repo", "v1.2.3-dev-abcdef0", retries=1) == "43"
+            assert len(mock_commands) == 2, "release lookup did not retry once after an empty page"
+        finally:
+            time.sleep = original_sleep
+
+        mock_commands.clear()
+
+        def mock_create(command: list[str], *, env: dict[str, str] | None = None, capture: bool = False) -> subprocess.CompletedProcess[str]:
+            mock_commands.append(command)
+            mock_capture_flags.append(capture)
+            return subprocess.CompletedProcess(command, 0, stdout='{"id":99}', stderr="")
+
+        run = mock_create
+        assert create_draft("owner/repo", "v1.2.3-dev-abcdef0", sha, "notes", True)["id"] == 99
+        assert "-F" in mock_commands[0] and "prerelease=true" in mock_commands[0]
+        assert create_draft("owner/repo", "v1.2.3", sha, "notes", False)["id"] == 99
+        assert "prerelease=false" in mock_commands[1]
+        mock_commands.clear()
+        mock_capture_flags.clear()
+        dev_tag = "v1.2.3-dev-abcdef0"
+        correct_draft_prerelease(
+            "owner/repo", "99", dev_tag, sha,
+            {"draft": True, "prerelease": False}, True,
+        )
+        assert mock_commands == [[
+            "gh", "api", "--method", "PATCH", "repos/owner/repo/releases/99",
+            "-F", f"tag_name={dev_tag}", "-F", f"name={dev_tag}", "-F", f"target_commitish={sha}",
+            "-F", "draft=true", "-F", "prerelease=true",
+        ]], "existing draft mode was not corrected while retaining draft status"
+        assert mock_capture_flags == [True], "draft PATCH response was not captured"
+        mock_commands.clear()
+        mock_capture_flags.clear()
+        correct_draft_prerelease(
+            "owner/repo", "99", dev_tag, sha, {"draft": True, "prerelease": True}, True
+        )
+        assert not mock_commands, "matching draft mode should not be patched"
+        try:
+            correct_draft_prerelease(
+                "owner/repo", "99", dev_tag, sha, {"draft": False, "prerelease": False}, True
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("published release was allowed through draft mode correction")
+        publish_draft("owner/repo", "99", dev_tag, sha, True)
+        publish_draft("owner/repo", "100", "v1.2.3", sha, False)
+        assert "prerelease=true" in mock_commands[0] and "draft=false" in mock_commands[0]
+        assert f"tag_name={dev_tag}" in mock_commands[0] and f"name={dev_tag}" in mock_commands[0]
+        assert f"target_commitish={sha}" in mock_commands[0]
+        assert "prerelease=false" in mock_commands[1] and "draft=false" in mock_commands[1]
+        assert "tag_name=v1.2.3" in mock_commands[1] and "name=v1.2.3" in mock_commands[1]
+        assert f"target_commitish={sha}" in mock_commands[1]
+        assert mock_capture_flags == [True, True], "publication PATCH responses were not captured"
     finally:
         run = original_run
 
@@ -393,12 +561,31 @@ def self_check() -> None:
             path.write_bytes(content)
         remote = {
             "draft": True,
+            "prerelease": True,
+            "tag_name": "v1.2.3-dev-abcdef0",
+            "name": "v1.2.3-dev-abcdef0",
+            "target_commitish": sha,
             "assets": [
-                {"name": path.name, "size": path.stat().st_size, "state": "uploaded"}
+                {
+                    "name": path.name,
+                    "size": path.stat().st_size,
+                    "state": "uploaded",
+                    "digest": f"sha256:{sha256_file(path)}",
+                }
                 for path in asset_paths
             ],
         }
-        verify_remote_assets(remote, asset_paths)
+        verify_remote_assets("owner/repo", "v1.2.3-dev-abcdef0", sha, remote, asset_paths, True)
+        verify_remote_assets(
+            "owner/repo", "v1.2.3", sha,
+            {**remote, "prerelease": False, "tag_name": "v1.2.3", "name": "v1.2.3"},
+            asset_paths, False,
+        )
+        verify_published_release({**remote, "draft": False}, "v1.2.3-dev-abcdef0", sha, True)
+        verify_published_release(
+            {**remote, "draft": False, "prerelease": False, "tag_name": "v1.2.3", "name": "v1.2.3"},
+            "v1.2.3", sha, False,
+        )
         mock_commands.clear()
         try:
             run = lambda command, *, env=None, capture=False: (
@@ -421,15 +608,86 @@ def self_check() -> None:
                 ["gh", "release", "upload", "v1.2.3", str(asset_paths[1]), str(asset_paths[2]),
                  "--clobber", "--repo", "owner/repo"],
             ], f"unexpected draft resume commands: {mock_commands}"
+
+            mock_commands.clear()
+            corrupted = {
+                **remote,
+                "assets": [
+                    remote["assets"][0],
+                    {**remote["assets"][1], "digest": "sha256:" + "0" * 64},
+                    remote["assets"][2],
+                ],
+            }
+            resume_remote_assets("owner/repo", "v1.2.3", corrupted, asset_paths)
+            assert mock_commands == [[
+                "gh", "release", "upload", "v1.2.3", str(asset_paths[1]),
+                "--clobber", "--repo", "owner/repo",
+            ]], f"same-size corrupted asset was not replaced: {mock_commands}"
+
+            mock_commands.clear()
+            fallback_assets = [{**asset} for asset in remote["assets"]]
+            fallback_assets[0].pop("digest")
+            digest_missing = {**remote, "assets": fallback_assets}
+            local_by_name = {path.name: path for path in asset_paths}
+
+            def mock_download(command: list[str], *, env=None, capture=False):
+                mock_commands.append(command)
+                assert "--pattern" in command, command
+                name = command[command.index("--pattern") + 1]
+                directory = Path(command[command.index("--dir") + 1])
+                (directory / name).write_bytes(local_by_name[name].read_bytes())
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            run = mock_download
+            resume_remote_assets("owner/repo", "v1.2.3", digest_missing, asset_paths)
+            assert len(mock_commands) == 1 and mock_commands[0][1:3] == ["release", "download"]
+
+            mock_commands.clear()
+
+            def mock_corrupt_download(command: list[str], *, env=None, capture=False):
+                mock_commands.append(command)
+                if command[1:3] != ["release", "download"]:
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+                assert "--pattern" in command, command
+                name = command[command.index("--pattern") + 1]
+                directory = Path(command[command.index("--dir") + 1])
+                local = local_by_name[name].read_bytes()
+                (directory / name).write_bytes(bytes([local[0] ^ 1]) + local[1:])
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            run = mock_corrupt_download
+            resume_remote_assets("owner/repo", "v1.2.3", digest_missing, asset_paths)
+            assert len(mock_commands) == 2 and mock_commands[0][1:3] == ["release", "download"]
+            assert "--clobber" in mock_commands[1], "downloaded same-size corruption was not replaced"
         finally:
             run = original_run
         try:
-            verify_remote_assets({**remote, "assets": remote["assets"][:-1]}, asset_paths)
+            verify_remote_assets(
+                "owner/repo", "v1.2.3-dev-abcdef0", sha,
+                {**remote, "assets": remote["assets"][:-1]}, asset_paths, True,
+            )
         except RuntimeError:
             pass
         else:
             raise AssertionError("incomplete remote draft asset set was accepted")
-        print("release self-check passed: SemVer, asset names, target/linker mapping, paginated draft lookup, and asset resume/verification")
+        try:
+            verify_published_release(
+                {**remote, "draft": False, "prerelease": False}, "v1.2.3-dev-abcdef0", sha, True
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("published prerelease mismatch was accepted")
+        try:
+            verify_published_release(
+                {**remote, "draft": False, "tag_name": "untagged-8297"},
+                "v1.2.3-dev-abcdef0", sha, True,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("published release with a rewritten tag was accepted")
+        print("release self-check passed: lookup recovery, draft identity/prerelease repair, asset content, and publication verification")
 
 
 def main() -> int:

@@ -351,19 +351,23 @@ impl App for DashboardApp {
                     disk.computing = false;
                     if let Some(telemetry) = disk.pending_telemetry.take() {
                         let score = score_health(disk.identity.kind, &telemetry);
-                        let sample = HealthSample {
-                            disk_id: disk.identity.id.clone(),
-                            timestamp_unix_secs: next_timestamp(&state.history, disk_id),
-                            kind: disk.identity.kind,
-                            endurance_percent: telemetry.endurance_percent,
-                            power_on_hours: telemetry.power_on_hours,
-                            score: (score.outcome != HealthOutcome::Unknown).then_some(score.score),
-                        };
-                        let _ = state.history.record(sample);
-                        disk.telemetry = Some(telemetry);
-                        if let Some(writer) = &self.history_writer {
-                            let _ = writer.send(state.history.clone());
+                        if let Some(timestamp_unix_secs) = next_timestamp(&state.history, disk_id) {
+                            let sample = HealthSample {
+                                disk_id: disk.identity.id.clone(),
+                                timestamp_unix_secs,
+                                kind: disk.identity.kind,
+                                endurance_percent: telemetry.endurance_percent,
+                                power_on_hours: telemetry.power_on_hours,
+                                score: (score.outcome != HealthOutcome::Unknown)
+                                    .then_some(score.score),
+                            };
+                            if state.history.record(sample).is_ok()
+                                && let Some(writer) = &self.history_writer
+                            {
+                                let _ = writer.send(state.history.clone());
+                            }
                         }
+                        disk.telemetry = Some(telemetry);
                     }
                 }
             }
@@ -1013,13 +1017,13 @@ fn telemetry_has_usable_data(telemetry: &Telemetry) -> bool {
 }
 
 fn telemetry_status(telemetry: &Telemetry) -> &'static str {
-    if failed_permission(&telemetry.nvme)
-        || failed_permission(&telemetry.ata)
-        || failed_permission(&telemetry.overall_failure)
-    {
-        return "Permissão insuficiente para consultar o dispositivo";
-    }
     if !telemetry_has_usable_data(telemetry) {
+        if failed_permission(&telemetry.nvme)
+            || failed_permission(&telemetry.ata)
+            || failed_permission(&telemetry.overall_failure)
+        {
+            return "Permissão insuficiente para consultar o dispositivo";
+        }
         if matches!(&telemetry.nvme, QueryState::Unsupported)
             || matches!(&telemetry.ata, QueryState::Unsupported)
             || matches!(&telemetry.overall_failure, QueryState::Unsupported)
@@ -1033,6 +1037,12 @@ fn telemetry_status(telemetry: &Telemetry) -> &'static str {
             return "Falha ao ler dados SMART";
         }
         return "Dados de saúde indisponíveis";
+    }
+    if failed_permission(&telemetry.nvme)
+        || failed_permission(&telemetry.ata)
+        || failed_permission(&telemetry.overall_failure)
+    {
+        return "Dados parciais; permissão insuficiente em algumas consultas";
     }
     if matches!(&telemetry.overall_failure, QueryState::Success(true)) {
         return "O dispositivo relatou uma falha";
@@ -1248,18 +1258,22 @@ fn replace_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result
 fn replace_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
-fn next_timestamp(history: &History, disk_id: &str) -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
-    history
+fn next_timestamp(history: &History, disk_id: &str) -> Option<u64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    next_timestamp_at(history, disk_id, now)
+}
+
+fn next_timestamp_at(history: &History, disk_id: &str, now: u64) -> Option<u64> {
+    let latest = history
         .samples
         .iter()
         .filter(|sample| sample.disk_id == disk_id)
-        .map(|sample| sample.timestamp_unix_secs.saturating_add(1))
-        .max()
-        .unwrap_or(now)
-        .max(now)
+        .map(|sample| sample.timestamp_unix_secs)
+        .max();
+    match latest {
+        Some(latest) if now <= latest => None,
+        _ => Some(now),
+    }
 }
 
 #[cfg(test)]
@@ -1561,6 +1575,67 @@ mod tests {
             telemetry_status(&empty_success),
             "Leitura SMART não compatível"
         );
+    }
+
+    #[test]
+    fn partial_permission_failure_keeps_successful_score_and_warns_about_probe() {
+        let telemetry = Telemetry {
+            nvme: QueryState::Failed {
+                message: "Access is denied (5)".into(),
+            },
+            ata: QueryState::Success(crate::model::AtaHealth {
+                attributes: vec![crate::model::AtaAttribute {
+                    id: 9,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    raw: [0; 6],
+                }],
+            }),
+            endurance_percent: Some(12.0),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            score_health(DiskKind::Ssd, &telemetry).outcome,
+            HealthOutcome::Pass
+        );
+        assert_eq!(
+            telemetry_status(&telemetry),
+            "Dados parciais; permissão insuficiente em algumas consultas"
+        );
+
+        let no_data = Telemetry {
+            nvme: QueryState::Failed {
+                message: "Access is denied".into(),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            telemetry_status(&no_data),
+            "Permissão insuficiente para consultar o dispositivo"
+        );
+    }
+
+    #[test]
+    fn wall_clock_rollback_holds_history_baseline_until_time_advances() {
+        let mut history = History::default();
+        history
+            .record(HealthSample {
+                disk_id: "ssd-a".into(),
+                timestamp_unix_secs: 2_000,
+                kind: DiskKind::Ssd,
+                endurance_percent: Some(10.0),
+                power_on_hours: None,
+                score: Some(94),
+            })
+            .unwrap();
+
+        assert_eq!(next_timestamp_at(&history, "ssd-a", 1_000), None);
+        assert_eq!(next_timestamp_at(&history, "ssd-a", 2_000), None);
+        assert_eq!(next_timestamp_at(&history, "ssd-a", 2_001), Some(2_001));
+        assert_eq!(next_timestamp_at(&history, "other", 1_000), Some(1_000));
+        assert_eq!(history.estimate_endurance("ssd-a"), None);
     }
 
     #[test]
