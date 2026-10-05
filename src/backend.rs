@@ -290,15 +290,24 @@ mod windows {
         extra: &[u8],
         output_len: usize,
     ) -> Result<Vec<u8>, u32> {
-        let input_len = (8 + extra.len()).max(12).next_multiple_of(4);
-        let mut input = vec![0u8; input_len];
-        put_u32(&mut input, 0, property);
-        put_u32(&mut input, 4, PROPERTY_STANDARD_QUERY);
-        input[8..].copy_from_slice(extra);
+        let input = storage_property_input(property, extra).ok_or(87u32)?;
         let mut output = vec![0u8; output_len];
         let returned = ioctl(device, IOCTL_STORAGE_QUERY_PROPERTY, &input, &mut output)?;
         output.truncate(returned.min(output.len()));
         Ok(output)
+    }
+
+    fn storage_property_input(property: u32, extra: &[u8]) -> Option<Vec<u8>> {
+        let payload_end = 8usize.checked_add(extra.len())?;
+        let minimum_len = payload_end.max(12);
+        let input_len = minimum_len.checked_add(3)? & !3;
+        u32::try_from(input_len).ok()?;
+
+        let mut input = vec![0; input_len];
+        put_u32(&mut input, 0, property);
+        put_u32(&mut input, 4, PROPERTY_STANDARD_QUERY);
+        input.get_mut(8..payload_end)?.copy_from_slice(extra);
+        Some(input)
     }
 
     fn put_u32(buf: &mut [u8], at: usize, value: u32) {
@@ -824,6 +833,57 @@ mod windows {
             QueryState::Failed { message } => Some(message.clone()),
             QueryState::Unsupported => Some("probe is unsupported".to_owned()),
             QueryState::NotQueried | QueryState::Success(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn assert_query_header(input: &[u8], property: u32) {
+            assert_eq!(input.len() % 4, 0);
+            assert_eq!(get_u32(input, 0), Some(property));
+            assert_eq!(get_u32(input, 4), Some(PROPERTY_STANDARD_QUERY));
+        }
+
+        #[test]
+        fn storage_property_input_preserves_empty_payload_and_query_abi() {
+            let input = storage_property_input(STORAGE_DEVICE_PROPERTY, &[]).unwrap();
+
+            assert_eq!(
+                input,
+                [
+                    STORAGE_DEVICE_PROPERTY.to_le_bytes().as_slice(),
+                    PROPERTY_STANDARD_QUERY.to_le_bytes().as_slice(),
+                    &[0; 4],
+                ]
+                .concat()
+            );
+            assert_eq!(input.len(), 12);
+            assert_query_header(&input, STORAGE_DEVICE_PROPERTY);
+        }
+
+        #[test]
+        fn storage_property_input_pads_only_after_one_byte_payload() {
+            let input =
+                storage_property_input(STORAGE_DEVICE_SEEK_PENALTY_PROPERTY, &[0xA5]).unwrap();
+
+            assert_eq!(input.len(), 12);
+            assert_query_header(&input, STORAGE_DEVICE_SEEK_PENALTY_PROPERTY);
+            assert_eq!(&input[8..9], &[0xA5]);
+            assert_eq!(&input[9..], &[0; 3]);
+        }
+
+        #[test]
+        fn storage_property_input_preserves_protocol_payload_and_header_abi() {
+            let protocol: Vec<u8> = (0..40).collect();
+            let input =
+                storage_property_input(STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY, &protocol)
+                    .unwrap();
+
+            assert_eq!(input.len(), 48);
+            assert_query_header(&input, STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY);
+            assert_eq!(&input[8..], protocol);
         }
     }
 }

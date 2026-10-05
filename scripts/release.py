@@ -11,9 +11,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
-from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -228,24 +228,19 @@ def gh_json(arguments: list[str]) -> dict:
     return json.loads(result.stdout)
 
 
-def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> None:
-    name, version = manifest()
-    tag = validate_tag(mode, version, sha, supplied_tag)
-    assets = expected_assets(mode, sha, name, version, assets_dir)
-    verify_assets(assets_dir, assets)
-    repository = os.environ.get("GITHUB_REPOSITORY")
-    if not repository:
-        raise ValueError("GITHUB_REPOSITORY is required to publish")
-    notes = f"Development build for commit {sha[:7]}." if mode == "dev" else f"Stable chkdsk release {version}."
+def release_id_for_tag(repository: str, tag: str) -> str | None:
+    result = run(
+        ["gh", "release", "list", "--repo", repository, "--limit", "1000",
+         "--json", "databaseId,tagName"],
+        capture=True,
+    )
+    matches = [release for release in json.loads(result.stdout) if release.get("tagName") == tag]
+    if len(matches) > 1:
+        raise RuntimeError(f"multiple GitHub releases found for tag {tag}")
+    return str(matches[0]["databaseId"]) if matches else None
 
-    # Create a draft before attaching anything. It becomes public only after
-    # the release API confirms the complete, uploaded asset set and sizes.
-    run(["gh", "release", "create", tag, "--draft", "--title", tag,
-         "--notes", notes, "--target", sha])
-    run(["gh", "release", "upload", tag, *(str(path) for path in assets)])
 
-    route = f"repos/{repository}/releases/tags/{quote(tag, safe='')}"
-    draft = gh_json([route])
+def verify_remote_assets(draft: dict, assets: list[Path]) -> None:
     if not draft.get("draft"):
         raise RuntimeError("new GitHub release was not retained as a draft")
     remote_assets = draft.get("assets", [])
@@ -258,7 +253,33 @@ def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> 
         if asset.get("state") != "uploaded" or asset.get("size") != size:
             raise RuntimeError(f"draft asset is incomplete: {filename}")
 
-    release_id = str(draft["id"])
+
+def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> None:
+    name, version = manifest()
+    tag = validate_tag(mode, version, sha, supplied_tag)
+    assets = expected_assets(mode, sha, name, version, assets_dir)
+    verify_assets(assets_dir, assets)
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    if not repository:
+        raise ValueError("GITHUB_REPOSITORY is required to publish")
+    notes = f"Development build for commit {sha[:7]}." if mode == "dev" else f"Stable chkdsk release {version}."
+
+    # Reuse an existing draft on retries: uploading the same names again is
+    # not idempotent. The by-tag REST endpoint omits drafts, so resolve the
+    # authenticated release list to a database ID and fetch it by ID instead.
+    release_id = release_id_for_tag(repository, tag)
+    if release_id is None:
+        # Create a draft before attaching anything. It becomes public only
+        # after the release API confirms the complete, uploaded asset set.
+        run(["gh", "release", "create", tag, "--draft", "--title", tag,
+             "--notes", notes, "--target", sha])
+        release_id = release_id_for_tag(repository, tag)
+        if release_id is None:
+            raise RuntimeError(f"GitHub did not return the newly created draft for tag {tag}")
+        run(["gh", "release", "upload", tag, *(str(path) for path in assets)])
+
+    draft = gh_json([f"repos/{repository}/releases/{release_id}"])
+    verify_remote_assets(draft, assets)
     run(["gh", "api", "--method", "PATCH", f"repos/{repository}/releases/{release_id}", "-F", "draft=false"])
     published = gh_json([f"repos/{repository}/releases/{release_id}"])
     if published.get("draft"):
@@ -319,7 +340,40 @@ def self_check() -> None:
         pass
     else:
         raise AssertionError("stable mode accepted a mismatched tag")
-    print("release self-check passed: SemVer mode/tag rules, asset names, target/linker mapping")
+
+    global run
+    original_run = run
+    try:
+        run = lambda command, *, env=None, capture=False: subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps([
+                {"databaseId": 41, "tagName": "v1.2.3"},
+                {"databaseId": 42, "tagName": "v1.2.3-dev-abcdef0"},
+            ]), stderr=""
+        )
+        assert release_id_for_tag("owner/repo", "v1.2.3-dev-abcdef0") == "42"
+        assert release_id_for_tag("owner/repo", "missing") is None
+    finally:
+        run = original_run
+
+    with tempfile.TemporaryDirectory() as directory:
+        asset_paths = [Path(directory) / name for name in ("one.exe", "two.exe", "SHA256SUMS.txt")]
+        for path, content in zip(asset_paths, (b"one", b"two", b"checksums"), strict=True):
+            path.write_bytes(content)
+        remote = {
+            "draft": True,
+            "assets": [
+                {"name": path.name, "size": path.stat().st_size, "state": "uploaded"}
+                for path in asset_paths
+            ],
+        }
+        verify_remote_assets(remote, asset_paths)
+        try:
+            verify_remote_assets({**remote, "assets": remote["assets"][:-1]}, asset_paths)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("incomplete remote draft asset set was accepted")
+        print("release self-check passed: SemVer, asset names, target/linker mapping, draft lookup and complete assets")
 
 
 def main() -> int:
