@@ -1,0 +1,50 @@
+name: development release
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    env:
+      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
+      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v5
+        with:
+          install: true
+      - name: Build all development executables
+        run: mise run package-dev
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    env:
+      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
+      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v5
+        with:
+          install: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release
+      - name: Verify assets and publish the completed draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: mise run publish-dev
