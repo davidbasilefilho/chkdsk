@@ -584,6 +584,21 @@ mod windows {
         current_task_file: [u8; 8],
     }
 
+    fn ata_task_file(feature: u8, command: u8, read_sector: bool) -> [u8; 8] {
+        let mut task_file = [0; 8];
+        task_file[0] = feature;
+        if read_sector {
+            task_file[1] = 1;
+        }
+        // SMART READ DATA does not use the sector-number/LBA-low register.
+        // Leave it zero for conservative device compatibility.
+        task_file[3] = 0x4f;
+        task_file[4] = 0xc2;
+        task_file[5] = 0xa0;
+        task_file[6] = command;
+        task_file
+    }
+
     fn ata_command(
         device: &Device,
         command: u8,
@@ -593,7 +608,7 @@ mod windows {
         let header = size_of::<AtaPassThroughEx>();
         let transfer = if read_sector { 512usize } else { 0 };
         let mut buffer = vec![0u8; header + transfer];
-        let mut pass = AtaPassThroughEx {
+        let pass = AtaPassThroughEx {
             length: header as u16,
             ata_flags: if read_sector {
                 ATA_FLAGS_DATA_IN | ATA_FLAGS_DRDY_REQUIRED
@@ -609,18 +624,8 @@ mod windows {
             reserved: 0,
             data_buffer_offset: if read_sector { header } else { 0 },
             previous_task_file: [0; 8],
-            current_task_file: [0; 8],
+            current_task_file: ata_task_file(feature, command, read_sector),
         };
-        // Task-file order: features, count, sector, cylinder low/high, device, command, status.
-        pass.current_task_file[0] = feature;
-        if read_sector {
-            pass.current_task_file[1] = 1;
-            pass.current_task_file[2] = 1;
-        }
-        pass.current_task_file[3] = 0x4f;
-        pass.current_task_file[4] = 0xc2;
-        pass.current_task_file[5] = 0xa0;
-        pass.current_task_file[6] = command;
         // The only ABI cast is to the repr(C) header followed by its inline data buffer.
         unsafe {
             std::ptr::write_unaligned(buffer.as_mut_ptr().cast::<AtaPassThroughEx>(), pass);
@@ -839,6 +844,18 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn smart_data_and_return_status_task_file_fixtures_are_distinct() {
+            assert_eq!(
+                ata_task_file(ATA_SMART_READ_DATA, ATA_SMART_COMMAND, true),
+                [0xd0, 1, 0, 0x4f, 0xc2, 0xa0, 0xb0, 0]
+            );
+            assert_eq!(
+                ata_task_file(ATA_SMART_RETURN_STATUS, ATA_SMART_COMMAND, false),
+                [0xda, 0, 0, 0x4f, 0xc2, 0xa0, 0xb0, 0]
+            );
+        }
 
         fn assert_query_header(input: &[u8], property: u32) {
             assert_eq!(input.len() % 4, 0);

@@ -230,14 +230,14 @@ def gh_json(arguments: list[str]) -> dict:
 
 def release_id_for_tag(repository: str, tag: str) -> str | None:
     result = run(
-        ["gh", "release", "list", "--repo", repository, "--limit", "1000",
-         "--json", "databaseId,tagName"],
+        ["gh", "api", "--paginate", "--slurp", f"repos/{repository}/releases"],
         capture=True,
     )
-    matches = [release for release in json.loads(result.stdout) if release.get("tagName") == tag]
+    pages = json.loads(result.stdout)
+    matches = [release for page in pages for release in page if release.get("tag_name") == tag]
     if len(matches) > 1:
         raise RuntimeError(f"multiple GitHub releases found for tag {tag}")
-    return str(matches[0]["databaseId"]) if matches else None
+    return str(matches[0]["id"]) if matches else None
 
 
 def verify_remote_assets(draft: dict, assets: list[Path]) -> None:
@@ -252,6 +252,29 @@ def verify_remote_assets(draft: dict, assets: list[Path]) -> None:
         asset = remote[filename]
         if asset.get("state") != "uploaded" or asset.get("size") != size:
             raise RuntimeError(f"draft asset is incomplete: {filename}")
+
+
+def resume_remote_assets(repository: str, tag: str, draft: dict, assets: list[Path]) -> None:
+    if not draft.get("draft"):
+        raise RuntimeError("release is not a draft")
+    remote_assets = draft.get("assets", [])
+    remote = {asset.get("name"): asset for asset in remote_assets}
+    if len(remote) != len(remote_assets):
+        raise RuntimeError("draft contains duplicate asset names")
+    required = {path.name: path for path in assets}
+
+    for filename in remote.keys() - required.keys():
+        run(["gh", "release", "delete-asset", tag, filename, "--yes", "--repo", repository])
+
+    to_upload = [
+        path for filename, path in required.items()
+        if filename not in remote
+        or remote[filename].get("state") != "uploaded"
+        or remote[filename].get("size") != path.stat().st_size
+    ]
+    if to_upload:
+        run(["gh", "release", "upload", tag, *(str(path) for path in to_upload),
+             "--clobber", "--repo", repository])
 
 
 def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> None:
@@ -276,8 +299,9 @@ def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> 
         release_id = release_id_for_tag(repository, tag)
         if release_id is None:
             raise RuntimeError(f"GitHub did not return the newly created draft for tag {tag}")
-        run(["gh", "release", "upload", tag, *(str(path) for path in assets)])
 
+    draft = gh_json([f"repos/{repository}/releases/{release_id}"])
+    resume_remote_assets(repository, tag, draft, assets)
     draft = gh_json([f"repos/{repository}/releases/{release_id}"])
     verify_remote_assets(draft, assets)
     run(["gh", "api", "--method", "PATCH", f"repos/{repository}/releases/{release_id}", "-F", "draft=false"])
@@ -343,15 +367,23 @@ def self_check() -> None:
 
     global run
     original_run = run
+    mock_commands: list[list[str]] = []
     try:
-        run = lambda command, *, env=None, capture=False: subprocess.CompletedProcess(
-            command, 0, stdout=json.dumps([
-                {"databaseId": 41, "tagName": "v1.2.3"},
-                {"databaseId": 42, "tagName": "v1.2.3-dev-abcdef0"},
-            ]), stderr=""
-        )
+        def mock_run(command: list[str], *, env: dict[str, str] | None = None, capture: bool = False) -> subprocess.CompletedProcess[str]:
+            mock_commands.append(command)
+            response = json.dumps([[
+                {"id": 41, "tag_name": "v1.2.3"},
+                {"id": 42, "tag_name": "v1.2.3-dev-abcdef0"},
+            ]]) if len(mock_commands) == 1 else json.dumps([[]])
+            return subprocess.CompletedProcess(command, 0, stdout=response, stderr="")
+
+        run = mock_run
         assert release_id_for_tag("owner/repo", "v1.2.3-dev-abcdef0") == "42"
         assert release_id_for_tag("owner/repo", "missing") is None
+        assert mock_commands == [
+            ["gh", "api", "--paginate", "--slurp", "repos/owner/repo/releases"],
+            ["gh", "api", "--paginate", "--slurp", "repos/owner/repo/releases"],
+        ]
     finally:
         run = original_run
 
@@ -367,13 +399,37 @@ def self_check() -> None:
             ],
         }
         verify_remote_assets(remote, asset_paths)
+        mock_commands.clear()
+        try:
+            run = lambda command, *, env=None, capture=False: (
+                mock_commands.append(command) or subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            )
+            resume_remote_assets("owner/repo", "v1.2.3", remote, asset_paths)
+            assert not mock_commands, "complete assets should not be re-uploaded"
+
+            partial = {
+                "draft": True,
+                "assets": [
+                    remote["assets"][0],
+                    {**remote["assets"][1], "size": 1},
+                    {"name": "obsolete.txt", "size": 1, "state": "uploaded"},
+                ],
+            }
+            resume_remote_assets("owner/repo", "v1.2.3", partial, asset_paths)
+            assert mock_commands == [
+                ["gh", "release", "delete-asset", "v1.2.3", "obsolete.txt", "--yes", "--repo", "owner/repo"],
+                ["gh", "release", "upload", "v1.2.3", str(asset_paths[1]), str(asset_paths[2]),
+                 "--clobber", "--repo", "owner/repo"],
+            ], f"unexpected draft resume commands: {mock_commands}"
+        finally:
+            run = original_run
         try:
             verify_remote_assets({**remote, "assets": remote["assets"][:-1]}, asset_paths)
         except RuntimeError:
             pass
         else:
             raise AssertionError("incomplete remote draft asset set was accepted")
-        print("release self-check passed: SemVer, asset names, target/linker mapping, draft lookup and complete assets")
+        print("release self-check passed: SemVer, asset names, target/linker mapping, paginated draft lookup, and asset resume/verification")
 
 
 def main() -> int:
