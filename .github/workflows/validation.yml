@@ -1,0 +1,21 @@
+name: validation
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  validation:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    env:
+      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
+      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v5
+        with:
+          install: true
+      - run: mise run validation

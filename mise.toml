@@ -1,0 +1,80 @@
+[tools]
+rust = { version = "stable", components = ["rustfmt", "clippy"], targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc", "i686-pc-windows-msvc"] }
+python = "3.12"
+"github:llvm/llvm-project" = { version = "llvmorg-23.1.2", matching = "clang+llvm", matching_regex = "\\.tar\\.xz$" }
+prek = "latest"
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.clippy]
+description = "Lint every target and feature for x64, ARM64, and x86"
+run = "python scripts/release.py clippy"
+
+[tasks.tests]
+description = "Run the complete x64 Windows test suite"
+run = "python scripts/release.py tests"
+
+[tasks.compile]
+description = "Compile every Cargo target and feature for x64, ARM64, and x86"
+run = "python scripts/release.py compile"
+
+[tasks.release-check]
+description = "Self-check release naming and Windows target mapping"
+run = "python scripts/release.py self-check"
+
+[tasks.linker-check]
+description = "Verify the x64, ARM64, and x86 MSVC environment and linkers"
+run = "python scripts/release.py linker-check"
+
+[tasks.validation]
+description = "Run formatting, lint, tests, all-architecture compilation, and release checks"
+run = [
+  { task = "fmt" },
+  { task = "release-check" },
+  { task = "linker-check" },
+  { task = "clippy" },
+  { task = "tests" },
+  { task = "compile" },
+]
+
+[tasks.setup-hook]
+description = "Install the repository pre-commit hook"
+run = "prek install"
+
+[tasks.release]
+description = "Build optimized x64-baseline, ARM64, and x86 executables"
+run = [
+  { task = "release-x64-baseline" },
+  { task = "release-arm64" },
+  { task = "release-x86" },
+]
+
+[tasks.release-x64-baseline]
+description = "Build the optimized x64-baseline executable"
+run = "python scripts/release.py build --architecture x64"
+
+[tasks.release-arm64]
+description = "Build the optimized ARM64 executable"
+run = "python scripts/release.py build --architecture arm64"
+
+[tasks.release-x86]
+description = "Build the optimized x86 executable"
+run = "python scripts/release.py build --architecture x86"
+
+[tasks.package-dev]
+description = "Package the complete development release using the current commit"
+run = 'python scripts/release.py package --mode dev --sha "{{ env.GITHUB_SHA }}" --output dist/release'
+
+[tasks.publish-dev]
+description = "Verify and publish the development release for the current commit"
+run = 'python scripts/release.py publish --mode dev --sha "{{ env.GITHUB_SHA }}" --assets-dir dist/release'
+
+[tasks.package-stable]
+description = "Validate the current tag and package the complete stable release"
+run = 'python scripts/release.py package --mode stable --tag "{{ env.GITHUB_REF_NAME }}" --sha "{{ env.GITHUB_SHA }}" --output dist/release'
+
+[tasks.publish-stable]
+description = "Verify and publish the stable release for the current tag and commit"
+run = 'python scripts/release.py publish --mode stable --tag "{{ env.GITHUB_REF_NAME }}" --sha "{{ env.GITHUB_SHA }}" --assets-dir dist/release'
