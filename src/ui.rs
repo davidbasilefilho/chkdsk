@@ -946,7 +946,10 @@ fn render_disk(
                 HealthOutcome::Unknown => ("SAÚDE INDISPONÍVEL".into(), MOCHA_YELLOW),
             };
             let mut compact = vec![(summary, color, true)];
-            if let Some(eta) = lines.get(9) {
+            if let Some(eta) = lines
+                .iter()
+                .find(|(text, _, _)| text.starts_with("Vida estimada"))
+            {
                 compact.push(eta.clone());
             }
             compact.extend(lines.iter().take(2).cloned());
@@ -1648,6 +1651,76 @@ mod tests {
         assert_eq!(next_timestamp_at(&history, "ssd-a", 2_001), Some(2_001));
         assert_eq!(next_timestamp_at(&history, "other", 1_000), Some(1_000));
         assert_eq!(history.estimate_endurance("ssd-a"), None);
+    }
+
+    #[test]
+    fn unknown_health_keeps_historical_eta_in_compact_and_normal_views() {
+        let mut history = History::default();
+        for (timestamp, wear) in [(1_000_000, 10.0), (1_086_400, 11.0)] {
+            history
+                .record(HealthSample {
+                    disk_id: "test".into(),
+                    timestamp_unix_secs: timestamp,
+                    kind: DiskKind::Nvme,
+                    endurance_percent: Some(wear),
+                    power_on_hours: None,
+                    score: None,
+                })
+                .unwrap();
+        }
+
+        for (width, height, querying) in [(12, 8, false), (12, 8, true), (64, 20, false)] {
+            let state = Dashboard {
+                disks: vec![DiskView {
+                    identity: identity("test", 0),
+                    telemetry: Some(Telemetry::default()),
+                    querying,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                }],
+                history: history.clone(),
+                ..Default::default()
+            };
+            let mut app = DashboardApp {
+                started: true,
+                ..Default::default()
+            };
+            let mut global = test_global_data(state, width, height);
+            let pipeline = app
+                .app_render(
+                    &mut global,
+                    &mut ComponentRegistryMap::default(),
+                    &mut HasFocus::default(),
+                )
+                .unwrap();
+            let size = r3bl_tui::Size::new((
+                r3bl_tui::ColWidth::new(width),
+                r3bl_tui::RowHeight::new(height),
+            ));
+            let mut buffer = r3bl_tui::OffscreenBuffer::new_empty(size);
+            pipeline.compose_render_ops_into_ofs_buf(
+                size,
+                &mut buffer,
+                &mut r3bl_tui::MemoizedLenMap::default(),
+            );
+            let rendered = buffer
+                .iter()
+                .map(|line| {
+                    line.iter()
+                        .map(|pixel| match pixel {
+                            r3bl_tui::PixelChar::PlainText { display_char, .. } => *display_char,
+                            _ => ' ',
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                rendered.contains("Vida estima"),
+                "{width}x{height}: {rendered}"
+            );
+        }
     }
 
     #[test]
