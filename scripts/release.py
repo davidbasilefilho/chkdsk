@@ -326,14 +326,11 @@ def verify_release_identity(release: dict, tag: str, sha: str, prerelease: bool)
         raise RuntimeError(f"release identity mismatch (expected, found): {mismatches}")
 
 
-def verify_remote_assets(
-    repository: str, tag: str, sha: str, draft: dict, assets: list[Path], prerelease: bool
-) -> None:
-    if not draft.get("draft"):
-        raise RuntimeError("new GitHub release was not retained as a draft")
-    verify_release_identity(draft, tag, sha, prerelease)
-    remote_assets = draft.get("assets", [])
+def verify_release_assets(repository: str, tag: str, release: dict, assets: list[Path]) -> None:
+    remote_assets = release.get("assets", [])
     remote = {asset.get("name"): asset for asset in remote_assets}
+    if len(remote) != len(remote_assets):
+        raise RuntimeError("release contains duplicate asset names")
     required_assets = {path.name: path for path in assets}
     required = {name: path.stat().st_size for name, path in required_assets.items()}
     if set(remote) != set(required):
@@ -341,15 +338,34 @@ def verify_remote_assets(
     for filename, size in required.items():
         asset = remote[filename]
         if asset.get("state") != "uploaded" or asset.get("size") != size:
-            raise RuntimeError(f"draft asset is incomplete: {filename}")
+            raise RuntimeError(f"release asset is incomplete: {filename}")
         if not remote_asset_matches(repository, tag, asset, required_assets[filename]):
-            raise RuntimeError(f"draft asset content does not match the local asset: {filename}")
+            raise RuntimeError(f"release asset content does not match the local asset: {filename}")
+
+
+def verify_remote_assets(
+    repository: str, tag: str, sha: str, draft: dict, assets: list[Path], prerelease: bool
+) -> None:
+    if not draft.get("draft"):
+        raise RuntimeError("new GitHub release was not retained as a draft")
+    verify_release_identity(draft, tag, sha, prerelease)
+    verify_release_assets(repository, tag, draft, assets)
 
 
 def verify_published_release(release: dict, tag: str, sha: str, prerelease: bool) -> None:
     if release.get("draft"):
         raise RuntimeError("GitHub did not publish the verified release draft")
     verify_release_identity(release, tag, sha, prerelease)
+
+
+def verify_existing_published_release(
+    repository: str, tag: str, sha: str, release: dict, assets: list[Path], prerelease: bool
+) -> bool:
+    if release.get("draft"):
+        return False
+    verify_published_release(release, tag, sha, prerelease)
+    verify_release_assets(repository, tag, release, assets)
+    return True
 
 
 def resume_remote_assets(repository: str, tag: str, draft: dict, assets: list[Path]) -> None:
@@ -403,6 +419,9 @@ def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> 
                 raise
 
     draft = created_draft or gh_json_retry([f"repos/{repository}/releases/{release_id}"])
+    if verify_existing_published_release(repository, tag, sha, draft, assets, prerelease):
+        print(f"verified already-published release {tag}")
+        return
     correct_draft_prerelease(repository, release_id, tag, sha, draft, prerelease)
     draft = gh_json_retry([f"repos/{repository}/releases/{release_id}"])
     verify_release_identity(draft, tag, sha, prerelease)
@@ -587,6 +606,30 @@ def self_check() -> None:
             "v1.2.3", sha, False,
         )
         mock_commands.clear()
+        already_published = {**remote, "draft": False}
+        assert verify_existing_published_release(
+            "owner/repo", "v1.2.3-dev-abcdef0", sha, already_published, asset_paths, True
+        ), "a matching published release was not reused"
+        assert not mock_commands, "verifying an already-published release mutated or downloaded anything"
+        try:
+            verify_existing_published_release(
+                "owner/repo", "v1.2.3-dev-abcdef0", sha,
+                {
+                    **already_published,
+                    "assets": [
+                        remote["assets"][0],
+                        {**remote["assets"][1], "digest": "sha256:" + "0" * 64},
+                        remote["assets"][2],
+                    ],
+                },
+                asset_paths,
+                True,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("published release with corrupted same-size asset was reused")
+        assert not mock_commands, "digest-based published-release verification caused a write"
         try:
             run = lambda command, *, env=None, capture=False: (
                 mock_commands.append(command) or subprocess.CompletedProcess(command, 0, stdout="", stderr="")

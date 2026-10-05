@@ -852,8 +852,8 @@ fn render_disk(
             .estimate_endurance(&disk.identity.id)
             .map(|estimate| {
                 format!(
-                    "Vida estimada  {} dias",
-                    (estimate.remaining_seconds / 86_400).max(1)
+                    "Vida estimada  {}",
+                    format_endurance_days(estimate.remaining_seconds)
                 )
             })
             .unwrap_or_else(|| "Vida estimada  aguardando histórico".into());
@@ -1181,6 +1181,15 @@ fn format_duration(seconds: u64) -> String {
     }
 }
 
+fn format_endurance_days(remaining_seconds: u64) -> String {
+    let days = remaining_seconds / 86_400;
+    if days == 1 {
+        "1 dia".into()
+    } else {
+        format!("{days} dias")
+    }
+}
+
 fn history_path() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
@@ -1378,6 +1387,9 @@ mod tests {
     fn ui_generated_messages_are_brazilian_portuguese() {
         assert_eq!(format_duration(86_400), "1 dia");
         assert_eq!(format_duration(366 * 86_400), "1 ano");
+        assert_eq!(format_endurance_days(0), "0 dias");
+        assert_eq!(format_endurance_days(86_400), "1 dia");
+        assert_eq!(format_endurance_days(3 * 86_400), "3 dias");
         assert_eq!(compact_number(1_234_567), "1,2 mi");
         let disk = DiskView {
             identity: DiskIdentity {

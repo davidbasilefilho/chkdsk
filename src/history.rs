@@ -269,15 +269,30 @@ impl History {
         let points = &points[segment_start..];
         let first = *points.first()?;
         let last = *points.last()?;
+        let initial = first.endurance_percent?;
+        let current = last.endurance_percent?;
         let elapsed = last
             .timestamp_unix_secs
             .checked_sub(first.timestamp_unix_secs)?;
+        let increase = current - initial;
+        // Rated endurance is exhausted at 100% wear-used. Report that endpoint
+        // directly even when there is not enough history to establish a trend;
+        // this is not a prediction of device failure.
+        if current >= 100.0 {
+            let wear_percent_per_day = if elapsed > 0 && increase > 0.0 {
+                increase / elapsed as f64 * 86_400.0
+            } else {
+                0.0
+            };
+            return Some(EnduranceEstimate {
+                remaining_seconds: 0,
+                wear_percent_per_day,
+                samples_used: points.len(),
+            });
+        }
         if elapsed == 0 {
             return None;
         }
-        let initial = first.endurance_percent?;
-        let current = last.endurance_percent?;
-        let increase = current - initial;
         // Repeated or non-increasing readings do not establish a trend. A
         // regression was already handled as a new counter baseline above.
         if increase <= 0.0 {
@@ -354,6 +369,21 @@ mod tests {
         assert_eq!(eta.remaining_seconds, 88 * 86_400);
         assert_eq!(eta.samples_used, 3);
         assert!(history.estimate_endurance("missing").is_none());
+    }
+
+    #[test]
+    fn exhausted_rated_endurance_has_zero_eta_without_a_trend() {
+        for wear in [100.0, 101.0, 255.0] {
+            let mut history = History::default();
+            history
+                .record(sample("ssd-a", 1_000_000, DiskKind::Nvme, Some(wear), None))
+                .unwrap();
+
+            let estimate = history.estimate_endurance("ssd-a").unwrap();
+            assert_eq!(estimate.remaining_seconds, 0, "wear={wear}");
+            assert_eq!(estimate.wear_percent_per_day, 0.0, "wear={wear}");
+            assert_eq!(estimate.samples_used, 1, "wear={wear}");
+        }
     }
 
     #[test]
