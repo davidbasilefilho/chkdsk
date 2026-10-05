@@ -133,6 +133,8 @@ mod windows {
     const NVME_LOG_PAGE_HEALTH_INFO: u32 = 2;
     const ATA_FLAGS_DRDY_REQUIRED: u16 = 0x01;
     const ATA_FLAGS_DATA_IN: u16 = 0x02;
+    const ATA_STATUS_ERR: u8 = 0x01;
+    const ATA_STATUS_DF: u8 = 0x20;
     const ATA_SMART_COMMAND: u8 = 0xb0;
     const ATA_SMART_READ_DATA: u8 = 0xd0;
     const ATA_SMART_RETURN_STATUS: u8 = 0xda;
@@ -584,6 +586,45 @@ mod windows {
         current_task_file: [u8; 8],
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum AtaCommandError {
+        Io(u32),
+        ShortResponse,
+        Device { status: u8, error: u8 },
+    }
+
+    impl AtaCommandError {
+        fn code(self) -> u32 {
+            match self {
+                Self::Io(code) => code,
+                Self::ShortResponse => 13,
+                Self::Device { .. } => 31,
+            }
+        }
+
+        fn message(self) -> String {
+            match self {
+                Self::Io(code) => io::Error::from_raw_os_error(code as i32).to_string(),
+                Self::ShortResponse => "ATA pass-through returned an incomplete response".into(),
+                Self::Device { status, error } => {
+                    format!("ATA command failed (status 0x{status:02x}, error 0x{error:02x})")
+                }
+            }
+        }
+    }
+
+    fn ata_completion_error(task_file: &[u8; 8]) -> Option<AtaCommandError> {
+        let status = task_file[6];
+        if status & (ATA_STATUS_ERR | ATA_STATUS_DF) != 0 {
+            Some(AtaCommandError::Device {
+                status,
+                error: task_file[0],
+            })
+        } else {
+            None
+        }
+    }
+
     fn ata_task_file(feature: u8, command: u8, read_sector: bool) -> [u8; 8] {
         let mut task_file = [0; 8];
         task_file[0] = feature;
@@ -604,7 +645,7 @@ mod windows {
         command: u8,
         feature: u8,
         read_sector: bool,
-    ) -> Result<(Vec<u8>, AtaPassThroughEx), u32> {
+    ) -> Result<(Vec<u8>, AtaPassThroughEx), AtaCommandError> {
         let header = size_of::<AtaPassThroughEx>();
         let transfer = if read_sector { 512usize } else { 0 };
         let mut buffer = vec![0u8; header + transfer];
@@ -630,16 +671,29 @@ mod windows {
         unsafe {
             std::ptr::write_unaligned(buffer.as_mut_ptr().cast::<AtaPassThroughEx>(), pass);
         }
-        let returned_bytes = ioctl_inout(device, IOCTL_ATA_PASS_THROUGH, &mut buffer)?;
-        if returned_bytes < header + transfer {
-            return Err(13);
+        let returned_bytes = ioctl_inout(device, IOCTL_ATA_PASS_THROUGH, &mut buffer, header)
+            .map_err(AtaCommandError::Io)?;
+        if returned_bytes < header {
+            return Err(AtaCommandError::ShortResponse);
         }
         let returned =
             unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<AtaPassThroughEx>()) };
+        if let Some(error) = ata_completion_error(&returned.current_task_file) {
+            return Err(error);
+        }
+        if returned_bytes < header + transfer || (returned.data_transfer_length as usize) < transfer
+        {
+            return Err(AtaCommandError::ShortResponse);
+        }
         Ok((buffer.get(header..).unwrap_or_default().to_vec(), returned))
     }
 
-    fn ioctl_inout(device: &Device, code: u32, buffer: &mut [u8]) -> Result<usize, u32> {
+    fn ioctl_inout(
+        device: &Device,
+        code: u32,
+        buffer: &mut [u8],
+        input_length: usize,
+    ) -> Result<usize, u32> {
         let mut returned = 0u32;
         let ok = unsafe {
             let ptr = buffer.as_mut_ptr().cast::<c_void>();
@@ -647,7 +701,7 @@ mod windows {
                 device.0,
                 code,
                 ptr,
-                buffer.len() as u32,
+                input_length as u32,
                 ptr,
                 buffer.len() as u32,
                 &mut returned,
@@ -699,17 +753,17 @@ mod windows {
         parse::parse_nvme_health_log(&output[start..end]).map_err(|_| 13)
     }
 
-    fn ata_health(device: &Device) -> Result<crate::model::AtaHealth, u32> {
+    fn ata_health(device: &Device) -> Result<crate::model::AtaHealth, AtaCommandError> {
         let (sector, _) = ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_DATA, true)?;
-        parse::parse_ata_smart_data(&sector).map_err(|_| 13)
+        parse::parse_ata_smart_data(&sector).map_err(|_| AtaCommandError::ShortResponse)
     }
 
-    fn ata_failure_status(device: &Device) -> Result<bool, u32> {
+    fn ata_failure_status(device: &Device) -> Result<bool, AtaCommandError> {
         let (_, pass) = ata_command(device, ATA_SMART_COMMAND, ATA_SMART_RETURN_STATUS, false)?;
         match (pass.current_task_file[3], pass.current_task_file[4]) {
             (0x4f, 0xc2) => Ok(false),
             (0xf4, 0x2c) => Ok(true),
-            _ => Err(13),
+            _ => Err(AtaCommandError::ShortResponse),
         }
     }
 
@@ -755,12 +809,13 @@ mod windows {
         match ata_health(&device) {
             Ok(health) => telemetry.ata = QueryState::Success(health),
             Err(code) => {
-                probe_errors.push(classify(code));
-                telemetry.ata = if matches!(classify(code), QueryErrorState::Unsupported) {
+                let state = classify(code.code());
+                probe_errors.push(state);
+                telemetry.ata = if matches!(state, QueryErrorState::Unsupported) {
                     QueryState::Unsupported
                 } else {
                     QueryState::Failed {
-                        message: io::Error::from_raw_os_error(code as i32).to_string(),
+                        message: code.message(),
                     }
                 }
             }
@@ -773,8 +828,8 @@ mod windows {
                     telemetry.overall_failure = QueryState::Success(failed);
                 }
                 Err(legacy_error) => {
-                    let code = if classify(ata_error) == QueryErrorState::Permission {
-                        ata_error
+                    let code = if classify(ata_error.code()) == QueryErrorState::Permission {
+                        ata_error.code()
                     } else {
                         legacy_error
                     };
@@ -855,6 +910,33 @@ mod windows {
                 ata_task_file(ATA_SMART_RETURN_STATUS, ATA_SMART_COMMAND, false),
                 [0xda, 0, 0, 0x4f, 0xc2, 0xa0, 0xb0, 0]
             );
+        }
+
+        #[test]
+        fn ata_error_and_status_output_registers_reject_failed_completions() {
+            let rejected_read_data = [0x04, 1, 0, 0x4f, 0xc2, 0xa0, 0x51, 0];
+            assert_eq!(
+                ata_completion_error(&rejected_read_data),
+                Some(AtaCommandError::Device {
+                    status: 0x51,
+                    error: 0x04,
+                })
+            );
+
+            let rejected_return_status = [0x40, 0, 0, 0xf4, 0x2c, 0xa0, 0x60, 0];
+            assert_eq!(
+                ata_completion_error(&rejected_return_status),
+                Some(AtaCommandError::Device {
+                    status: 0x60,
+                    error: 0x40,
+                })
+            );
+        }
+
+        #[test]
+        fn stale_error_register_does_not_reject_clean_ata_status() {
+            let clean_completion = [0x04, 0, 0, 0x4f, 0xc2, 0xa0, 0x50, 0];
+            assert_eq!(ata_completion_error(&clean_completion), None);
         }
 
         fn assert_query_header(input: &[u8], property: u32) {
