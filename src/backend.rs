@@ -632,14 +632,19 @@ mod windows {
         task_file[0] = feature;
         if read_sector {
             task_file[1] = 1;
+            task_file[2] = smart_sector_number(feature);
         }
-        // SMART READ DATA does not use the sector-number/LBA-low register.
-        // Leave it zero for conservative device compatibility.
         task_file[3] = 0x4f;
         task_file[4] = 0xc2;
         task_file[5] = 0xa0;
         task_file[6] = command;
         task_file
+    }
+
+    fn smart_sector_number(feature: u8) -> u8 {
+        // Use sector number 1 for D1 threshold reads, but 0 for D0 data reads.
+        // Keep the command-specific inputs aligned across both Windows IOCTLs.
+        u8::from(feature == ATA_SMART_READ_THRESHOLDS)
     }
 
     fn ata_command(
@@ -761,6 +766,7 @@ mod windows {
         put_u32(&mut input, 0, 512);
         input[4] = feature;
         input[5] = 1; // SMART READ DATA / THRESHOLDS sector count.
+        input[6] = smart_sector_number(feature); // Sector Number / LBA Low.
         input[7] = 0x4f;
         input[8] = 0xc2;
         input[9] = 0xa0;
@@ -978,7 +984,7 @@ mod windows {
             );
             assert_eq!(
                 ata_task_file(ATA_SMART_READ_THRESHOLDS, ATA_SMART_COMMAND, true),
-                [0xd1, 1, 0, 0x4f, 0xc2, 0xa0, 0xb0, 0]
+                [0xd1, 1, 1, 0x4f, 0xc2, 0xa0, 0xb0, 0]
             );
         }
 
@@ -1006,22 +1012,26 @@ mod windows {
         #[test]
         fn legacy_smart_receive_header_uses_documented_sector_request() {
             assert_eq!(IOCTL_SMART_RCV_DRIVE_DATA, 508040);
-            let input = legacy_smart_input(ATA_SMART_READ_THRESHOLDS);
-            assert_eq!(input.len(), 32);
-            assert_eq!(get_u32(&input, 0), Some(512));
-            assert_eq!(
-                &input[4..12],
-                &[
-                    ATA_SMART_READ_THRESHOLDS,
-                    1,
-                    0,
-                    0x4f,
-                    0xc2,
-                    0xa0,
-                    ATA_SMART_COMMAND,
-                    0
-                ]
-            );
+            for (feature, sector_number) in
+                [(ATA_SMART_READ_DATA, 0), (ATA_SMART_READ_THRESHOLDS, 1)]
+            {
+                let input = legacy_smart_input(feature);
+                assert_eq!(input.len(), 32);
+                assert_eq!(get_u32(&input, 0), Some(512));
+                assert_eq!(
+                    &input[4..12],
+                    &[
+                        feature,
+                        1,
+                        sector_number,
+                        0x4f,
+                        0xc2,
+                        0xa0,
+                        ATA_SMART_COMMAND,
+                        0
+                    ]
+                );
+            }
         }
 
         #[test]

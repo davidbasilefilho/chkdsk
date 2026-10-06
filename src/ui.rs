@@ -279,6 +279,8 @@ impl App for DashboardApp {
         _components: &mut ComponentRegistryMap<Dashboard, AppSignal>,
         _focus: &mut HasFocus,
     ) -> CommonResult<EventPropagation> {
+        let width: usize = (*global.window_size.col_width).into();
+        let height: usize = (*global.window_size.row_height).into();
         let state = &mut global.state;
         match signal {
             AppSignal::Discovered {
@@ -293,6 +295,7 @@ impl App for DashboardApp {
                     .disks
                     .get(state.selected)
                     .map(|disk| disk.identity.id.clone());
+                let previous_selection = state.selected;
                 let previous = std::mem::take(&mut state.disks);
                 state.disks = disks
                     .iter()
@@ -312,15 +315,22 @@ impl App for DashboardApp {
                         }
                     })
                     .collect();
-                state.selected = old_id
-                    .and_then(|id| state.disks.iter().position(|disk| disk.identity.id == id))
-                    .unwrap_or(0)
+                let preserved_selection = old_id
+                    .as_ref()
+                    .and_then(|id| state.disks.iter().position(|disk| disk.identity.id == *id));
+                if preserved_selection.is_none() {
+                    state.content_scroll = 0;
+                }
+                state.selected = preserved_selection
+                    .unwrap_or(previous_selection)
                     .min(state.disks.len().saturating_sub(1));
                 state.notice = if state.disks.is_empty() {
                     Some("Nenhum disco encontrado".into())
                 } else {
                     None
                 };
+                clamp_tab_scroll(state, width, height);
+                ensure_selected_visible(state, width, height);
             }
             AppSignal::Discovered {
                 generation,
@@ -632,6 +642,21 @@ fn ensure_selected_visible(state: &mut Dashboard, width: usize, height: usize) {
     } else {
         state.scroll = state.selected;
     }
+}
+
+fn clamp_tab_scroll(state: &mut Dashboard, width: usize, height: usize) {
+    let disk_count = state.disks.len();
+    if disk_count == 0 {
+        state.scroll = 0;
+        return;
+    }
+    let visible_count = Layout::new(width, height, disk_count, 0).tab_indices.len();
+    let max_scroll = if visible_count == 0 {
+        disk_count - 1
+    } else {
+        disk_count.saturating_sub(visible_count)
+    };
+    state.scroll = state.scroll.min(max_scroll);
 }
 
 const MAX_CONCURRENT_DISK_QUERIES: usize = 4;
@@ -1803,6 +1828,20 @@ mod tests {
         .unwrap()
     }
 
+    fn dispatch_signal(
+        app: &mut DashboardApp,
+        global: &mut GlobalData<Dashboard, AppSignal>,
+        signal: AppSignal,
+    ) -> EventPropagation {
+        app.app_handle_signal(
+            &signal,
+            global,
+            &mut ComponentRegistryMap::default(),
+            &mut HasFocus::default(),
+        )
+        .unwrap()
+    }
+
     fn rendered_text(
         app: &mut DashboardApp,
         global: &mut GlobalData<Dashboard, AppSignal>,
@@ -2176,6 +2215,168 @@ mod tests {
         );
         assert!(
             matches!(buffer[1][24], r3bl_tui::PixelChar::PlainText { style, .. } if style.color_bg == Some(TuiColor::Rgb(TOKYO_BG_HIGHLIGHT)))
+        );
+    }
+
+    #[test]
+    fn discovery_reorder_and_removal_preserve_shared_selection_and_reveal_its_tab() {
+        let disks = (0..9)
+            .map(|index| {
+                let mut disk_identity = identity(&format!("disk-{index}"), index);
+                let telemetry = if index == 5 {
+                    disk_identity.kind = DiskKind::Hdd;
+                    Some(Telemetry {
+                        overall_failure: QueryState::Success(false),
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                };
+                DiskView {
+                    identity: disk_identity,
+                    telemetry,
+                    querying: false,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                }
+            })
+            .collect();
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(
+            Dashboard {
+                disks,
+                selected: 5,
+                scroll: 4,
+                ..Default::default()
+            },
+            100,
+            10,
+        );
+
+        assert_eq!(Layout::new(100, 10, 9, 4).tab_at(24, 1), Some(5));
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(MouseInputKind::MouseDown(Button::Left), 24, 1),
+        );
+        assert_eq!(
+            global.state.disks[global.state.selected].identity.id,
+            "disk-5"
+        );
+        for _ in 0..2 {
+            dispatch_input(
+                &mut app,
+                &mut global,
+                InputEvent::Keyboard(KeyPress::Plain {
+                    key: Key::SpecialKey(SpecialKey::Down),
+                }),
+            );
+        }
+        assert_eq!(global.state.content_scroll, 2);
+
+        let reordered = [5, 0, 1, 2, 3, 4, 6, 7, 8]
+            .into_iter()
+            .map(|index| {
+                let mut disk_identity = identity(&format!("disk-{index}"), index);
+                if index == 5 {
+                    disk_identity.kind = DiskKind::Hdd;
+                }
+                disk_identity
+            })
+            .collect();
+        assert!(matches!(
+            dispatch_signal(
+                &mut app,
+                &mut global,
+                AppSignal::Discovered {
+                    generation: 1,
+                    result: Ok(reordered),
+                },
+            ),
+            EventPropagation::ConsumedRender
+        ));
+        assert_eq!(
+            global.state.disks[global.state.selected].identity.id,
+            "disk-5"
+        );
+        assert_eq!(global.state.selected, 0);
+        assert_eq!(global.state.scroll, 0);
+        assert_eq!(global.state.content_scroll, 2);
+        assert!(
+            Layout::new(100, 10, 9, global.state.scroll)
+                .tab_indices
+                .contains(&global.state.selected)
+        );
+        assert!(
+            rendered_text(&mut app, &mut global)
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("> Disco #5")
+        );
+
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::SpecialKey(SpecialKey::Right),
+            }),
+        );
+        assert_eq!(
+            global.state.disks[global.state.selected].identity.id,
+            "disk-0"
+        );
+
+        global.state.disks[global.state.selected].identity.kind = DiskKind::Hdd;
+        global.state.disks[global.state.selected].telemetry = Some(Telemetry {
+            overall_failure: QueryState::Success(false),
+            ..Default::default()
+        });
+        for _ in 0..2 {
+            dispatch_input(
+                &mut app,
+                &mut global,
+                InputEvent::Keyboard(KeyPress::Plain {
+                    key: Key::SpecialKey(SpecialKey::Down),
+                }),
+            );
+        }
+        assert_eq!(global.state.content_scroll, 2);
+
+        global.state.scroll = 4;
+        let removed_selection = [5, 1, 2, 3, 4, 6, 7, 8]
+            .into_iter()
+            .map(|index| {
+                let mut disk_identity = identity(&format!("disk-{index}"), index);
+                if index == 5 {
+                    disk_identity.kind = DiskKind::Hdd;
+                }
+                disk_identity
+            })
+            .collect();
+        dispatch_signal(
+            &mut app,
+            &mut global,
+            AppSignal::Discovered {
+                generation: 2,
+                result: Ok(removed_selection),
+            },
+        );
+        assert_eq!(global.state.selected, 1);
+        assert_eq!(
+            global.state.disks[global.state.selected].identity.id,
+            "disk-1"
+        );
+        assert_eq!(global.state.scroll, 1);
+        assert_eq!(global.state.content_scroll, 0);
+        assert!(
+            Layout::new(100, 10, 8, global.state.scroll)
+                .tab_indices
+                .contains(&global.state.selected)
         );
     }
 
