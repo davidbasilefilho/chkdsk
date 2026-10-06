@@ -211,6 +211,38 @@ def verify_assets(assets_dir: Path, expected: list[Path]) -> None:
         raise ValueError("release checksum manifest does not match the three executable assets")
 
 
+def verify_pe_machine(binary: Path, architecture: str) -> None:
+    expected_machine = {"x64": 0x8664, "arm64": 0xAA64, "x86": 0x014C}[architecture]
+    data = binary.read_bytes()
+    if len(data) < 64 or data[:2] != b"MZ":
+        raise ValueError(f"invalid DOS executable header: {binary.name}")
+    pe_offset = int.from_bytes(data[0x3C:0x40], "little")
+    if pe_offset < 64 or pe_offset + 24 > len(data) or data[pe_offset:pe_offset + 4] != b"PE\0\0":
+        raise ValueError(f"invalid PE executable header: {binary.name}")
+    machine = int.from_bytes(data[pe_offset + 4:pe_offset + 6], "little")
+    if machine != expected_machine:
+        raise ValueError(f"wrong PE architecture for {binary.name}: expected {expected_machine:#06x}, got {machine:#06x}")
+    print(f"verified PE architecture {architecture}: {binary.name}", flush=True)
+
+
+def verify_executables(binaries: list[Path], name: str, version: str) -> None:
+    if len(binaries) != len(TARGETS):
+        raise ValueError("exactly three Windows executables are required")
+    for architecture, binary in zip(TARGETS, binaries, strict=True):
+        verify_pe_machine(binary, architecture)
+    if os.name != "nt":
+        raise RuntimeError("packaged x64/x86 version smoke checks require Windows")
+    # --version returns before ensure_elevated; do not launch the interactive TUI.
+    for architecture, binary in zip(TARGETS, binaries, strict=True):
+        if architecture == "arm64":
+            continue  # PE validation only; the Windows x64 runner cannot execute ARM64.
+        result = subprocess.run([str(binary), "--version"], check=True, capture_output=True, text=True, timeout=30)
+        expected = f"{name} {version}"
+        if result.stdout.strip() != expected:
+            raise ValueError(f"unexpected --version from {binary.name}: {result.stdout!r}; expected {expected!r}")
+        print(f"verified {architecture} --version: {result.stdout.strip()}", flush=True)
+
+
 def package(mode: str, sha: str, tag: str | None, output: Path) -> None:
     name, version = manifest()
     release_tag = validate_tag(mode, version, sha, tag)
@@ -221,6 +253,7 @@ def package(mode: str, sha: str, tag: str | None, output: Path) -> None:
         shutil.copy2(build_target(architecture, name), asset)
     write_checksums(binaries, assets[-1])
     verify_assets(output, assets)
+    verify_executables(binaries, name, version)
     print(f"verified release assets for {release_tag}: {', '.join(path.name for path in assets)}")
 
 
@@ -397,6 +430,7 @@ def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> 
     tag = validate_tag(mode, version, sha, supplied_tag)
     assets = expected_assets(mode, sha, name, version, assets_dir)
     verify_assets(assets_dir, assets)
+    verify_executables(assets[:-1], name, version)
     repository = os.environ.get("GITHUB_REPOSITORY")
     if not repository:
         raise ValueError("GITHUB_REPOSITORY is required to publish")
@@ -499,6 +533,58 @@ def self_check() -> None:
         pass
     else:
         raise AssertionError("stable mode accepted a mismatched tag")
+
+    with tempfile.TemporaryDirectory() as directory:
+        binary = Path(directory) / "test.exe"
+        for architecture, machine in (("x64", 0x8664), ("arm64", 0xAA64), ("x86", 0x014C)):
+            data = bytearray(88)
+            data[:2] = b"MZ"
+            data[0x3C:0x40] = (64).to_bytes(4, "little")
+            data[64:68] = b"PE\0\0"
+            data[68:70] = machine.to_bytes(2, "little")
+            binary.write_bytes(data)
+            verify_pe_machine(binary, architecture)
+            wrong = "x86" if architecture != "x86" else "x64"
+            try:
+                verify_pe_machine(binary, wrong)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("incorrect PE machine was accepted")
+        for invalid in (b"", b"MZ", b"MZ" + bytes(86)):
+            binary.write_bytes(invalid)
+            try:
+                verify_pe_machine(binary, "x64")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid PE header was accepted")
+
+    with tempfile.TemporaryDirectory() as directory:
+        binaries = [Path(directory) / f"test-{architecture}.exe" for architecture in TARGETS]
+        original_name, original_subprocess_run = os.name, subprocess.run
+        calls = []
+        original_verify_pe_machine = globals()["verify_pe_machine"]
+        try:
+            os.name = "nt"
+            globals()["verify_pe_machine"] = lambda binary, architecture: None
+            def smoke_run(command, **kwargs):
+                calls.append(command)
+                assert kwargs.get("check") and kwargs.get("timeout") == 30
+                return subprocess.CompletedProcess(command, 0, stdout="chkdsk 0.0.2\n", stderr="")
+            subprocess.run = smoke_run
+            verify_executables(binaries, "chkdsk", "0.0.2")
+            assert calls == [[str(binaries[0]), "--version"], [str(binaries[2]), "--version"]]
+            try:
+                verify_executables(binaries, "chkdsk", "9.9.9")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("incorrect executable version was accepted")
+        finally:
+            os.name = original_name
+            subprocess.run = original_subprocess_run
+            globals()["verify_pe_machine"] = original_verify_pe_machine
 
     global run
     original_run = run

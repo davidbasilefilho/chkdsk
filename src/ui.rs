@@ -409,12 +409,13 @@ impl App for DashboardApp {
                 {
                     disk.computing = false;
                     if let Some(telemetry) = disk.pending_telemetry.take() {
-                        let score = score_health(disk.identity.kind, &telemetry);
+                        let kind = effective_disk_kind(&disk.identity, &telemetry);
+                        let score = score_health(kind, &telemetry);
                         if let Some(timestamp_unix_secs) = next_timestamp(&state.history, disk_id) {
                             let sample = HealthSample {
                                 disk_id: disk.identity.id.clone(),
                                 timestamp_unix_secs,
-                                kind: disk.identity.kind,
+                                kind,
                                 endurance_percent: telemetry.endurance_percent,
                                 power_on_hours: telemetry.power_on_hours,
                                 score: (score.outcome != HealthOutcome::Unknown)
@@ -1010,7 +1011,8 @@ fn disk_content_line_count(disk: &DiskView, width: usize, body_height: usize) ->
         return 5;
     };
 
-    let health = score_health(disk.identity.kind, telemetry);
+    let kind = effective_disk_kind(&disk.identity, telemetry);
+    let health = score_health(kind, telemetry);
     let large_score = body_height >= 9 && width >= 26;
     10 + usize::from(large_score) * 5 + health_detail_messages(&health, telemetry).len()
 }
@@ -1175,7 +1177,8 @@ fn render_disk(
         }
         return;
     };
-    let health = score_health(disk.identity.kind, telemetry);
+    let kind = effective_disk_kind(&disk.identity, telemetry);
+    let health = score_health(kind, telemetry);
     let (label, color) = health_presentation(&health);
     let nominal_attention = health.outcome == HealthOutcome::Pass
         && health
@@ -1208,13 +1211,13 @@ fn render_disk(
             row(ops, &score_row, color, TOKYO_BG, true);
         }
     }
-    let eta = if disk.identity.kind == DiskKind::Hdd {
+    let eta = if kind == DiskKind::Hdd {
         if width < 40 {
             "ETA não aplicável a HDD".to_owned()
         } else {
             "ETA não aplicável · vida útil de HDD".to_owned()
         }
-    } else if disk.identity.kind == DiskKind::Unknown {
+    } else if kind == DiskKind::Unknown {
         if width < 40 {
             "Sem ETA: tipo desconhecido".to_owned()
         } else {
@@ -1271,7 +1274,7 @@ fn render_disk(
     for (message, color) in health_detail_messages(&health, telemetry) {
         row(ops, &message, color, TOKYO_BG_DARK1, color == TOKYO_RED);
     }
-    let kind = match disk.identity.kind {
+    let kind = match kind {
         DiskKind::Hdd => "HDD",
         DiskKind::Ssd => "SSD",
         DiskKind::Nvme => "NVMe",
@@ -1317,6 +1320,21 @@ fn render_disk(
     let _ = frame;
 }
 
+/// A verified ATA SSD profile with measured wear can fill a missing media kind.
+/// Never override an explicit HDD classification or infer SSD from an opaque ID.
+fn effective_disk_kind(identity: &DiskIdentity, telemetry: &Telemetry) -> DiskKind {
+    if identity.kind == DiskKind::Unknown
+        && telemetry.endurance_percent.is_some()
+        && matches!(telemetry.ata, QueryState::Success(_))
+        && crate::ata::profile(identity.model.as_deref())
+            .is_some_and(|profile| telemetry.ata_profile.as_deref() == Some(profile.family))
+    {
+        DiskKind::Ssd
+    } else {
+        identity.kind
+    }
+}
+
 fn is_basic_smart_pass(health: &crate::health::HealthScore) -> bool {
     health.outcome == HealthOutcome::Pass
         && health.score == 100
@@ -1359,10 +1377,10 @@ fn health_detail_messages(
             let spare_below_threshold = if let (Some(spare), Some(threshold)) = (
                 nvme.available_spare_percent,
                 nvme.available_spare_threshold_percent,
-            ) && spare <= threshold
+            ) && spare < threshold
             {
                 messages.push((
-                    format!("Reserva NVMe abaixo do limite ({spare}% ≤ {threshold}%)"),
+                    format!("Reserva NVMe abaixo do limite ({spare}% < {threshold}%)"),
                     TOKYO_RED,
                 ));
                 true
@@ -1383,7 +1401,8 @@ fn health_detail_messages(
         }
         if let QueryState::Success(ata) = &telemetry.ata {
             for attribute in &ata.attributes {
-                if attribute.flags & 1 != 0
+                if (1..=254).contains(&attribute.current)
+                    && attribute.flags & 1 != 0
                     && let Some(threshold) = attribute.threshold.filter(|value| *value > 0)
                     && attribute.current <= threshold
                 {
@@ -1425,7 +1444,7 @@ fn health_detail_messages(
                 }
             }],
             HealthWarningReason::NvmeTemperatureThreshold => {
-                vec!["Temperatura NVMe acima do limite".into()]
+                vec!["Temperatura NVMe fora dos limites".into()]
             }
             HealthWarningReason::NvmeVolatileMemoryBackup => {
                 vec!["Backup da memória volátil NVMe degradado".into()]
@@ -1451,6 +1470,9 @@ fn ata_threshold_messages(telemetry: &Telemetry, near: bool) -> Option<Vec<Strin
         .attributes
         .iter()
         .filter_map(|attribute| {
+            if !(1..=254).contains(&attribute.current) {
+                return None;
+            }
             let threshold = attribute.threshold.filter(|value| *value > 0)?;
             let matches = if near {
                 attribute.current > threshold
@@ -2592,7 +2614,7 @@ mod tests {
         assert!(rendered.contains(&"SMART ATA próximo do limite: atributo 194 (108/100)"));
         assert!(rendered.contains(&"SMART ATA atingiu o limite: atributo 197 (99/100)"));
         assert!(rendered.contains(&"Erros de mídia NVMe registrados: 42"));
-        assert!(rendered.contains(&"Temperatura NVMe acima do limite"));
+        assert!(rendered.contains(&"Temperatura NVMe fora dos limites"));
         assert!(rendered.contains(&"Backup da memória volátil NVMe degradado"));
         assert!(
             rendered.contains(&"Região de memória persistente NVMe degradada ou somente leitura")
@@ -2640,6 +2662,157 @@ mod tests {
         assert!(
             health_detail_messages(&critical, &overall_failure)
                 .contains(&("Falha geral reportada pelo dispositivo".into(), TOKYO_RED))
+        );
+    }
+
+    #[test]
+    fn failure_details_match_validated_health_boundaries() {
+        for warning in [1, 4] {
+            let telemetry = Telemetry {
+                nvme: QueryState::Success(crate::model::NvmeHealth {
+                    available_spare_percent: Some(10),
+                    available_spare_threshold_percent: Some(10),
+                    critical_warning: warning,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let health = score_health(DiskKind::Nvme, &telemetry);
+            let details = health_detail_messages(&health, &telemetry);
+            assert!(!details.iter().any(|(text, _)| text.contains("abaixo")));
+            let cause = if warning == 1 {
+                "Reserva NVMe em nível crítico"
+            } else {
+                "Confiabilidade NVMe comprometida"
+            };
+            assert!(details.contains(&(cause.into(), TOKYO_RED)));
+        }
+        for current in [0, 255] {
+            let telemetry = Telemetry {
+                overall_failure: QueryState::Success(true),
+                ata: QueryState::Success(crate::model::AtaHealth {
+                    attributes: vec![crate::model::AtaAttribute {
+                        id: 5,
+                        flags: 1,
+                        current,
+                        worst: current,
+                        threshold: Some(10),
+                        raw: [0; 6],
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let health = score_health(DiskKind::Hdd, &telemetry);
+            let details = health_detail_messages(&health, &telemetry);
+            assert_eq!(
+                details,
+                vec![("Falha geral reportada pelo dispositivo".into(), TOKYO_RED)]
+            );
+            assert!(ata_threshold_messages(&telemetry, false).is_none());
+        }
+    }
+
+    #[test]
+    fn verified_ssd_profile_restores_unknown_kind_history_and_eta() {
+        let mut disk_identity = identity("profile-ssd", 0);
+        disk_identity.model = Some("CT500MX500SSD1".into());
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_ata(
+            crate::model::AtaHealth {
+                attributes: vec![crate::model::AtaAttribute {
+                    id: 202,
+                    flags: 0,
+                    current: 89,
+                    worst: 89,
+                    threshold: None,
+                    raw: [11, 0, 0, 0, 0, 0],
+                }],
+                ..Default::default()
+            },
+            disk_identity.model.as_deref(),
+        );
+        assert_eq!(
+            effective_disk_kind(&disk_identity, &telemetry),
+            DiskKind::Ssd
+        );
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(
+            Dashboard {
+                disks: vec![DiskView {
+                    identity: disk_identity.clone(),
+                    telemetry: None,
+                    querying: false,
+                    computing: true,
+                    pending_telemetry: Some(telemetry.clone()),
+                    error_message: None,
+                }],
+                ..Default::default()
+            },
+            100,
+            28,
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        global
+            .state
+            .history
+            .record(HealthSample {
+                disk_id: disk_identity.id.clone(),
+                timestamp_unix_secs: now - 86_400,
+                kind: DiskKind::Ssd,
+                endurance_percent: Some(10.0),
+                power_on_hours: None,
+                score: None,
+            })
+            .unwrap();
+        dispatch_signal(
+            &mut app,
+            &mut global,
+            AppSignal::ComputeFinished {
+                generation: 0,
+                disk_id: disk_identity.id.clone(),
+            },
+        );
+        assert_eq!(
+            global.state.history.samples.last().unwrap().kind,
+            DiskKind::Ssd
+        );
+        assert!(
+            global
+                .state
+                .history
+                .estimate_endurance(&disk_identity.id)
+                .is_some()
+        );
+        assert!(rendered_text(&mut app, &mut global).contains("ETA restante"));
+        disk_identity.kind = DiskKind::Hdd;
+        assert_eq!(
+            effective_disk_kind(&disk_identity, &telemetry),
+            DiskKind::Hdd
+        );
+        disk_identity.kind = DiskKind::Unknown;
+        disk_identity.model = Some("Unknown SSD".into());
+        assert_eq!(
+            effective_disk_kind(&disk_identity, &telemetry),
+            DiskKind::Unknown
+        );
+        disk_identity.model = Some("CT500MX500SSD1".into());
+        telemetry.ata_profile = Some("Crucial BX500".into());
+        assert_eq!(
+            effective_disk_kind(&disk_identity, &telemetry),
+            DiskKind::Unknown
+        );
+        telemetry.ata_profile = Some("Crucial MX500".into());
+        telemetry.endurance_percent = None;
+        assert_eq!(
+            effective_disk_kind(&disk_identity, &telemetry),
+            DiskKind::Unknown
         );
     }
 
