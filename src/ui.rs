@@ -459,6 +459,8 @@ impl App for DashboardApp {
         }
         let width: usize = (*global.window_size.col_width).into();
         let height: usize = (*global.window_size.row_height).into();
+        clamp_tab_scroll(&mut global.state, width, height);
+        ensure_selected_visible(&mut global.state, width, height);
         clamp_content_scroll(&mut global.state, width, height);
         let state = &global.state;
         let layout = Layout::new(width, height, state.disks.len(), state.scroll);
@@ -2143,6 +2145,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn render_keeps_selected_disk_tab_visible_after_terminal_resize() {
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(
+            Dashboard {
+                disks: (0..9)
+                    .map(|index| DiskView {
+                        identity: identity(&format!("disk-{index}"), index),
+                        telemetry: None,
+                        querying: false,
+                        computing: false,
+                        pending_telemetry: None,
+                        error_message: None,
+                    })
+                    .collect(),
+                selected: 8,
+                ..Default::default()
+            },
+            100,
+            28,
+        );
+        for (width, height) in [(100, 28), (44, 28), (22, 10), (100, 28)] {
+            global.window_size = r3bl_tui::Size::new((
+                r3bl_tui::ColWidth::new(width),
+                r3bl_tui::RowHeight::new(height),
+            ));
+            let rendered = rendered_text(&mut app, &mut global);
+            let layout = Layout::new(width, height, global.state.disks.len(), global.state.scroll);
+            assert_eq!(global.state.selected, 8);
+            if width == 100 {
+                assert_eq!(global.state.scroll, 5);
+                assert_eq!(layout.tab_indices, vec![5, 6, 7, 8]);
+            }
+            assert!(
+                layout.tab_indices.contains(&8),
+                "{width}x{height}: {layout:?}"
+            );
+            assert!(
+                rendered.lines().nth(1).unwrap().contains("> Disco #8"),
+                "{width}x{height}: {rendered}"
+            );
+        }
+    }
     #[test]
     fn horizontal_tabs_keep_earlier_disks_visible_until_selection_overflows_and_hover_is_distinct()
     {
