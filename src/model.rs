@@ -136,6 +136,7 @@ impl Telemetry {
     pub fn apply_ata(&mut self, health: AtaHealth, model: Option<&str>) {
         let profile = crate::ata::profile(model);
         let hdd_profile = crate::ata::hdd_profile(model);
+        let previous_ata_profile = self.ata_profile.is_some();
         self.ata_profile = profile
             .map(|profile| profile.family.to_owned())
             .or_else(|| hdd_profile.map(|profile| profile.family.to_owned()));
@@ -145,17 +146,20 @@ impl Telemetry {
         self.temperature_c = self
             .temperature_c
             .or_else(|| crate::ata::hdd_temperature_c(model, &health));
-        let endurance = profile.and_then(|profile| {
-            health
-                .attributes
-                .iter()
-                .find(|attribute| attribute.id == profile.lifetime_used_attribute)
-                .and_then(|attribute| {
-                    crate::ata::endurance_used_percent(model, attribute.id, attribute.raw)
-                })
-                .map(f64::from)
-        });
-        if endurance.is_some() {
+        let endurance = profile
+            .and_then(|profile| {
+                crate::ata::unique_attribute(&health, profile.lifetime_used_attribute)
+            })
+            .and_then(|attribute| {
+                crate::ata::endurance_used_percent(model, attribute.id, attribute.raw)
+            })
+            .map(f64::from);
+        // Replace or clear prior ATA-derived wear when the model profile is
+        // known. Never retain an arbitrary value from duplicated rows; preserve
+        // an NVMe value if this telemetry also contains a valid NVMe log.
+        if !matches!(&self.nvme, QueryState::Success(_))
+            && (profile.is_some() || previous_ata_profile)
+        {
             self.endurance_percent = endurance;
         }
         self.ata = QueryState::Success(health);
@@ -205,6 +209,92 @@ mod tests {
             assert_eq!(unprofiled.endurance_percent, None, "{model}");
             assert_eq!(unprofiled.ata_profile, None, "{model}");
         }
+    }
+
+    #[test]
+    fn duplicate_crucial_lifetime_rows_do_not_choose_or_persist_an_arbitrary_wear_value() {
+        for raw_values in [vec![23, 23], vec![23, 81], vec![81, 23]] {
+            let health = AtaHealth {
+                attributes: raw_values
+                    .iter()
+                    .map(|raw| AtaAttribute {
+                        id: 202,
+                        flags: 0,
+                        current: 77,
+                        worst: 75,
+                        threshold: None,
+                        raw: [*raw, 0, 0, 0, 0, 0],
+                    })
+                    .collect(),
+                thresholds_available: false,
+            };
+            let mut telemetry = Telemetry {
+                endurance_percent: Some(11.0),
+                ata_profile: Some("Crucial MX500".to_owned()),
+                ..Default::default()
+            };
+            telemetry.apply_ata(health.clone(), Some("Crucial CT500MX500SSD1"));
+
+            assert_eq!(telemetry.endurance_percent, None, "rows {raw_values:?}");
+            assert_eq!(telemetry.ata_profile.as_deref(), Some("Crucial MX500"));
+            assert!(matches!(
+                &telemetry.ata,
+                QueryState::Success(parsed)
+                    if parsed.attributes.len() == raw_values.len()
+                        && parsed.attributes.iter().map(|row| row.raw[0]).collect::<Vec<_>>() == raw_values
+            ));
+
+            // The UI copies this telemetry value into the serialized history
+            // sample. Ambiguous duplicates may remain diagnostic rows, but
+            // they must not create an ETA baseline or persist invented wear.
+            let mut history = crate::history::History::default();
+            history
+                .record(crate::history::HealthSample {
+                    disk_id: "crucial-a".to_owned(),
+                    timestamp_unix_secs: 1_000,
+                    kind: DiskKind::Ssd,
+                    endurance_percent: telemetry.endurance_percent,
+                    power_on_hours: telemetry.power_on_hours,
+                    score: None,
+                })
+                .unwrap();
+            assert_eq!(history.samples[0].endurance_percent, None);
+            assert_eq!(history.estimate_endurance("crucial-a"), None);
+        }
+    }
+
+    #[test]
+    fn duplicate_ata_lifetime_rows_do_not_overwrite_valid_nvme_wear() {
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_nvme(NvmeHealth {
+            percentage_used: Some(4),
+            ..Default::default()
+        });
+        telemetry.apply_ata(
+            AtaHealth {
+                attributes: vec![
+                    AtaAttribute {
+                        id: 202,
+                        flags: 0,
+                        current: 77,
+                        worst: 75,
+                        threshold: None,
+                        raw: [23, 0, 0, 0, 0, 0],
+                    },
+                    AtaAttribute {
+                        id: 202,
+                        flags: 0,
+                        current: 77,
+                        worst: 75,
+                        threshold: None,
+                        raw: [81, 0, 0, 0, 0, 0],
+                    },
+                ],
+                thresholds_available: false,
+            },
+            Some("Crucial CT500MX500SSD1"),
+        );
+        assert_eq!(telemetry.endurance_percent, Some(4.0));
     }
 
     #[test]

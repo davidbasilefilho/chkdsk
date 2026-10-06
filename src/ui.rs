@@ -634,22 +634,22 @@ impl App for DashboardApp {
                         disk.telemetry = Some(telemetry);
                     }
                 }
-                if let Some((disk_id, label, issue_keys, details, severity)) = health_notice {
-                    if record_issue_transition(state, &disk_id, issue_keys) {
-                        let title = match severity {
-                            NotificationSeverity::Info => "Informação de saúde",
-                            NotificationSeverity::Warning => "Atenção à saúde",
-                            NotificationSeverity::Critical => "Falha de saúde",
-                        };
-                        push_notification(
-                            state,
-                            Some(disk_id),
-                            format!("{title} · {label}"),
-                            details,
-                            severity,
-                            Instant::now(),
-                        );
-                    }
+                if let Some((disk_id, label, issue_keys, details, severity)) = health_notice
+                    && record_issue_transition(state, &disk_id, issue_keys)
+                {
+                    let title = match severity {
+                        NotificationSeverity::Info => "Informação de saúde",
+                        NotificationSeverity::Warning => "Atenção à saúde",
+                        NotificationSeverity::Critical => "Falha de saúde",
+                    };
+                    push_notification(
+                        state,
+                        Some(disk_id),
+                        format!("{title} · {label}"),
+                        details,
+                        severity,
+                        Instant::now(),
+                    );
                 }
             }
             AppSignal::HistoryLoaded(history) => state.history = history.clone(),
@@ -1154,6 +1154,7 @@ struct FooterControl {
 }
 
 impl Layout {
+    #[cfg(test)]
     pub fn new(width: usize, height: usize, disks: usize, scroll: usize) -> Self {
         let index_digits = disks.saturating_sub(1).max(1).to_string().len();
         Self::new_with_index_digits(width, height, disks, scroll, index_digits, false)
@@ -4390,7 +4391,7 @@ mod tests {
 
     #[test]
     fn failed_inventory_refresh_keeps_the_last_snapshot_and_reports_the_failure() {
-        let identities = vec![identity("drive-a", 0), identity("drive-b", 1)];
+        let identities = [identity("drive-a", 0), identity("drive-b", 1)];
         let state = Dashboard {
             disks: identities
                 .iter()

@@ -86,6 +86,20 @@ impl HddCounter {
     }
 }
 
+/// Return an ATA row only when that ID appears exactly once. This is required
+/// before interpreting model-specific SMART data such as lifetime-used ID 202.
+pub(crate) fn unique_attribute(
+    health: &crate::model::AtaHealth,
+    id: u8,
+) -> Option<&crate::model::AtaAttribute> {
+    let mut matching = health
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.id == id);
+    let attribute = matching.next()?;
+    matching.next().is_none().then_some(attribute)
+}
+
 /// Model-scoped HDD layouts are intentionally explicit. Unknown models have
 /// no model profile; only the limited common HDD signal defaults below can
 /// still be used, never a guessed vendor health baseline. ATA ID 5 uses
@@ -311,6 +325,31 @@ pub(crate) fn raw_u48(raw: [u8; 6]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_attribute_lookup_rejects_equal_or_different_duplicate_rows() {
+        let attribute = |raw| crate::model::AtaAttribute {
+            id: 202,
+            flags: 0,
+            current: 77,
+            worst: 75,
+            threshold: None,
+            raw: [raw, 0, 0, 0, 0, 0],
+        };
+        let one = crate::model::AtaHealth {
+            attributes: vec![attribute(23)],
+            thresholds_available: false,
+        };
+        assert_eq!(unique_attribute(&one, 202).unwrap().raw[0], 23);
+        for values in [[23, 23], [23, 81], [81, 23]] {
+            let duplicate = crate::model::AtaHealth {
+                attributes: values.into_iter().map(attribute).collect(),
+                thresholds_available: false,
+            };
+            assert_eq!(unique_attribute(&duplicate, 202), None, "rows {values:?}");
+        }
+        assert_eq!(unique_attribute(&one, 5), None);
+    }
 
     #[test]
     fn raw_hdd_ids_are_unlabeled_without_a_model_profile() {

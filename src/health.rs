@@ -156,6 +156,8 @@ pub fn score_health(kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
     }
 }
 
+// Keep each deterministic scoring accumulator explicit at this call boundary.
+#[allow(clippy::too_many_arguments)]
 fn add_ata_evidence(
     kind: DiskKind,
     profile_family: Option<&str>,
