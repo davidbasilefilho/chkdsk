@@ -487,56 +487,47 @@ impl App for DashboardApp {
                 Some(TOKYO_BG),
             );
         }
-        fill_row(&mut ops, 0, width, TOKYO_BG_DARK);
-        let title = if width >= 15 {
-            format!(" chkdsk v{}", env!("CARGO_PKG_VERSION"))
+        for y in 0..layout.quit.height.min(height) {
+            fill_row(&mut ops, y, width, TOKYO_BG_DARK);
+        }
+        let title_x = usize::from(width >= 24);
+        let full_title = format!("chkdsk v{}", env!("CARGO_PKG_VERSION"));
+        let title_width = layout.quit.x.saturating_sub(title_x + 1);
+        let title = if r3bl_tui::GCStringOwned::new(&full_title)
+            .display_width()
+            .as_usize()
+            <= title_width
+        {
+            full_title
         } else {
-            " chkdsk".to_owned()
+            "chkdsk".to_owned()
         };
         paint_background(
             &mut ops,
-            0,
-            0,
+            title_x,
+            layout.quit.height / 2,
             &title,
-            TOKYO_PURPLE,
+            TOKYO_BLUE,
             true,
-            width.saturating_sub(layout.quit.width),
+            title_width,
             Some(TOKYO_BG_DARK),
         );
         if layout.quit.visible() {
-            let quit_label = if layout.quit.width >= 4 {
-                pad_to_columns("Sair", layout.quit.width)
-            } else {
-                pad_to_columns("×", layout.quit.width)
-            };
-            paint_background(
+            paint_button(
                 &mut ops,
-                layout.quit.x,
-                0,
-                &quit_label,
+                layout.quit,
+                if layout.quit.width >= 6 { "Sair" } else { "×" },
                 TOKYO_BG_DARK1,
+                TOKYO_RED,
                 true,
-                width.saturating_sub(layout.quit.x),
-                Some(TOKYO_RED),
             );
-        }
-        if height > 1 {
-            fill_row(&mut ops, 1, width, TOKYO_BG_DARK1);
         }
         for (position, area) in layout.tabs.iter().enumerate() {
             let index = layout.tab_indices[position];
             let disk = &state.disks[index];
-            let mark = if index == state.selected { "> " } else { "  " };
-            let name = disk
-                .identity
-                .model
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("Disco");
-            let physical = format!("#{}", disk.identity.index);
-            let model_width = area.width.saturating_sub(mark.len() + physical.len() + 1);
-            let model = clipped(name, model_width);
-            let label = pad_to_columns(&format!("{mark}{model} {physical}"), area.width);
+            let mark = if index == state.selected { "> " } else { "" };
+            // Disk identity belongs in the permanent tab; the model appears once below.
+            let label = format!("{mark}Disco #{}", disk.identity.index);
             let (fg, bg) = if index == state.selected {
                 (TOKYO_FG, TOKYO_BG_VISUAL)
             } else if state.hovered_tab == Some(index) {
@@ -544,16 +535,7 @@ impl App for DashboardApp {
             } else {
                 (TOKYO_FG_DARK, TOKYO_BG_DARK1)
             };
-            paint_background(
-                &mut ops,
-                area.x,
-                area.y,
-                &label,
-                fg,
-                index == state.selected || state.hovered_tab == Some(index),
-                area.width,
-                Some(bg),
-            );
+            paint_button(&mut ops, *area, &label, fg, bg, index == state.selected);
         }
         if height > layout.body_y {
             if let Some(disk) = state.disks.get(state.selected) {
@@ -580,21 +562,19 @@ impl App for DashboardApp {
                 );
             }
         }
-        if height >= 6 {
-            fill_row(&mut ops, height - 1, width, TOKYO_BG_DARK);
-            for control in &layout.controls {
-                let label = pad_to_columns(control.label, control.area.width);
-                paint_background(
-                    &mut ops,
-                    control.area.x,
-                    control.area.y,
-                    &label,
-                    TOKYO_BG_DARK1,
-                    true,
-                    control.area.width,
-                    Some(TOKYO_BLUE),
-                );
-            }
+        for control in &layout.controls {
+            let color = match control.action {
+                FooterAction::PreviousDisk | FooterAction::NextDisk => TOKYO_BLUE,
+                FooterAction::ScrollUp | FooterAction::ScrollDown => TOKYO_CYAN,
+            };
+            paint_button(
+                &mut ops,
+                control.area,
+                control.label,
+                TOKYO_BG_DARK1,
+                color,
+                true,
+            );
         }
         pipeline.push(ZOrder::Normal, ops);
         Ok(pipeline)
@@ -848,6 +828,8 @@ pub struct Layout {
     pub body_y: usize,
 }
 
+const TAB_BUTTON_WIDTH: usize = 18;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FooterAction {
     PreviousDisk,
@@ -868,40 +850,46 @@ impl Layout {
         if width == 0 || height == 0 {
             return Self::default();
         }
+        // Normal-sized buttons have one cell of vertical padding above and below
+        // their centered label. Preserve a one-row escape hatch for tiny terminals.
+        let button_height = if height >= 7 { 3 } else { 1 };
         let quit = if width >= 21 {
             HitArea {
-                x: width - 7,
+                x: width - 8,
                 y: 0,
                 width: 7,
-                height: 1,
+                height: button_height,
             }
         } else if width >= 18 {
             HitArea {
-                x: width - 4,
+                x: width - 5,
                 y: 0,
                 width: 4,
-                height: 1,
+                height: button_height,
             }
         } else {
             HitArea {
                 x: width - 1,
                 y: 0,
                 width: 1,
-                height: 1,
+                height: button_height,
             }
         };
         let mut tabs = Vec::new();
         let mut tab_indices = Vec::new();
-        let mut x = 0;
-        let y = usize::from(height > 1);
+        // Leave a quiet one-cell gutter around the horizontal tab strip when
+        // the terminal can spare it; narrow terminals keep the full width.
+        let side_margin = usize::from(width >= 24);
+        let mut x = side_margin;
+        let y = button_height;
         let start = scroll.min(disks.saturating_sub(1));
-        if width >= 3 && height > 2 {
+        if width >= 3 && height > 2 * button_height {
             for index in start..disks {
-                let remaining = width.saturating_sub(x);
-                if remaining < 22 && !tabs.is_empty() {
+                let remaining = width.saturating_sub(x + side_margin);
+                if remaining < TAB_BUTTON_WIDTH && !tabs.is_empty() {
                     break;
                 }
-                let available = 22.min(remaining);
+                let available = TAB_BUTTON_WIDTH.min(remaining);
                 if available == 0 {
                     break;
                 }
@@ -909,16 +897,16 @@ impl Layout {
                     x,
                     y,
                     width: available,
-                    height: 1,
+                    height: button_height,
                 });
                 tab_indices.push(index);
-                x += available;
+                x += available + usize::from(width >= 24);
                 if x >= width {
                     break;
                 }
             }
         }
-        let body_y = if height > 2 { 2 } else { height };
+        let body_y = (2 * button_height).min(height);
         let controls = footer_controls(width, height);
         Self {
             tabs,
@@ -944,9 +932,12 @@ impl Layout {
 }
 
 fn footer_controls(width: usize, height: usize) -> Vec<FooterControl> {
-    if width < 11 || height < 6 {
+    // Compact screens reserve their height for the health summary. The same
+    // mouse actions remain available through tab clicks and wheel scrolling.
+    if width < 21 || height < 14 {
         return Vec::new();
     }
+    let button_height = 3;
     let controls: &[(&str, FooterAction)] = if width >= 54 {
         &[
             ("← Discos", FooterAction::PreviousDisk),
@@ -954,14 +945,14 @@ fn footer_controls(width: usize, height: usize) -> Vec<FooterControl> {
             ("↑ Detalhes", FooterAction::ScrollUp),
             ("↓ Detalhes", FooterAction::ScrollDown),
         ]
-    } else if width >= 30 {
+    } else if width >= 39 {
         &[
             ("← Disco", FooterAction::PreviousDisk),
             ("→ Disco", FooterAction::NextDisk),
             ("↑ Info", FooterAction::ScrollUp),
             ("↓ Info", FooterAction::ScrollDown),
         ]
-    } else if width >= 23 {
+    } else if width >= 33 {
         &[
             ("←Dsc", FooterAction::PreviousDisk),
             ("→Dsc", FooterAction::NextDisk),
@@ -976,34 +967,49 @@ fn footer_controls(width: usize, height: usize) -> Vec<FooterControl> {
             ("↓I", FooterAction::ScrollDown),
         ]
     };
-    let mut x = 0;
-    controls
+    let mut x = 1;
+    let right_edge = width.saturating_sub(1);
+    let mut result = controls
         .iter()
         .filter_map(|(label, action)| {
             let label_width = r3bl_tui::GCStringOwned::new(*label)
                 .display_width()
                 .as_usize();
-            if x + label_width > width {
+            let button_width = label_width + 2;
+            if x + button_width > right_edge {
                 return None;
             }
             let control = FooterControl {
                 area: HitArea {
                     x,
-                    y: height - 1,
-                    width: label_width,
-                    height: 1,
+                    y: height - button_height,
+                    width: button_width,
+                    height: button_height,
                 },
                 label,
                 action: *action,
             };
-            x += label_width + 1;
+            x += button_width + 1;
             Some(control)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let (Some(first), Some(last)) = (result.first(), result.last()) {
+        let occupied_width = last.area.x + last.area.width - first.area.x;
+        let centered_start = width.saturating_sub(occupied_width) / 2;
+        let shift = centered_start.saturating_sub(first.area.x);
+        for control in &mut result {
+            control.area.x += shift;
+        }
+    }
+    result
 }
 
 fn body_view_height(layout: &Layout, height: usize) -> usize {
-    height.saturating_sub(layout.body_y + usize::from(height >= 6))
+    let footer_height = layout
+        .controls
+        .first()
+        .map_or(0, |control| control.area.height);
+    height.saturating_sub(layout.body_y + footer_height)
 }
 
 fn disk_content_line_count(disk: &DiskView, width: usize, body_height: usize) -> usize {
@@ -1026,6 +1032,55 @@ fn clamp_content_scroll(state: &mut Dashboard, width: usize, height: usize) {
         .map(|disk| disk_content_line_count(disk, width, body_height).saturating_sub(body_height))
         .unwrap_or_default();
     state.content_scroll = state.content_scroll.min(max_scroll);
+}
+
+fn centered_button_text(area: HitArea, label: &str) -> Option<(usize, usize, String)> {
+    if !area.visible() {
+        return None;
+    }
+    let inner_width = area.width.saturating_sub(2);
+    let text = clipped(label, inner_width.max(usize::from(area.width > 0)));
+    let text_width = r3bl_tui::GCStringOwned::new(&text)
+        .display_width()
+        .as_usize();
+    let x = area.x + area.width.saturating_sub(text_width) / 2;
+    let y = area.y + area.height / 2;
+    Some((x, y, text))
+}
+
+fn paint_button(
+    ops: &mut RenderOpIRVec,
+    area: HitArea,
+    label: &str,
+    fg: RgbValue,
+    bg: RgbValue,
+    bold: bool,
+) {
+    let Some((text_x, text_y, text)) = centered_button_text(area, label) else {
+        return;
+    };
+    for y in area.y..area.y + area.height {
+        paint_background(
+            ops,
+            area.x,
+            y,
+            &" ".repeat(area.width),
+            fg,
+            bold,
+            area.width,
+            Some(bg),
+        );
+    }
+    paint_background(
+        ops,
+        text_x,
+        text_y,
+        &text,
+        fg,
+        bold,
+        area.x + area.width - text_x,
+        Some(bg),
+    );
 }
 
 fn fill_row(ops: &mut RenderOpIRVec, y: usize, width: usize, color: RgbValue) {
@@ -1119,13 +1174,7 @@ fn render_disk(
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("Modelo desconhecido");
-    row(
-        ops,
-        &format!("DISCO #{} · {model}", disk.identity.index),
-        TOKYO_FG,
-        TOKYO_BG_VISUAL,
-        true,
-    );
+    row(ops, model, TOKYO_FG, TOKYO_BG_HIGHLIGHT, true);
 
     let Some(telemetry) = disk.telemetry.as_ref() else {
         let message = if disk.querying || disk.computing {
@@ -1236,7 +1285,9 @@ fn render_disk(
             })
             .unwrap_or_else(|| "ETA indisponível · requer histórico de desgaste".into())
     };
-    row(ops, &eta, TOKYO_ORANGE, TOKYO_BG_DARK, true);
+    // Health status and score are the focus; keep the long-range forecast useful
+    // but visually secondary.
+    row(ops, &eta, TOKYO_FG_DARK, TOKYO_BG_DARK, false);
 
     let full_status = telemetry_status(telemetry);
     let status = if basic_smart {
@@ -2200,15 +2251,19 @@ mod tests {
             let layout = Layout::new(width, height, global.state.disks.len(), global.state.scroll);
             assert_eq!(global.state.selected, 8);
             if width == 100 {
-                assert_eq!(global.state.scroll, 5);
-                assert_eq!(layout.tab_indices, vec![5, 6, 7, 8]);
+                assert_eq!(global.state.scroll, 4);
+                assert_eq!(layout.tab_indices, vec![4, 5, 6, 7, 8]);
             }
             assert!(
                 layout.tab_indices.contains(&8),
                 "{width}x{height}: {layout:?}"
             );
             assert!(
-                rendered.lines().nth(1).unwrap().contains("> Disco #8"),
+                rendered
+                    .lines()
+                    .nth(layout.tabs[0].y + layout.tabs[0].height / 2)
+                    .unwrap()
+                    .contains("> Disco #8"),
                 "{width}x{height}: {rendered}"
             );
         }
@@ -2236,16 +2291,17 @@ mod tests {
             ..Default::default()
         };
         let visible = Layout::new(100, 28, state.disks.len(), state.scroll);
-        assert_eq!(visible.tab_indices, vec![0, 1, 2, 3]);
-        assert_eq!(visible.tab_at(24, 1), Some(1));
-        assert_eq!(visible.tab_at(43, 1), Some(1));
-        assert_eq!(visible.tab_at(44, 1), Some(2));
-        state.selected = 4;
+        assert_eq!(visible.tab_indices, vec![0, 1, 2, 3, 4]);
+        assert_eq!(visible.tab_at(20, 4), Some(1));
+        assert_eq!(visible.tab_at(37, 4), Some(1));
+        assert_eq!(visible.tab_at(38, 4), None);
+        assert_eq!(visible.tab_at(39, 4), Some(2));
+        state.selected = 5;
         ensure_selected_visible(&mut state, 100, 28);
         let shifted = Layout::new(100, 28, state.disks.len(), state.scroll);
-        assert_eq!(shifted.tab_indices, vec![1, 2, 3, 4]);
-        assert_eq!(shifted.tab_at(0, 1), Some(1));
-        assert_eq!(shifted.tab_at(3 * 22, 1), Some(4));
+        assert_eq!(shifted.tab_indices, vec![1, 2, 3, 4, 5]);
+        assert_eq!(shifted.tab_at(1, 4), Some(1));
+        assert_eq!(shifted.tab_at(1 + 4 * 19, 4), Some(5));
 
         let mut app = DashboardApp {
             started: true,
@@ -2263,7 +2319,7 @@ mod tests {
             dispatch_input(
                 &mut app,
                 &mut global,
-                mouse_event(MouseInputKind::MouseMove, 24, 1)
+                mouse_event(MouseInputKind::MouseMove, 20, 4)
             ),
             EventPropagation::ConsumedRender
         ));
@@ -2284,7 +2340,7 @@ mod tests {
             &mut r3bl_tui::MemoizedLenMap::default(),
         );
         assert!(
-            matches!(buffer[1][24], r3bl_tui::PixelChar::PlainText { style, .. } if style.color_bg == Some(TuiColor::Rgb(TOKYO_BG_HIGHLIGHT)))
+            matches!(buffer[4][24], r3bl_tui::PixelChar::PlainText { style, .. } if style.color_bg == Some(TuiColor::Rgb(TOKYO_BG_HIGHLIGHT)))
         );
     }
 
@@ -2327,11 +2383,11 @@ mod tests {
             10,
         );
 
-        assert_eq!(Layout::new(100, 10, 9, 4).tab_at(24, 1), Some(5));
+        assert_eq!(Layout::new(100, 10, 9, 4).tab_at(20, 4), Some(5));
         dispatch_input(
             &mut app,
             &mut global,
-            mouse_event(MouseInputKind::MouseDown(Button::Left), 24, 1),
+            mouse_event(MouseInputKind::MouseDown(Button::Left), 20, 4),
         );
         assert_eq!(
             global.state.disks[global.state.selected].identity.id,
@@ -2857,24 +2913,65 @@ mod tests {
     }
 
     #[test]
-    fn compact_footer_names_disk_and_detail_actions_without_redundant_tab_button() {
+    fn compact_footer_reserves_space_for_the_health_summary() {
         let layout = Layout::new(30, 10, 2, 0);
-        let labels = layout
-            .controls
-            .iter()
-            .map(|control| control.label)
-            .collect::<Vec<_>>();
-        assert_eq!(labels, ["← Disco", "→ Disco", "↑ Info", "↓ Info"]);
-        assert!(layout.controls.iter().all(|control| {
-            control.area.x + control.area.width <= 30
-                && layout.control_at(control.area.x, control.area.y) == Some(control.action)
-        }));
-        for (index, control) in layout.controls.iter().enumerate() {
-            for other in layout.controls.iter().skip(index + 1) {
-                assert!(
-                    control.area.x + control.area.width <= other.area.x
-                        || other.area.x + other.area.width <= control.area.x
+        assert!(layout.controls.is_empty());
+        assert_eq!(layout.quit.height, 3);
+        assert_eq!(layout.tabs.len(), 1);
+        assert_eq!(layout.tabs[0].height, 3);
+        assert_eq!(body_view_height(&layout, 10), 4);
+    }
+
+    #[test]
+    fn standard_buttons_are_padded_centered_and_have_full_hitboxes() {
+        for (width, height) in [(100, 28), (70, 20), (30, 10)] {
+            let layout = Layout::new(width, height, 5, 0);
+            assert_eq!(layout.quit.height, 3, "{width}x{height}");
+            assert!(!layout.tabs.is_empty(), "{width}x{height}");
+            assert!(layout.tabs.iter().all(|tab| tab.height == 3));
+            assert!(
+                layout
+                    .tabs
+                    .iter()
+                    .zip(layout.tabs.iter().skip(1))
+                    .all(|(left, right)| right.x == left.x + left.width + 1)
+            );
+
+            let mut buttons = vec![(layout.quit, "Sair".to_owned())];
+            buttons.extend(layout.tabs.iter().enumerate().map(|(position, area)| {
+                let index = layout.tab_indices[position];
+                let marker = if index == 0 { "> " } else { "" };
+                (*area, format!("{marker}Disco #{index}"))
+            }));
+            buttons.extend(
+                layout
+                    .controls
+                    .iter()
+                    .map(|control| (control.area, control.label.to_owned())),
+            );
+
+            for (area, label) in buttons {
+                assert!(area.width >= 3, "{width}x{height}: {area:?}");
+                let (text_x, text_y, text) = centered_button_text(area, &label).unwrap();
+                let text_width = r3bl_tui::GCStringOwned::new(&text)
+                    .display_width()
+                    .as_usize();
+                assert_eq!(text_y, area.y + 1, "{width}x{height}: {area:?}");
+                assert_eq!(
+                    text_x,
+                    area.x + (area.width - text_width) / 2,
+                    "{width}x{height}: {area:?}"
                 );
+                assert!(text_x >= area.x + 1, "{width}x{height}: {area:?}");
+                assert!(
+                    text_x + text_width <= area.x + area.width - 1,
+                    "{width}x{height}: {area:?}"
+                );
+                for y in area.y..area.y + area.height {
+                    for x in area.x..area.x + area.width {
+                        assert!(area.contains(x, y), "{width}x{height}: {area:?}");
+                    }
+                }
             }
         }
     }
@@ -3132,6 +3229,71 @@ mod tests {
         assert_eq!(global.state.content_scroll, 1);
         click(&mut app, &mut global, FooterAction::ScrollUp);
         assert_eq!(global.state.content_scroll, 0);
+    }
+
+    #[test]
+    fn compact_mouse_controls_cover_disk_selection_detail_scroll_and_exit() {
+        let state = Dashboard {
+            disks: (0..4)
+                .map(|index| DiskView {
+                    identity: identity(&index.to_string(), index),
+                    telemetry: None,
+                    querying: false,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut app = DashboardApp::default();
+        let mut global = test_global_data(state, 30, 10);
+        let layout = Layout::new(30, 10, 4, 0);
+        assert!(layout.controls.is_empty());
+
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(
+                MouseInputKind::ScrollDown,
+                layout.tabs[0].x + 1,
+                layout.tabs[0].y + 1,
+            ),
+        );
+        assert_eq!(global.state.selected, 1);
+        assert_eq!(global.state.scroll, 1);
+
+        let selected_tab = Layout::new(30, 10, 4, global.state.scroll).tabs[0];
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(
+                MouseInputKind::MouseDown(Button::Left),
+                selected_tab.x + selected_tab.width / 2,
+                selected_tab.y + selected_tab.height / 2,
+            ),
+        );
+        assert_eq!(global.state.selected, 1);
+
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(MouseInputKind::ScrollDown, 15, layout.body_y),
+        );
+        assert_eq!(global.state.content_scroll, 1);
+
+        assert!(matches!(
+            dispatch_input(
+                &mut app,
+                &mut global,
+                mouse_event(
+                    MouseInputKind::MouseDown(Button::Left),
+                    layout.quit.x + 1,
+                    layout.quit.y + 1,
+                ),
+            ),
+            EventPropagation::ExitMainEventLoop
+        ));
     }
 
     #[test]
@@ -3514,8 +3676,10 @@ mod tests {
             endurance_percent: Some(12.0),
             ..Default::default()
         };
+        let mut primary_identity = identity("test", 4);
+        primary_identity.model = Some("MODELO-UNICO".into());
         let disk = DiskView {
-            identity: identity("test", 4),
+            identity: primary_identity,
             telemetry: Some(telemetry),
             querying: false,
             computing: false,
@@ -3554,7 +3718,7 @@ mod tests {
             started: true,
             ..Default::default()
         };
-        for (width, height) in [(100, 28), (12, 4), (1, 1), (1, 8)] {
+        for (width, height) in [(100, 28), (70, 20), (30, 10), (12, 4), (1, 1), (1, 8)] {
             let mut global = test_global_data(state.clone(), width, height);
             let pipeline = app
                 .app_render(
@@ -3576,14 +3740,15 @@ mod tests {
                 &mut r3bl_tui::MemoizedLenMap::default(),
             );
             if width == 100 {
+                let layout = Layout::new(width, height, state.disks.len(), state.scroll);
                 assert!(
                     matches!(
-                        buffer[1][0],
+                        buffer[layout.tabs[0].y][layout.tabs[0].x],
                         r3bl_tui::PixelChar::PlainText { style, .. }
                             if style.color_bg == Some(TuiColor::Rgb(TOKYO_BG_VISUAL))
                     ),
                     "bg={:?} wanted={:?}",
-                    match buffer[1][0] {
+                    match buffer[layout.tabs[0].y][layout.tabs[0].x] {
                         r3bl_tui::PixelChar::PlainText { style, .. } => style.color_bg,
                         _ => None,
                     },
@@ -3609,32 +3774,66 @@ mod tests {
                 );
             }
             if width == 100 {
-                assert!(cell_has_colors(&buffer[0][1], TOKYO_PURPLE, TOKYO_BG_DARK));
-                assert!(cell_has_colors(&buffer[1][0], TOKYO_FG, TOKYO_BG_VISUAL));
-                assert!(cell_has_colors(&buffer[2][0], TOKYO_FG, TOKYO_BG_VISUAL));
-                assert!(cell_has_colors(&buffer[3][1], TOKYO_GREEN, TOKYO_BG_DARK1));
-                assert!(cell_has_colors(&buffer[4][1], TOKYO_GREEN, TOKYO_BG));
-                assert!(cell_has_colors(&buffer[9][1], TOKYO_ORANGE, TOKYO_BG_DARK));
+                assert!(cell_has_colors(&buffer[1][1], TOKYO_BLUE, TOKYO_BG_DARK));
+                let layout = Layout::new(width, height, state.disks.len(), state.scroll);
                 assert!(cell_has_colors(
-                    &buffer[11][1],
-                    TOKYO_FG_DARK,
+                    &buffer[layout.tabs[0].y][layout.tabs[0].x],
+                    TOKYO_FG,
+                    TOKYO_BG_VISUAL
+                ));
+                for (position, tab) in layout.tabs.iter().enumerate() {
+                    let (foreground, background) =
+                        if layout.tab_indices[position] == global.state.selected {
+                            (TOKYO_FG, TOKYO_BG_VISUAL)
+                        } else {
+                            (TOKYO_FG_DARK, TOKYO_BG_DARK1)
+                        };
+                    for y in tab.y..tab.y + tab.height {
+                        for x in tab.x..tab.x + tab.width {
+                            assert!(cell_has_colors(&buffer[y][x], foreground, background));
+                        }
+                    }
+                }
+                let tab_row = rendered.lines().nth(layout.tabs[0].y + 1).unwrap();
+                assert!(tab_row.contains("> Disco #4"), "{tab_row}");
+                assert!(!tab_row.contains("MODELO-UNICO"), "{tab_row}");
+                assert!(
+                    rendered
+                        .lines()
+                        .nth(layout.body_y)
+                        .unwrap()
+                        .contains("MODELO-UNICO"),
+                    "{rendered}"
+                );
+                let health_row = layout.body_y + 1;
+                assert!(cell_has_colors(
+                    &buffer[health_row][1],
+                    TOKYO_GREEN,
                     TOKYO_BG_DARK1
                 ));
-                assert!(cell_has_colors(&buffer[11][15], TOKYO_FG, TOKYO_BG_DARK1));
-                assert!(cell_has_colors(&buffer[12][1], TOKYO_FG_DARK, TOKYO_BG));
-                assert!((93..100).all(|x| cell_has_colors(
-                    &buffer[0][x],
-                    TOKYO_BG_DARK1,
-                    TOKYO_RED
-                )));
-                let layout = Layout::new(width, height, state.disks.len(), state.scroll);
+                let eta_row = rendered
+                    .lines()
+                    .position(|line| line.contains("ETA"))
+                    .unwrap();
+                assert!(cell_has_colors(
+                    &buffer[eta_row][1],
+                    TOKYO_FG_DARK,
+                    TOKYO_BG_DARK
+                ));
+                for y in layout.quit.y..layout.quit.y + layout.quit.height {
+                    for x in layout.quit.x..layout.quit.x + layout.quit.width {
+                        assert!(cell_has_colors(&buffer[y][x], TOKYO_BG_DARK1, TOKYO_RED));
+                    }
+                }
                 for control in &layout.controls {
-                    for x in control.area.x..control.area.x + control.area.width {
-                        assert!(cell_has_colors(
-                            &buffer[control.area.y][x],
-                            TOKYO_BG_DARK1,
-                            TOKYO_BLUE
-                        ));
+                    let color = match control.action {
+                        FooterAction::PreviousDisk | FooterAction::NextDisk => TOKYO_BLUE,
+                        FooterAction::ScrollUp | FooterAction::ScrollDown => TOKYO_CYAN,
+                    };
+                    for y in control.area.y..control.area.y + control.area.height {
+                        for x in control.area.x..control.area.x + control.area.width {
+                            assert!(cell_has_colors(&buffer[y][x], TOKYO_BG_DARK1, color));
+                        }
                     }
                 }
                 assert!(
@@ -3647,6 +3846,20 @@ mod tests {
                         .iter()
                         .all(|score_row| rendered.contains(score_row.trim_end()))
                 );
+            }
+            if width == 30 {
+                let layout = Layout::new(width, height, state.disks.len(), state.scroll);
+                assert!(layout.controls.is_empty());
+                for y in layout.quit.y..layout.quit.y + layout.quit.height {
+                    for x in layout.quit.x..layout.quit.x + layout.quit.width {
+                        assert!(cell_has_colors(&buffer[y][x], TOKYO_BG_DARK1, TOKYO_RED));
+                    }
+                }
+                for y in layout.tabs[0].y..layout.tabs[0].y + layout.tabs[0].height {
+                    for x in layout.tabs[0].x..layout.tabs[0].x + layout.tabs[0].width {
+                        assert!(cell_has_colors(&buffer[y][x], TOKYO_FG, TOKYO_BG_VISUAL));
+                    }
+                }
             }
             if width == 12 && height >= 8 {
                 assert!(rendered.contains("88%"), "{rendered}");

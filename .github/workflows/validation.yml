@@ -13,9 +13,17 @@ jobs:
     env:
       MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
       MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
+      CHKDSK_UI_PROOF_DIR: target/ui-proof
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v5
         with:
           install: true
       - run: mise run validation
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chkdsk-ui-proof
+          path: target/ui-proof/chkdsk-ui-proof.html
+          if-no-files-found: ignore
+          retention-days: 7
