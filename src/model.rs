@@ -65,6 +65,10 @@ pub struct AtaAttribute {
     pub flags: u16,
     pub current: u8,
     pub worst: u8,
+    /// Device-declared failure threshold from SMART READ THRESHOLDS, when
+    /// available. Zero/absent thresholds are not interpreted as a trip.
+    #[serde(default)]
+    pub threshold: Option<u8>,
     /// Raw vendor-defined six-byte value, retained without assigning units.
     pub raw: [u8; 6],
 }
@@ -72,6 +76,9 @@ pub struct AtaAttribute {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtaHealth {
     pub attributes: Vec<AtaAttribute>,
+    /// Whether a valid SMART READ THRESHOLDS sector was received.
+    #[serde(default)]
+    pub thresholds_available: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -81,6 +88,9 @@ pub struct Telemetry {
     /// Wear consumed, 0..=100. Only populate when the device/model mapping
     /// establishes the semantics; never infer it from an ATA attribute ID.
     pub endurance_percent: Option<f64>,
+    /// Manufacturer/model profile that authorized ATA lifetime semantics.
+    #[serde(default)]
+    pub ata_profile: Option<String>,
     pub power_on_hours: Option<u64>,
     pub temperature_c: Option<i16>,
     /// SMART/NVMe device-reported overall failure state.
@@ -98,5 +108,75 @@ impl Telemetry {
         let failed = health.critical_warning & ((1 << 0) | (1 << 2) | (1 << 3)) != 0;
         self.overall_failure = QueryState::Success(failed);
         self.nvme = QueryState::Success(health);
+    }
+
+    /// Apply ATA attributes and only profile-backed wear semantics.
+    pub fn apply_ata(&mut self, health: AtaHealth, model: Option<&str>) {
+        let profile = crate::ata::profile(model);
+        self.ata_profile = profile.map(|profile| profile.family.to_owned());
+        let endurance = profile.and_then(|profile| {
+            health
+                .attributes
+                .iter()
+                .find(|attribute| attribute.id == profile.lifetime_used_attribute)
+                .and_then(|attribute| {
+                    crate::ata::endurance_used_percent(model, attribute.id, attribute.raw)
+                })
+                .map(f64::from)
+        });
+        if endurance.is_some() {
+            self.endurance_percent = endurance;
+        }
+        self.ata = QueryState::Success(health);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_scoped_ata_profiles_decode_crucial_raw_used_only() {
+        let health = |id, raw| AtaHealth {
+            attributes: vec![AtaAttribute {
+                id,
+                flags: 0,
+                current: 77,
+                worst: 75,
+                threshold: Some(5),
+                raw: [raw, 0, 0, 0, 0, 0],
+            }],
+            thresholds_available: true,
+        };
+        let mut crucial = Telemetry::default();
+        crucial.apply_ata(health(202, 23), Some("Crucial CT500MX500SSD1"));
+        assert_eq!(crucial.endurance_percent, Some(23.0));
+        assert_eq!(crucial.ata_profile.as_deref(), Some("Crucial MX500"));
+        assert!(matches!(
+            &crucial.ata,
+            QueryState::Success(health) if health.attributes[0].current == 77
+        ));
+
+        for (model, id) in [
+            ("Samsung SSD 850 EVO", 177),
+            ("Samsung SSD 860 EVO", 177),
+            ("Samsung SSD 870 EVO", 177),
+            ("CT500MX500SSD2", 202),
+            ("MacroVIP MV240GB", 177),
+        ] {
+            let mut unprofiled = Telemetry::default();
+            unprofiled.apply_ata(health(id, 23), Some(model));
+            assert_eq!(unprofiled.endurance_percent, None, "{model}");
+            assert_eq!(unprofiled.ata_profile, None, "{model}");
+        }
+    }
+
+    #[test]
+    fn older_ata_telemetry_json_defaults_new_threshold_fields() {
+        let older =
+            r#"{"attributes":[{"id":5,"flags":1,"current":100,"worst":100,"raw":[0,0,0,0,0,0]}]}"#;
+        let health: AtaHealth = serde_json::from_str(older).unwrap();
+        assert!(!health.thresholds_available);
+        assert_eq!(health.attributes[0].threshold, None);
     }
 }

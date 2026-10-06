@@ -122,6 +122,7 @@ mod windows {
     const IOCTL_DISK_GET_LENGTH_INFO: u32 = ctl_code(0x07, 0x0017, 0, 1);
     const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = ctl_code(0x2d, 0x0420, 0, 0);
     const IOCTL_ATA_PASS_THROUGH: u32 = ctl_code(0x04, 0x040b, 0, 3);
+    const IOCTL_SMART_RCV_DRIVE_DATA: u32 = ctl_code(0x07, 0x0022, 0, 3);
     const IOCTL_STORAGE_PREDICT_FAILURE: u32 = ctl_code(0x2d, 0x0440, 0, 1);
     const STORAGE_DEVICE_PROPERTY: u32 = 0;
     const STORAGE_DEVICE_SEEK_PENALTY_PROPERTY: u32 = 7;
@@ -137,6 +138,7 @@ mod windows {
     const ATA_STATUS_DF: u8 = 0x20;
     const ATA_SMART_COMMAND: u8 = 0xb0;
     const ATA_SMART_READ_DATA: u8 = 0xd0;
+    const ATA_SMART_READ_THRESHOLDS: u8 = 0xd1;
     const ATA_SMART_RETURN_STATUS: u8 = 0xda;
 
     const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
@@ -753,9 +755,73 @@ mod windows {
         parse::parse_nvme_health_log(&output[start..end]).map_err(|_| 13)
     }
 
+    fn legacy_smart_input(feature: u8) -> [u8; 32] {
+        // SENDCMDINPARAMS ends immediately before its one-byte trailing buffer.
+        let mut input = [0u8; 32];
+        put_u32(&mut input, 0, 512);
+        input[4] = feature;
+        input[5] = 1; // SMART READ DATA / THRESHOLDS sector count.
+        input[7] = 0x4f;
+        input[8] = 0xc2;
+        input[9] = 0xa0;
+        input[10] = ATA_SMART_COMMAND;
+        input
+    }
+
+    fn legacy_smart_sector(device: &Device, feature: u8) -> Result<Vec<u8>, AtaCommandError> {
+        // The 16-byte SENDCMDOUTPARAMS fixed header is followed by one sector.
+        let input = legacy_smart_input(feature);
+        let mut output = [0u8; 16 + 512];
+        let returned = ioctl(device, IOCTL_SMART_RCV_DRIVE_DATA, &input, &mut output)
+            .map_err(AtaCommandError::Io)?;
+        legacy_smart_response(&output, returned).map(|sector| sector.to_vec())
+    }
+
+    fn legacy_smart_response(output: &[u8], returned: usize) -> Result<&[u8], AtaCommandError> {
+        if returned < 16 + 512 || output.len() < 16 + 512 || get_u32(output, 0).unwrap_or(0) < 512 {
+            return Err(AtaCommandError::ShortResponse);
+        }
+        let driver_error = output[4];
+        let status = output[5];
+        if driver_error != 0 || status & (ATA_STATUS_ERR | ATA_STATUS_DF) != 0 {
+            return Err(AtaCommandError::Device {
+                status,
+                error: driver_error,
+            });
+        }
+        Ok(&output[16..16 + 512])
+    }
+
+    fn ata_data_sector(
+        pass_through: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
+        legacy: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
+    ) -> Result<Vec<u8>, AtaCommandError> {
+        pass_through().or_else(|pass_error| legacy().map_err(|_| pass_error))
+    }
+
     fn ata_health(device: &Device) -> Result<crate::model::AtaHealth, AtaCommandError> {
-        let (sector, _) = ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_DATA, true)?;
-        parse::parse_ata_smart_data(&sector).map_err(|_| AtaCommandError::ShortResponse)
+        let sector = ata_data_sector(
+            || {
+                ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_DATA, true)
+                    .map(|(sector, _)| sector)
+            },
+            || legacy_smart_sector(device, ATA_SMART_READ_DATA),
+        )?;
+        let mut health =
+            parse::parse_ata_smart_data(&sector).map_err(|_| AtaCommandError::ShortResponse)?;
+
+        if let Ok(thresholds) = ata_data_sector(
+            || {
+                ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_THRESHOLDS, true)
+                    .map(|(sector, _)| sector)
+            },
+            || legacy_smart_sector(device, ATA_SMART_READ_THRESHOLDS),
+        ) {
+            // Thresholds are optional evidence: malformed/unavailable threshold
+            // data must not invalidate a checksummed READ DATA sector.
+            let _ = parse::apply_ata_smart_thresholds(&mut health, &thresholds);
+        }
+        Ok(health)
     }
 
     fn ata_failure_status(device: &Device) -> Result<bool, AtaCommandError> {
@@ -807,7 +873,7 @@ mod windows {
             }
         }
         match ata_health(&device) {
-            Ok(health) => telemetry.ata = QueryState::Success(health),
+            Ok(health) => telemetry.apply_ata(health, identity.model.as_deref()),
             Err(code) => {
                 let state = classify(code.code());
                 probe_errors.push(state);
@@ -910,6 +976,133 @@ mod windows {
                 ata_task_file(ATA_SMART_RETURN_STATUS, ATA_SMART_COMMAND, false),
                 [0xda, 0, 0, 0x4f, 0xc2, 0xa0, 0xb0, 0]
             );
+            assert_eq!(
+                ata_task_file(ATA_SMART_READ_THRESHOLDS, ATA_SMART_COMMAND, true),
+                [0xd1, 1, 0, 0x4f, 0xc2, 0xa0, 0xb0, 0]
+            );
+        }
+
+        #[test]
+        fn ata_read_data_fallback_is_used_only_after_pass_through_fails() {
+            let fallback = ata_data_sector(
+                || Ok(vec![1]),
+                || panic!("legacy fallback must not run on pass-through success"),
+            )
+            .unwrap();
+            assert_eq!(fallback, [1]);
+
+            let fallback = ata_data_sector(|| Err(AtaCommandError::Io(5)), || Ok(vec![2])).unwrap();
+            assert_eq!(fallback, [2]);
+
+            assert_eq!(
+                ata_data_sector(
+                    || Err(AtaCommandError::Io(5)),
+                    || Err(AtaCommandError::Io(1)),
+                ),
+                Err(AtaCommandError::Io(5))
+            );
+        }
+
+        #[test]
+        fn legacy_smart_receive_header_uses_documented_sector_request() {
+            assert_eq!(IOCTL_SMART_RCV_DRIVE_DATA, 508040);
+            let input = legacy_smart_input(ATA_SMART_READ_THRESHOLDS);
+            assert_eq!(input.len(), 32);
+            assert_eq!(get_u32(&input, 0), Some(512));
+            assert_eq!(
+                &input[4..12],
+                &[
+                    ATA_SMART_READ_THRESHOLDS,
+                    1,
+                    0,
+                    0x4f,
+                    0xc2,
+                    0xa0,
+                    ATA_SMART_COMMAND,
+                    0
+                ]
+            );
+        }
+
+        #[test]
+        fn legacy_smart_response_rejects_partial_and_device_error_status() {
+            let mut output = [0u8; 16 + 512];
+            put_u32(&mut output, 0, 512);
+            assert_eq!(
+                legacy_smart_response(&output, output.len()).unwrap().len(),
+                512
+            );
+            assert_eq!(
+                legacy_smart_response(&output, output.len() - 1),
+                Err(AtaCommandError::ShortResponse)
+            );
+            output[4] = 0x04;
+            output[5] = ATA_STATUS_ERR;
+            assert_eq!(
+                legacy_smart_response(&output, output.len()),
+                Err(AtaCommandError::Device {
+                    status: ATA_STATUS_ERR,
+                    error: 0x04,
+                })
+            );
+        }
+
+        #[test]
+        #[ignore = "requires elevated physical-drive access; set CHKDSK_HARDWARE_REPORT to an absolute report path"]
+        fn physical_disk_smart_diagnostic() {
+            let report_path = std::env::var_os("CHKDSK_HARDWARE_REPORT")
+                .expect("set CHKDSK_HARDWARE_REPORT to an absolute report path");
+            let report_path = std::path::PathBuf::from(report_path);
+            assert!(report_path.is_absolute(), "report path must be absolute");
+            let disks = discover().expect("native disk discovery");
+            let observations: Vec<_> = disks
+                .iter()
+                .map(|identity| {
+                    let result = query(identity);
+                    let summary = match &result {
+                        Ok(telemetry) => {
+                            let ata = match &telemetry.ata {
+                                QueryState::Success(health) => serde_json::json!({
+                                    "state": "readable",
+                                    "attributes": health.attributes.len(),
+                                    "thresholds_available": health.thresholds_available,
+                                }),
+                                QueryState::Failed { message } => serde_json::json!({
+                                    "state": "failed",
+                                    "message": message,
+                                }),
+                                QueryState::Unsupported => {
+                                    serde_json::json!({"state": "unsupported"})
+                                }
+                                QueryState::NotQueried => {
+                                    serde_json::json!({"state": "not_queried"})
+                                }
+                            };
+                            serde_json::json!({
+                                "ata": ata,
+                                "nvme": format!("{:?}", telemetry.nvme),
+                                "overall_failure": format!("{:?}", telemetry.overall_failure),
+                            })
+                        }
+                        Err(error) => serde_json::json!({
+                            "query_error": format!("{:?}: {}", error.state, error.message),
+                        }),
+                    };
+                    serde_json::json!({
+                        "index": identity.index,
+                        "model": identity.model,
+                        "bus": identity.bus,
+                        "kind": format!("{:?}", identity.kind),
+                        "query": summary,
+                    })
+                })
+                .collect();
+            let report = serde_json::json!({
+                "discovered": disks.len(),
+                "observations": observations,
+            });
+            std::fs::write(report_path, serde_json::to_vec_pretty(&report).unwrap())
+                .expect("write hardware report");
         }
 
         #[test]

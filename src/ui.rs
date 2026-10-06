@@ -31,10 +31,25 @@ const MOCHA_BASE: RgbValue = RgbValue {
     green: 30,
     blue: 46,
 };
-const MOCHA_SURFACE: RgbValue = RgbValue {
+const MOCHA_MANTLE: RgbValue = RgbValue {
+    red: 24,
+    green: 24,
+    blue: 37,
+};
+const MOCHA_SURFACE0: RgbValue = RgbValue {
+    red: 49,
+    green: 50,
+    blue: 68,
+};
+const MOCHA_SURFACE1: RgbValue = RgbValue {
     red: 69,
     green: 71,
     blue: 90,
+};
+const MOCHA_SURFACE2: RgbValue = RgbValue {
+    red: 88,
+    green: 91,
+    blue: 112,
 };
 const MOCHA_TEXT: RgbValue = RgbValue {
     red: 205,
@@ -66,6 +81,11 @@ const MOCHA_YELLOW: RgbValue = RgbValue {
     green: 226,
     blue: 175,
 };
+const MOCHA_PEACH: RgbValue = RgbValue {
+    red: 250,
+    green: 179,
+    blue: 135,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DiskView {
@@ -82,6 +102,7 @@ pub struct Dashboard {
     pub disks: Vec<DiskView>,
     pub selected: usize,
     pub scroll: usize,
+    pub hovered_tab: Option<usize>,
     pub content_scroll: usize,
     pub notice: Option<String>,
     pub history: History,
@@ -187,6 +208,14 @@ impl App for DashboardApp {
                     state.disks.len(),
                     state.scroll,
                 );
+                if mouse.kind == MouseInputKind::MouseMove {
+                    let hovered_tab = layout.tab_at(x, y);
+                    if state.hovered_tab != hovered_tab {
+                        state.hovered_tab = hovered_tab;
+                        return Ok(EventPropagation::ConsumedRender);
+                    }
+                    return Ok(EventPropagation::Propagate);
+                }
                 match mouse.kind {
                     MouseInputKind::MouseDown(Button::Left) => {
                         if layout.quit.contains(x, y) {
@@ -194,8 +223,13 @@ impl App for DashboardApp {
                         }
                         if let Some(index) = layout.tab_at(x, y) {
                             state.selected = index;
-                            state.scroll = index;
+                            state.hovered_tab = Some(index);
                             state.content_scroll = 0;
+                            ensure_selected_visible(
+                                state,
+                                (*global.window_size.col_width).into(),
+                                (*global.window_size.row_height).into(),
+                            );
                         }
                     }
                     MouseInputKind::ScrollUp
@@ -219,6 +253,11 @@ impl App for DashboardApp {
             }
             _ => return Ok(EventPropagation::Propagate),
         }
+        ensure_selected_visible(
+            state,
+            (*global.window_size.col_width).into(),
+            (*global.window_size.row_height).into(),
+        );
         Ok(EventPropagation::ConsumedRender)
     }
 
@@ -266,7 +305,6 @@ impl App for DashboardApp {
                     .and_then(|id| state.disks.iter().position(|disk| disk.identity.id == id))
                     .unwrap_or(0)
                     .min(state.disks.len().saturating_sub(1));
-                state.scroll = state.selected;
                 state.notice = if state.disks.is_empty() {
                     Some("Nenhum disco encontrado".into())
                 } else {
@@ -412,17 +450,36 @@ impl App for DashboardApp {
             return Ok(pipeline);
         }
 
-        paint(
+        for y in 0..height {
+            paint_background(
+                &mut ops,
+                0,
+                y,
+                &" ".repeat(width),
+                MOCHA_TEXT,
+                false,
+                width,
+                Some(MOCHA_BASE),
+            );
+        }
+        fill_row(&mut ops, 0, width, MOCHA_MANTLE);
+        let title = if width >= 15 {
+            format!(" chkdsk v{}", env!("CARGO_PKG_VERSION"))
+        } else {
+            " chkdsk".to_owned()
+        };
+        paint_background(
             &mut ops,
             0,
             0,
-            &format!("chkdsk v{}", env!("CARGO_PKG_VERSION")),
+            &title,
             MOCHA_LAVENDER,
             true,
             width.saturating_sub(layout.quit.width),
+            Some(MOCHA_MANTLE),
         );
         if layout.quit.visible() {
-            paint(
+            paint_background(
                 &mut ops,
                 layout.quit.x,
                 0,
@@ -436,37 +493,42 @@ impl App for DashboardApp {
                 MOCHA_RED,
                 true,
                 width.saturating_sub(layout.quit.x),
+                Some(MOCHA_MANTLE),
             );
+        }
+        if height > 1 {
+            fill_row(&mut ops, 1, width, MOCHA_SURFACE0);
         }
         for (position, area) in layout.tabs.iter().enumerate() {
             let index = layout.tab_indices[position];
             let disk = &state.disks[index];
-            let mark = if index == state.selected {
-                "● "
-            } else {
-                "○ "
-            };
+            let mark = if index == state.selected { "> " } else { "  " };
             let name = disk
                 .identity
                 .model
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or("Disco");
-            let label = clipped(&format!("{mark}{name}"), area.width);
-            let label = format!("{label:<width$}", width = area.width);
+            let physical = format!("#{}", disk.identity.index);
+            let model_width = area.width.saturating_sub(mark.len() + physical.len() + 1);
+            let model = clipped(name, model_width);
+            let label = pad_to_columns(&format!("{mark}{model} {physical}"), area.width);
+            let (fg, bg) = if index == state.selected {
+                (MOCHA_BASE, MOCHA_LAVENDER)
+            } else if state.hovered_tab == Some(index) {
+                (MOCHA_TEXT, MOCHA_SURFACE2)
+            } else {
+                (MOCHA_MUTED, MOCHA_SURFACE1)
+            };
             paint_background(
                 &mut ops,
                 area.x,
                 area.y,
                 &label,
-                if index == state.selected {
-                    MOCHA_LAVENDER
-                } else {
-                    MOCHA_MUTED
-                },
-                index == state.selected,
+                fg,
+                index == state.selected || state.hovered_tab == Some(index),
                 area.width,
-                (index == state.selected).then_some(MOCHA_SURFACE),
+                Some(bg),
             );
         }
         if height > layout.body_y {
@@ -482,7 +544,7 @@ impl App for DashboardApp {
                     state.frame,
                 );
             } else {
-                paint(
+                paint_background(
                     &mut ops,
                     width.min(2).saturating_sub(1),
                     layout.body_y,
@@ -490,18 +552,30 @@ impl App for DashboardApp {
                     MOCHA_MUTED,
                     false,
                     width.saturating_sub(2),
+                    Some(MOCHA_SURFACE0),
                 );
             }
         }
         if height >= 6 {
-            paint(
+            fill_row(&mut ops, height - 1, width, MOCHA_MANTLE);
+            let controls = if width >= 40 {
+                "←/→ discos  ↑/↓ detalhes  Tab próximo  q sair"
+            } else if width >= 27 {
+                "←/→ disco  ↑/↓  Tab  q sair"
+            } else if width >= 16 {
+                "←/→  ↑/↓  Tab  q"
+            } else {
+                "q sair"
+            };
+            paint_background(
                 &mut ops,
                 0,
                 height - 1,
-                "←/→ disco  ↑/↓ rolar  Tab próximo  q sair",
+                controls,
                 MOCHA_MUTED,
                 false,
                 width,
+                Some(MOCHA_MANTLE),
             );
         }
         pipeline.push(ZOrder::Normal, ops);
@@ -521,8 +595,25 @@ fn move_selection(state: &mut Dashboard, forward: bool, amount: usize) {
     } else {
         state.selected.saturating_sub(amount)
     };
-    state.scroll = state.selected;
     state.content_scroll = 0;
+}
+
+fn ensure_selected_visible(state: &mut Dashboard, width: usize, height: usize) {
+    let layout = Layout::new(width, height, state.disks.len(), state.scroll);
+    if layout.tab_indices.contains(&state.selected) {
+        return;
+    }
+    if let Some(last) = layout.tab_indices.last().copied() {
+        if state.selected > last {
+            state.scroll = state
+                .selected
+                .saturating_sub(layout.tab_indices.len().saturating_sub(1));
+        } else {
+            state.scroll = state.selected;
+        }
+    } else {
+        state.scroll = state.selected;
+    }
 }
 
 const MAX_CONCURRENT_DISK_QUERIES: usize = 4;
@@ -743,7 +834,11 @@ impl Layout {
         let start = scroll.min(disks.saturating_sub(1));
         if width >= 3 && height > 2 {
             for index in start..disks {
-                let available = (14 + (index % 10)).min(width.saturating_sub(x));
+                let remaining = width.saturating_sub(x);
+                if remaining < 22 && !tabs.is_empty() {
+                    break;
+                }
+                let available = 22.min(remaining);
                 if available == 0 {
                     break;
                 }
@@ -760,7 +855,7 @@ impl Layout {
                 }
             }
         }
-        let body_y = if height > 2 { 2.min(height) } else { height };
+        let body_y = if height > 2 { 2 } else { height };
         Self {
             tabs,
             tab_indices,
@@ -773,6 +868,21 @@ impl Layout {
             .iter()
             .position(|tab| tab.contains(x, y))
             .and_then(|position| self.tab_indices.get(position).copied())
+    }
+}
+
+fn fill_row(ops: &mut RenderOpIRVec, y: usize, width: usize, color: RgbValue) {
+    if width > 0 {
+        paint_background(
+            ops,
+            0,
+            y,
+            &" ".repeat(width),
+            MOCHA_TEXT,
+            false,
+            width,
+            Some(color),
+        );
     }
 }
 
@@ -790,65 +900,106 @@ fn render_disk(
     if available_height == 0 || width == 0 {
         return;
     }
+    let mut line = 0usize;
+    let mut row = |text: &str, fg: RgbValue, bg: RgbValue, bold: bool| {
+        if line >= scroll && line - scroll < available_height {
+            let y = top + line - scroll;
+            fill_row(ops, y, width, bg);
+            paint_background(
+                ops,
+                1.min(width.saturating_sub(1)),
+                y,
+                text,
+                fg,
+                bold,
+                width.saturating_sub(1),
+                Some(bg),
+            );
+        }
+        line += 1;
+    };
     let model = disk
         .identity
         .model
         .as_deref()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("Modelo desconhecido");
-    let kind = match disk.identity.kind {
-        DiskKind::Hdd => "HD",
-        DiskKind::Ssd => "SSD",
-        DiskKind::Nvme => "NVMe",
-        DiskKind::Unknown => "Tipo desconhecido",
-    };
-    let capacity = disk
-        .identity
-        .capacity_bytes
-        .map(format_bytes)
-        .unwrap_or_else(|| "capacidade indisponível".into());
-    let mut lines: Vec<(String, RgbValue, bool)> = vec![
-        (model.to_owned(), MOCHA_TEXT, true),
-        (format!("{kind}  ·  {capacity}"), MOCHA_MUTED, false),
-    ];
-    if disk.querying || disk.computing {
-        let spinner = ["◐", "◓", "◑", "◒"][frame % 4];
-        let stage = if disk.computing {
-            "Calculando saúde"
+    row(model, MOCHA_TEXT, MOCHA_BASE, true);
+
+    let Some(telemetry) = disk.telemetry.as_ref() else {
+        let message = if disk.querying || disk.computing {
+            if disk.computing {
+                "Calculando saúde…"
+            } else {
+                "Consultando dados de saúde…"
+            }
         } else {
-            "Consultando e interpretando dados"
-        };
-        lines.push((format!("{spinner} {stage}…"), MOCHA_YELLOW, true));
-    } else if disk.telemetry.is_none() {
-        lines.push((
             disk.error_message
-                .clone()
-                .unwrap_or_else(|| "Dados de saúde indisponíveis".into()),
-            MOCHA_YELLOW,
-            false,
-        ));
-    }
-    if let Some(telemetry) = disk.telemetry.as_ref() {
-        let health = score_health(disk.identity.kind, telemetry);
-        let (label, color) = match health.outcome {
-            HealthOutcome::Pass => ("SAUDÁVEL", MOCHA_GREEN),
-            HealthOutcome::Fail => ("ATENÇÃO", MOCHA_RED),
-            HealthOutcome::Unknown => ("INDISPONÍVEL", MOCHA_YELLOW),
+                .as_deref()
+                .unwrap_or("Dados de saúde indisponíveis")
         };
-        lines.push((label.into(), color, true));
-        let digits = if health.outcome == HealthOutcome::Unknown {
+        let color = if disk.querying || disk.computing {
+            MOCHA_YELLOW
+        } else {
+            MOCHA_RED
+        };
+        row(message, color, MOCHA_SURFACE0, true);
+        let kind = match disk.identity.kind {
+            DiskKind::Hdd => "HDD",
+            DiskKind::Ssd => "SSD",
+            DiskKind::Nvme => "NVMe",
+            DiskKind::Unknown => "Tipo desconhecido",
+        };
+        row(
+            &format!(
+                "{kind} · {}",
+                disk.identity
+                    .capacity_bytes
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "capacidade indisponível".into())
+            ),
+            MOCHA_MUTED,
+            MOCHA_BASE,
+            false,
+        );
+        return;
+    };
+    let health = score_health(disk.identity.kind, telemetry);
+    let (label, color) = health_presentation(&health);
+    let nominal_attention = health.outcome == HealthOutcome::Pass && health.score <= 50;
+    let basic_smart = is_basic_smart_pass(&health);
+    let large_score = available_height >= 9 && width >= 26;
+    let headline = if large_score || health.outcome == HealthOutcome::Unknown {
+        label.to_owned()
+    } else if nominal_attention {
+        format!("NOMINAL · {}%", health.score)
+    } else if basic_smart {
+        format!("SMART OK · {}%", health.score)
+    } else {
+        format!("{label} · {}%", health.score)
+    };
+    row(&headline, color, MOCHA_SURFACE0, true);
+
+    if large_score {
+        let score_text = if health.outcome == HealthOutcome::Unknown {
             "N/A".to_owned()
         } else {
-            health.score.to_string()
+            format!("{}%", health.score)
         };
-        let ascii = ascii_score_lines(&digits);
-        for row in ascii {
-            lines.push((row, color, true));
+        for score_row in ascii_score_lines(&score_text) {
+            row(&score_row, color, MOCHA_BASE, true);
         }
-        if health.outcome != HealthOutcome::Unknown {
-            lines.push(("% saúde".into(), MOCHA_MUTED, false));
+    }
+    let eta = if disk.identity.kind == DiskKind::Hdd || disk.identity.kind == DiskKind::Unknown {
+        if width < 40 {
+            "Vida estimada  n/a".to_owned()
+        } else {
+            "Vida estimada  não aplicável a este dispositivo".to_owned()
         }
-        let eta = history
+    } else if width < 40 && history.estimate_endurance(&disk.identity.id).is_none() {
+        "Vida estimada  sem histórico".to_owned()
+    } else {
+        history
             .estimate_endurance(&disk.identity.id)
             .map(|estimate| {
                 format!(
@@ -856,140 +1007,132 @@ fn render_disk(
                     format_endurance_days(estimate.remaining_seconds)
                 )
             })
-            .unwrap_or_else(|| "Vida estimada  aguardando histórico".into());
-        lines.push((eta, MOCHA_LAVENDER, true));
-        lines.push((
-            telemetry_status(telemetry).into(),
-            if telemetry_status(telemetry).contains("permissão") {
-                MOCHA_RED
-            } else {
-                MOCHA_MUTED
-            },
-            false,
-        ));
-        lines.push((
-            telemetry
-                .endurance_percent
-                .map(|wear| format!("Desgaste  {:.0}%", wear))
-                .unwrap_or_else(|| "Desgaste  indisponível".into()),
-            MOCHA_TEXT,
-            false,
-        ));
-        lines.push((
-            telemetry
-                .temperature_c
-                .map(|v| format!("Temperatura  {v} °C"))
-                .unwrap_or_else(|| "Temperatura  indisponível".into()),
-            MOCHA_TEXT,
-            false,
-        ));
-        lines.push((
-            telemetry
-                .power_on_hours
-                .map(|v| format!("Tempo ligado  {} h", compact_number(v)))
-                .unwrap_or_else(|| "Tempo ligado  indisponível".into()),
-            MOCHA_TEXT,
-            false,
-        ));
-        let last_reading = history
-            .samples
+            .unwrap_or_else(|| "Vida estimada  aguardando histórico".into())
+    };
+    row(&eta, MOCHA_PEACH, MOCHA_MANTLE, true);
+
+    let full_status = telemetry_status(telemetry);
+    let status = if width >= 40 {
+        full_status
+    } else if full_status.contains("permissão") {
+        "Permissão insuficiente"
+    } else if health.outcome == HealthOutcome::Unknown {
+        "Dados de saúde indisponíveis"
+    } else if health.outcome == HealthOutcome::Fail {
+        "Falha reportada"
+    } else if full_status.contains("parcial") {
+        "Dados parciais"
+    } else {
+        "Sem falha reportada"
+    };
+    let status_color =
+        if full_status.contains("permissão") || matches!(health.outcome, HealthOutcome::Fail) {
+            MOCHA_RED
+        } else if health.outcome == HealthOutcome::Unknown
+            || full_status.contains("parcial")
+            || basic_smart
+        {
+            MOCHA_YELLOW
+        } else {
+            MOCHA_GREEN
+        };
+    row(status, status_color, MOCHA_SURFACE0, false);
+    let kind = match disk.identity.kind {
+        DiskKind::Hdd => "HDD",
+        DiskKind::Ssd => "SSD",
+        DiskKind::Nvme => "NVMe",
+        DiskKind::Unknown => "Tipo desconhecido",
+    };
+    let bus = disk
+        .identity
+        .bus
+        .as_deref()
+        .unwrap_or("interface indisponível");
+    row(
+        &format!(
+            "{kind} · {bus} · {}",
+            disk.identity
+                .capacity_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "capacidade indisponível".into())
+        ),
+        MOCHA_MUTED,
+        MOCHA_BASE,
+        false,
+    );
+    let wear = telemetry
+        .endurance_percent
+        .map(|v| format!("{v:.0}%"))
+        .unwrap_or_else(|| "—".into());
+    let temperature = telemetry
+        .temperature_c
+        .map(|v| format!("{v} °C"))
+        .unwrap_or_else(|| "—".into());
+    let hours = telemetry
+        .power_on_hours
+        .map(|v| format!("{} h", compact_number(v)))
+        .unwrap_or_else(|| "—".into());
+    let metadata = if width < 40 {
+        format!("Desg. {wear} · Temp. {temperature}")
+    } else {
+        format!("Desgaste {wear}   Temperatura {temperature}   Ligado {hours}")
+    };
+    row(&metadata, MOCHA_TEXT, MOCHA_BASE, false);
+    if let QueryState::Success(nvme) = &telemetry.nvme {
+        for (bit, warning) in [
+            (1, "Reserva NVMe crítica"),
+            (2, "Temperatura NVMe crítica"),
+            (4, "Confiabilidade NVMe degradada"),
+            (8, "Mídia NVMe somente leitura"),
+            (16, "Aviso de memória NVMe"),
+        ] {
+            if nvme.critical_warning & bit != 0 {
+                row(warning, MOCHA_RED, MOCHA_SURFACE0, true);
+            }
+        }
+    }
+    let _ = frame;
+}
+
+fn is_basic_smart_pass(health: &crate::health::HealthScore) -> bool {
+    health.outcome == HealthOutcome::Pass
+        && health.score == 100
+        && health.confidence < 0.5
+        && health
+            .provenance
             .iter()
-            .filter(|sample| sample.disk_id == disk.identity.id)
-            .map(|sample| sample.timestamp_unix_secs)
-            .max();
-        lines.push((
-            last_reading
-                .map(|timestamp| {
-                    format!(
-                        "Última leitura  há {}",
-                        format_duration(age_seconds(timestamp))
-                    )
-                })
-                .unwrap_or_else(|| "Última leitura  indisponível".into()),
-            MOCHA_MUTED,
-            false,
-        ));
-        if let QueryState::Success(nvme) = &telemetry.nvme {
-            for (bit, warning) in [
-                (1, "Reserva NVMe crítica"),
-                (2, "Temperatura NVMe crítica"),
-                (4, "Confiabilidade NVMe degradada"),
-                (8, "Mídia NVMe somente leitura"),
-                (16, "Aviso de memória NVMe"),
-            ] {
-                if nvme.critical_warning & bit != 0 {
-                    lines.push((warning.into(), MOCHA_RED, true));
-                }
-            }
+            .any(|detail| detail.contains("coarse"))
+}
+
+fn health_presentation(health: &crate::health::HealthScore) -> (&'static str, RgbValue) {
+    match health.outcome {
+        HealthOutcome::Unknown => ("SAÚDE INDISPONÍVEL", MOCHA_YELLOW),
+        HealthOutcome::Fail => ("FALHA DETECTADA", MOCHA_RED),
+        HealthOutcome::Pass if health.score <= 50 => ("ATENÇÃO · VIDA NOMINAL", MOCHA_YELLOW),
+        HealthOutcome::Pass if is_basic_smart_pass(health) => {
+            ("SMART OK · LEITURA BÁSICA", MOCHA_YELLOW)
         }
-    }
-    if width < 40 || available_height < 12 {
-        if let Some(telemetry) = disk.telemetry.as_ref() {
-            let health = score_health(disk.identity.kind, telemetry);
-            let (summary, color) = match health.outcome {
-                HealthOutcome::Pass => (
-                    if width < 20 {
-                        format!("{}%", health.score)
-                    } else {
-                        format!("SAUDÁVEL · {}%", health.score)
-                    },
-                    MOCHA_GREEN,
-                ),
-                HealthOutcome::Fail => (
-                    if width < 20 {
-                        format!("{}%", health.score)
-                    } else {
-                        format!("ATENÇÃO · {}%", health.score)
-                    },
-                    MOCHA_RED,
-                ),
-                HealthOutcome::Unknown => ("SAÚDE INDISPONÍVEL".into(), MOCHA_YELLOW),
-            };
-            let mut compact = vec![(summary, color, true)];
-            if let Some(eta) = lines
-                .iter()
-                .find(|(text, _, _)| text.starts_with("Vida estimada"))
-            {
-                compact.push(eta.clone());
-            }
-            compact.extend(lines.iter().take(2).cloned());
-            compact.extend(lines.iter().skip(10).cloned());
-            lines = compact;
-        } else if lines.len() > 2 {
-            lines.rotate_left(2);
-        }
-    }
-    let scroll = scroll.min(lines.len().saturating_sub(available_height));
-    for (line, (text, color, bold)) in lines.iter().skip(scroll).take(available_height).enumerate()
-    {
-        paint(
-            ops,
-            width.min(2).saturating_sub(1),
-            top + line,
-            text,
-            *color,
-            *bold,
-            width.saturating_sub(width.min(2).saturating_sub(1)),
-        );
+        HealthOutcome::Pass => ("SAUDÁVEL", MOCHA_GREEN),
     }
 }
 
 fn ascii_score_lines(value: &str) -> Vec<String> {
     let glyph = |ch: char| -> [&'static str; 5] {
         match ch {
-            '0' => ["###", "# #", "# #", "# #", "###"],
-            '1' => [" # ", "## ", " # ", " # ", "###"],
-            '2' => ["###", "  #", "###", "#  ", "###"],
-            '3' => ["###", "  #", " ##", "  #", "###"],
-            '4' => ["# #", "# #", "###", "  #", "  #"],
-            '5' => ["###", "#  ", "###", "  #", "###"],
-            '6' => ["###", "#  ", "###", "# #", "###"],
-            '7' => ["###", "  #", "  #", " # ", " # "],
-            '8' => ["###", "# #", "###", "# #", "###"],
-            '9' => ["###", "# #", "###", "  #", "###"],
-            'N' => ["# #", "###", "###", "###", "# #"],
-            'A' => ["###", "# #", "###", "# #", "# #"],
-            '/' => ["  #", "  #", " # ", "#  ", "#  "],
+            '0' => ["███", "█ █", "█ █", "█ █", "███"],
+            '1' => [" █ ", "██ ", " █ ", " █ ", "███"],
+            '2' => ["███", "  █", "███", "█  ", "███"],
+            '3' => ["███", "  █", " ██", "  █", "███"],
+            '4' => ["█ █", "█ █", "███", "  █", "  █"],
+            '5' => ["███", "█  ", "███", "  █", "███"],
+            '6' => ["███", "█  ", "███", "█ █", "███"],
+            '7' => ["███", "  █", "  █", " █ ", " █ "],
+            '8' => ["███", "█ █", "███", "█ █", "███"],
+            '9' => ["███", "█ █", "███", "  █", "███"],
+            'N' => ["█ █", "███", "███", "███", "█ █"],
+            'A' => ["███", "█ █", "███", "█ █", "█ █"],
+            '/' => ["  █", "  █", " █ ", "█  ", "█  "],
+            '%' => ["█ █", "  █", " █ ", "█  ", "█ █"],
             _ => ["   "; 5],
         }
     };
@@ -1002,12 +1145,6 @@ fn ascii_score_lines(value: &str) -> Vec<String> {
                 .join(" ")
         })
         .collect()
-}
-
-fn age_seconds(timestamp: u64) -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |now| now.as_secs().saturating_sub(timestamp))
 }
 
 fn telemetry_has_usable_data(telemetry: &Telemetry) -> bool {
@@ -1076,18 +1213,6 @@ fn failed_permission<T>(state: &QueryState<T>) -> bool {
     }
 }
 
-fn paint(
-    ops: &mut RenderOpIRVec,
-    x: usize,
-    y: usize,
-    text: &str,
-    color: RgbValue,
-    bold: bool,
-    max_width: usize,
-) {
-    paint_background(ops, x, y, text, color, bold, max_width, None);
-}
-
 #[allow(clippy::too_many_arguments)]
 fn paint_background(
     ops: &mut RenderOpIRVec,
@@ -1105,10 +1230,12 @@ fn paint_background(
     if let Some(background) = background {
         *ops += RenderOpCommon::SetBgColor(TuiColor::Rgb(background));
     }
+    let background = background.unwrap_or(MOCHA_BASE);
+    *ops += RenderOpCommon::SetFgColor(TuiColor::Rgb(color));
     let text = clipped(text, max_width);
     let style = TuiStyle {
         color_fg: Some(TuiColor::Rgb(color)),
-        color_bg: None,
+        color_bg: Some(TuiColor::Rgb(background)),
         attribs: r3bl_tui::TuiStyleAttribs {
             bold: bold.then_some(r3bl_tui::tui_style_attrib::Bold),
             ..Default::default()
@@ -1117,9 +1244,7 @@ fn paint_background(
     };
     *ops += RenderOpCommon::MoveCursorPositionAbs(r3bl_tui::col(x) + r3bl_tui::row(y));
     *ops += RenderOpIR::PaintTextWithAttributes(text.into(), Some(style));
-    if background.is_some() {
-        *ops += RenderOpCommon::SetBgColor(TuiColor::Rgb(MOCHA_BASE));
-    }
+    *ops += RenderOpCommon::SetBgColor(TuiColor::Rgb(MOCHA_BASE));
 }
 
 fn is_permission_error(message: &str) -> bool {
@@ -1131,7 +1256,26 @@ fn is_permission_error(message: &str) -> bool {
 }
 
 fn clipped(text: &str, limit: usize) -> String {
-    text.chars().take(limit).collect()
+    let graphemes = r3bl_tui::GCStringOwned::new(text);
+    let mut display_width = 0;
+    let mut end_byte = 0;
+    for segment in graphemes.iter() {
+        let segment_width = segment.display_width.as_usize();
+        if display_width + segment_width > limit {
+            break;
+        }
+        display_width += segment_width;
+        end_byte = segment.end_byte_index.as_usize();
+    }
+    text[..end_byte].to_owned()
+}
+
+fn pad_to_columns(text: &str, width: usize) -> String {
+    let text = clipped(text, width);
+    let display_width = r3bl_tui::GCStringOwned::new(&text)
+        .display_width()
+        .as_usize();
+    format!("{text}{}", " ".repeat(width.saturating_sub(display_width)))
 }
 fn compact_number(value: u64) -> String {
     if value >= 1_000_000_000 {
@@ -1159,6 +1303,7 @@ fn format_bytes(bytes: u64) -> String {
 fn decimal_pt(value: f64) -> String {
     format!("{value:.1}").replace('.', ",")
 }
+#[cfg(test)]
 fn format_duration(seconds: u64) -> String {
     let days = seconds / 86_400;
     if days >= 365 {
@@ -1334,6 +1479,310 @@ mod tests {
         })
     }
 
+    fn rgb_hex(color: TuiColor) -> String {
+        match color {
+            TuiColor::Rgb(value) => {
+                format!("#{:02x}{:02x}{:02x}", value.red, value.green, value.blue)
+            }
+            other => panic!("unexpected non-truecolor UI cell: {other:?}"),
+        }
+    }
+
+    fn is_mocha_color(color: TuiColor) -> bool {
+        matches!(color, TuiColor::Rgb(value) if [
+            MOCHA_BASE, MOCHA_MANTLE, MOCHA_SURFACE0, MOCHA_SURFACE1, MOCHA_SURFACE2,
+            MOCHA_TEXT, MOCHA_MUTED, MOCHA_LAVENDER, MOCHA_GREEN, MOCHA_RED,
+            MOCHA_YELLOW, MOCHA_PEACH,
+        ].contains(&value))
+    }
+
+    fn cell_has_colors(
+        pixel: &r3bl_tui::PixelChar,
+        foreground: RgbValue,
+        background: RgbValue,
+    ) -> bool {
+        matches!(pixel, r3bl_tui::PixelChar::PlainText { style, .. }
+            if style.color_fg == Some(TuiColor::Rgb(foreground))
+                && style.color_bg == Some(TuiColor::Rgb(background)))
+    }
+
+    fn escape_cell(ch: char) -> &'static str {
+        match ch {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '\'' => "&#39;",
+            '"' => "&quot;",
+            _ => "",
+        }
+    }
+
+    #[test]
+    fn rendered_cells_cover_viewport_with_explicit_catppuccin_truecolor_and_optional_browser_proof()
+    {
+        let mut nvme = Telemetry::default();
+        nvme.apply_nvme(crate::model::NvmeHealth {
+            percentage_used: Some(12),
+            ..Default::default()
+        });
+        let fixtures = [
+            ("NVMe saudável", DiskKind::Nvme, "M.2 NVMe", "NVMe", nvme),
+            (
+                "SATA SSD",
+                DiskKind::Ssd,
+                "SSD SATA",
+                "SATA",
+                Telemetry {
+                    endurance_percent: Some(12.0),
+                    ata: QueryState::Success(crate::model::AtaHealth::default()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "SATA HDD",
+                DiskKind::Hdd,
+                "Disco rígido",
+                "SATA",
+                Telemetry {
+                    ata: QueryState::Success(crate::model::AtaHealth::default()),
+                    overall_failure: QueryState::Success(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                "Saúde desconhecida",
+                DiskKind::Unknown,
+                "Dispositivo",
+                "USB",
+                Telemetry::default(),
+            ),
+            (
+                "Dados parciais",
+                DiskKind::Ssd,
+                "SSD parcial",
+                "SATA",
+                Telemetry {
+                    nvme: QueryState::Failed {
+                        message: "Access is denied (5)".into(),
+                    },
+                    ata: QueryState::Success(crate::model::AtaHealth::default()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let mut html = String::from(
+            "<!doctype html><meta charset=\"utf-8\"><title>chkdsk UI cell proof</title><style>body{margin:24px;background:#11111b;color:#cdd6f4;font:14px system-ui,sans-serif}h1{font-size:18px;font-weight:600;margin:0 0 20px}section{margin:0 0 30px}.case{color:#a6adc8;margin:8px 0 5px}.viewport{overflow:auto;display:inline-block;background:#1e1e2e;padding:2px}.row{display:grid;grid-auto-rows:16px}.cell{display:block;width:8px;height:16px;padding:0;margin:0;overflow:hidden;font-family:\"Cascadia Mono\",\"Cascadia Code\",Consolas,monospace;font-size:13px;line-height:16px;letter-spacing:0;font-kerning:none;white-space:pre}.cell.wide{grid-column:span 2;width:16px}</style><h1>chkdsk · celdas do buffer offscreen</h1>",
+        );
+        let output_dir = std::env::var_os("CHKDSK_UI_PROOF_DIR").map(PathBuf::from);
+        for (fixture_name, kind, model, bus, telemetry) in fixtures {
+            for (width, height) in [(100, 28), (70, 20), (30, 10)] {
+                let disk = DiskView {
+                    identity: DiskIdentity {
+                        id: fixture_name.into(),
+                        index: 4,
+                        model: Some(model.into()),
+                        serial: None,
+                        firmware: None,
+                        capacity_bytes: Some(1_000_000_000_000),
+                        bus: Some(bus.into()),
+                        kind,
+                    },
+                    telemetry: Some(telemetry.clone()),
+                    querying: false,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                };
+                let mut sata_id = identity("tab-sata-ssd", 8);
+                sata_id.model = Some("SSD SATA Samsung".into());
+                sata_id.bus = Some("SATA".into());
+                sata_id.kind = DiskKind::Ssd;
+                let mut unicode_id = identity("tab-wide-nvme", 12);
+                unicode_id.model = Some("🧪漢字e\u{301} NVMe".into());
+                unicode_id.bus = Some("NVMe".into());
+                unicode_id.kind = DiskKind::Nvme;
+                let state = Dashboard {
+                    disks: vec![
+                        disk,
+                        DiskView {
+                            identity: sata_id,
+                            telemetry: None,
+                            querying: false,
+                            computing: false,
+                            pending_telemetry: None,
+                            error_message: None,
+                        },
+                        DiskView {
+                            identity: unicode_id,
+                            telemetry: None,
+                            querying: false,
+                            computing: false,
+                            pending_telemetry: None,
+                            error_message: None,
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let mut app = DashboardApp {
+                    started: true,
+                    ..Default::default()
+                };
+                let mut global = test_global_data(state, width, height);
+                let pipeline = app
+                    .app_render(
+                        &mut global,
+                        &mut ComponentRegistryMap::default(),
+                        &mut HasFocus::default(),
+                    )
+                    .unwrap();
+                let size = r3bl_tui::Size::new((
+                    r3bl_tui::ColWidth::new(width),
+                    r3bl_tui::RowHeight::new(height),
+                ));
+                let mut buffer = r3bl_tui::OffscreenBuffer::new_empty(size);
+                pipeline.compose_render_ops_into_ofs_buf(
+                    size,
+                    &mut buffer,
+                    &mut r3bl_tui::MemoizedLenMap::default(),
+                );
+                assert_eq!(buffer.len(), height);
+                assert!(buffer.iter().all(|row| row.len() == width));
+                html.push_str(&format!("<section><div class=\"case\">{fixture_name} · {width} × {height}</div><div class=\"viewport\">"));
+                for cells in buffer.iter() {
+                    html.push_str(&format!(
+                        "<div class=\"row\" style=\"grid-template-columns:repeat({width},8px)\">"
+                    ));
+                    let mut cell_iter = cells.iter().peekable();
+                    while let Some(cell) = cell_iter.next() {
+                        let r3bl_tui::PixelChar::PlainText {
+                            display_char,
+                            style,
+                        } = cell
+                        else {
+                            panic!(
+                                "unpainted cell in {fixture_name} at {width}x{height}: {cell:?}"
+                            );
+                        };
+                        let fg = style
+                            .color_fg
+                            .map(rgb_hex)
+                            .expect("cell without explicit foreground");
+                        let bg = style
+                            .color_bg
+                            .map(rgb_hex)
+                            .expect("cell without explicit background");
+                        assert!(fg.starts_with('#') && bg.starts_with('#'));
+                        assert!(is_mocha_color(style.color_fg.unwrap()));
+                        assert!(is_mocha_color(style.color_bg.unwrap()));
+                        let glyph_width = r3bl_tui::GCStringOwned::width_char(*display_char)
+                            .as_usize()
+                            .max(1);
+                        if glyph_width == 2
+                            && matches!(cell_iter.peek(), Some(r3bl_tui::PixelChar::Void))
+                        {
+                            cell_iter.next();
+                        }
+                        let escaped = escape_cell(*display_char);
+                        let ch = if escaped.is_empty() {
+                            display_char.to_string()
+                        } else {
+                            escaped.into()
+                        };
+                        let cell_class = if glyph_width == 2 {
+                            "cell wide"
+                        } else {
+                            "cell"
+                        };
+                        html.push_str(&format!("<span class=\"{cell_class}\" style=\"color:{fg};background:{bg}\">{ch}</span>"));
+                    }
+                    html.push_str("</div>");
+                }
+                html.push_str("</div></section>");
+            }
+        }
+        if let Some(output_dir) = output_dir {
+            std::fs::create_dir_all(&output_dir).unwrap();
+            let path = output_dir.join("chkdsk-ui-proof.html");
+            std::fs::write(&path, html).unwrap();
+            eprintln!("CHkdsk UI proof: {}", path.display());
+        }
+    }
+
+    #[test]
+    fn horizontal_tabs_keep_earlier_disks_visible_until_selection_overflows_and_hover_is_distinct()
+    {
+        let mut state = Dashboard {
+            disks: (0..9)
+                .map(|index| {
+                    let mut disk_identity = identity(&format!("disk-{index}"), index);
+                    if index == 1 {
+                        disk_identity.model = Some("🧪漢字e\u{301} NVMe".into());
+                    }
+                    DiskView {
+                        identity: disk_identity,
+                        telemetry: None,
+                        querying: false,
+                        computing: false,
+                        pending_telemetry: None,
+                        error_message: None,
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let visible = Layout::new(100, 28, state.disks.len(), state.scroll);
+        assert_eq!(visible.tab_indices, vec![0, 1, 2, 3]);
+        assert_eq!(visible.tab_at(24, 1), Some(1));
+        assert_eq!(visible.tab_at(43, 1), Some(1));
+        assert_eq!(visible.tab_at(44, 1), Some(2));
+        state.selected = 4;
+        ensure_selected_visible(&mut state, 100, 28);
+        let shifted = Layout::new(100, 28, state.disks.len(), state.scroll);
+        assert_eq!(shifted.tab_indices, vec![1, 2, 3, 4]);
+        assert_eq!(shifted.tab_at(0, 1), Some(1));
+        assert_eq!(shifted.tab_at(3 * 22, 1), Some(4));
+
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(
+            Dashboard {
+                disks: state.disks,
+                ..Default::default()
+            },
+            100,
+            28,
+        );
+        assert!(matches!(
+            dispatch_input(
+                &mut app,
+                &mut global,
+                mouse_event(MouseInputKind::MouseMove, 24, 1)
+            ),
+            EventPropagation::ConsumedRender
+        ));
+        assert_eq!(global.state.hovered_tab, Some(1));
+        let pipeline = app
+            .app_render(
+                &mut global,
+                &mut ComponentRegistryMap::default(),
+                &mut HasFocus::default(),
+            )
+            .unwrap();
+        let size =
+            r3bl_tui::Size::new((r3bl_tui::ColWidth::new(100), r3bl_tui::RowHeight::new(28)));
+        let mut buffer = r3bl_tui::OffscreenBuffer::new_empty(size);
+        pipeline.compose_render_ops_into_ofs_buf(
+            size,
+            &mut buffer,
+            &mut r3bl_tui::MemoizedLenMap::default(),
+        );
+        assert!(
+            matches!(buffer[1][24], r3bl_tui::PixelChar::PlainText { style, .. } if style.color_bg == Some(TuiColor::Rgb(MOCHA_SURFACE2)))
+        );
+    }
+
     fn identity(id: &str, index: u32) -> DiskIdentity {
         DiskIdentity {
             id: id.into(),
@@ -1345,6 +1794,69 @@ mod tests {
             bus: None,
             kind: DiskKind::Unknown,
         }
+    }
+
+    #[test]
+    fn terminal_labels_clip_graphemes_by_display_columns_and_keep_tab_index_visible() {
+        let model = "🧪漢字e\u{301} NVMe";
+        assert_eq!(clipped(model, 4), "🧪漢");
+        assert_eq!(clipped("e\u{301}SSD", 1), "e\u{301}");
+        let short_clip = clipped(model, 4);
+        let model_clip = clipped(model, 14);
+        let model_width = r3bl_tui::GCStringOwned::new(&model_clip)
+            .display_width()
+            .as_usize();
+        assert_eq!(
+            pad_to_columns(&format!("> {model_clip} #12"), 22),
+            format!(
+                "> {model_clip} #12{}",
+                " ".repeat(22 - 2 - model_width - 1 - 3)
+            )
+        );
+        assert_eq!(
+            r3bl_tui::GCStringOwned::new(short_clip)
+                .display_width()
+                .as_usize(),
+            4
+        );
+    }
+
+    #[test]
+    fn health_visual_labels_distinguish_nominal_wear_from_device_failure_and_coarse_smart() {
+        let nominal = crate::health::HealthScore {
+            score: 0,
+            outcome: HealthOutcome::Pass,
+            confidence: 0.8,
+            provenance: vec!["NVMe endurance used 100%".into()],
+        };
+        assert_eq!(
+            health_presentation(&nominal),
+            ("ATENÇÃO · VIDA NOMINAL", MOCHA_YELLOW)
+        );
+        let coarse = crate::health::HealthScore {
+            score: 100,
+            outcome: HealthOutcome::Pass,
+            confidence: 0.1,
+            provenance: vec!["device-reported no threshold failure (coarse only)".into()],
+        };
+        assert_eq!(
+            health_presentation(&coarse),
+            ("SMART OK · LEITURA BÁSICA", MOCHA_YELLOW)
+        );
+        let healthy = crate::health::HealthScore {
+            score: 88,
+            outcome: HealthOutcome::Pass,
+            confidence: 0.8,
+            provenance: vec!["NVMe SMART/Health log".into()],
+        };
+        assert_eq!(health_presentation(&healthy), ("SAUDÁVEL", MOCHA_GREEN));
+        let failed = crate::health::HealthScore {
+            score: 20,
+            outcome: HealthOutcome::Fail,
+            confidence: 1.0,
+            provenance: vec!["device-reported overall failure".into()],
+        };
+        assert_eq!(health_presentation(&failed), ("FALHA DETECTADA", MOCHA_RED));
     }
 
     #[test]
@@ -1469,7 +1981,7 @@ mod tests {
             EventPropagation::ConsumedRender
         ));
         assert_eq!(global.state.selected, 1);
-        assert_eq!(global.state.scroll, 1);
+        assert_eq!(global.state.scroll, 0);
         for key in [SpecialKey::Right, SpecialKey::BackTab] {
             dispatch_input(
                 &mut app,
@@ -1493,7 +2005,7 @@ mod tests {
         assert_eq!(global.state.content_scroll, 1);
 
         let layout = Layout::new(80, 24, global.state.disks.len(), global.state.scroll);
-        let next_tab = layout.tabs[1];
+        let next_tab = layout.tabs[2];
         assert_eq!(layout.tab_at(next_tab.x, next_tab.y), Some(2));
         assert!(matches!(
             dispatch_input(
@@ -1508,7 +2020,7 @@ mod tests {
             EventPropagation::ConsumedRender
         ));
         assert_eq!(global.state.selected, 2);
-        assert_eq!(global.state.scroll, 2);
+        assert_eq!(global.state.scroll, 0);
 
         let compact_state = global.state.clone();
         let mut compact = test_global_data(compact_state, 12, 2);
@@ -1527,7 +2039,7 @@ mod tests {
             EventPropagation::ExitMainEventLoop
         ));
         assert_eq!(compact.state.selected, 2);
-        assert_eq!(compact.state.scroll, 2);
+        assert_eq!(compact.state.scroll, 0);
 
         let mut tiny = test_global_data(compact.state.clone(), 1, 1);
         let tiny_layout = Layout::new(1, 1, tiny.state.disks.len(), tiny.state.scroll);
@@ -1561,7 +2073,9 @@ mod tests {
                     current: 100,
                     worst: 100,
                     raw: [0; 6],
+                    threshold: None,
                 }],
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1605,7 +2119,9 @@ mod tests {
                     current: 100,
                     worst: 100,
                     raw: [0; 6],
+                    threshold: None,
                 }],
+                ..Default::default()
             }),
             endurance_percent: Some(12.0),
             ..Default::default()
@@ -1734,15 +2250,39 @@ mod tests {
             ..Default::default()
         };
         let disk = DiskView {
-            identity: identity("test", 0),
+            identity: identity("test", 4),
             telemetry: Some(telemetry),
             querying: false,
             computing: false,
             pending_telemetry: None,
             error_message: None,
         };
+        let mut second_identity = identity("sata", 8);
+        second_identity.model = Some("SSD SATA".into());
+        second_identity.kind = DiskKind::Ssd;
+        let mut third_identity = identity("wide", 12);
+        third_identity.model = Some("🧪漢字e\u{301} NVMe".into());
+        third_identity.kind = DiskKind::Nvme;
         let state = Dashboard {
-            disks: vec![disk],
+            disks: vec![
+                disk,
+                DiskView {
+                    identity: second_identity,
+                    telemetry: None,
+                    querying: false,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                },
+                DiskView {
+                    identity: third_identity,
+                    telemetry: None,
+                    querying: false,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                },
+            ],
             ..Default::default()
         };
         let mut app = DashboardApp {
@@ -1775,14 +2315,14 @@ mod tests {
                     matches!(
                         buffer[1][0],
                         r3bl_tui::PixelChar::PlainText { style, .. }
-                            if style.color_bg == Some(TuiColor::Rgb(MOCHA_SURFACE))
+                            if style.color_bg == Some(TuiColor::Rgb(MOCHA_LAVENDER))
                     ),
                     "bg={:?} wanted={:?}",
                     match buffer[1][0] {
                         r3bl_tui::PixelChar::PlainText { style, .. } => style.color_bg,
                         _ => None,
                     },
-                    TuiColor::Rgb(MOCHA_SURFACE)
+                    TuiColor::Rgb(MOCHA_LAVENDER)
                 );
             }
             let rendered = buffer
@@ -1797,19 +2337,31 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            if width >= 12 {
+            if width >= 21 {
                 assert!(
                     rendered.contains("chkdsk v"),
                     "{width}x{height}: {rendered}"
                 );
             }
             if width == 100 {
+                assert!(cell_has_colors(&buffer[0][1], MOCHA_LAVENDER, MOCHA_MANTLE));
+                assert!(cell_has_colors(&buffer[1][0], MOCHA_BASE, MOCHA_LAVENDER));
+                assert!(cell_has_colors(&buffer[3][1], MOCHA_GREEN, MOCHA_SURFACE0));
+                assert!(cell_has_colors(&buffer[4][1], MOCHA_GREEN, MOCHA_BASE));
+                assert!(cell_has_colors(&buffer[9][1], MOCHA_PEACH, MOCHA_MANTLE));
+                assert!(
+                    rendered.contains("#4") && rendered.contains("#8") && rendered.contains("#12"),
+                    "{rendered}"
+                );
                 assert!(rendered.contains("SAUDÁVEL"));
-                assert!(rendered.contains("% saúde"));
-                assert!(rendered.contains("###"));
+                assert!(
+                    ascii_score_lines("88%")
+                        .iter()
+                        .all(|score_row| rendered.contains(score_row.trim_end()))
+                );
             }
-            if width == 12 {
-                assert!(rendered.contains("93%"), "{rendered}");
+            if width == 12 && height >= 8 {
+                assert!(rendered.contains("88%"), "{rendered}");
                 assert!(rendered.contains("Vida estima"), "{rendered}");
             }
         }

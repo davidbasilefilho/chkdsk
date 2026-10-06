@@ -183,7 +183,7 @@ def build_target(architecture: str, name: str) -> Path:
 def release_asset_names(name: str, version: str, mode: str, sha: str) -> list[str]:
     suffix = f"-dev-{sha[:7].lower()}" if mode == "dev" else ""
     base = f"{name}-{version}{suffix}-windows-"
-    return [base + "x64-baseline.exe", base + "arm64.exe", base + "x86.exe"]
+    return [base + "x64.exe", base + "arm64.exe", base + "x86.exe"]
 
 
 def expected_assets(mode: str, sha: str, name: str, version: str, output: Path) -> list[Path]:
@@ -459,15 +459,27 @@ def self_check() -> None:
     assert expected_tag("dev", "1.2.3", sha) == "v1.2.3-dev-abcdef0"
     assert expected_tag("dev", "1.2.3-rc.2", sha) == "v1.2.3-rc.2-dev-abcdef0"
     assert expected_tag("stable", "1.2.3", sha) == "v1.2.3"
+    assert expected_tag("dev", "0.0.2", sha) == "v0.0.2-dev-abcdef0"
+    assert expected_tag("stable", "0.0.2", sha) == "v0.0.2"
     assert release_asset_names("chkdsk", "1.2.3", "dev", sha) == [
-        "chkdsk-1.2.3-dev-abcdef0-windows-x64-baseline.exe",
+        "chkdsk-1.2.3-dev-abcdef0-windows-x64.exe",
         "chkdsk-1.2.3-dev-abcdef0-windows-arm64.exe",
         "chkdsk-1.2.3-dev-abcdef0-windows-x86.exe",
     ]
     assert release_asset_names("chkdsk", "1.2.3", "stable", sha) == [
-        "chkdsk-1.2.3-windows-x64-baseline.exe",
+        "chkdsk-1.2.3-windows-x64.exe",
         "chkdsk-1.2.3-windows-arm64.exe",
         "chkdsk-1.2.3-windows-x86.exe",
+    ]
+    assert release_asset_names("chkdsk", "0.0.2", "dev", sha) == [
+        "chkdsk-0.0.2-dev-abcdef0-windows-x64.exe",
+        "chkdsk-0.0.2-dev-abcdef0-windows-arm64.exe",
+        "chkdsk-0.0.2-dev-abcdef0-windows-x86.exe",
+    ]
+    assert release_asset_names("chkdsk", "0.0.2", "stable", sha) == [
+        "chkdsk-0.0.2-windows-x64.exe",
+        "chkdsk-0.0.2-windows-arm64.exe",
+        "chkdsk-0.0.2-windows-x86.exe",
     ]
     for invalid in ("01.2.3", "1.2", "1.2.3-01"):
         try:

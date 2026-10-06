@@ -44,15 +44,15 @@ description = "Install the repository pre-commit hook"
 run = "prek install"
 
 [tasks.release]
-description = "Build optimized x64-baseline, ARM64, and x86 executables"
+description = "Build optimized x64, ARM64, and x86 executables"
 run = [
-  { task = "release-x64-baseline" },
+  { task = "release-x64" },
   { task = "release-arm64" },
   { task = "release-x86" },
 ]
 
-[tasks.release-x64-baseline]
-description = "Build the optimized x64-baseline executable"
+[tasks.release-x64]
+description = "Build the optimized x64 executable"
 run = "python scripts/release.py build --architecture x64"
 
 [tasks.release-arm64]

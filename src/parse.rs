@@ -66,10 +66,7 @@ pub fn parse_nvme_health_log(bytes: &[u8]) -> Result<NvmeHealth, ParseError> {
     })
 }
 
-/// Parse the 512-byte ATA SMART READ DATA sector. Attribute IDs and six raw
-/// bytes are preserved verbatim: they are vendor-defined and are not assigned
-/// units or lifetime meaning here. Thresholds and overall SMART RETURN STATUS
-/// are separate commands and are intentionally not fabricated from this page.
+/// Parse the 512-byte ATA SMART READ DATA sector, validating its checksum.
 pub fn parse_ata_smart_data(bytes: &[u8]) -> Result<AtaHealth, ParseError> {
     require_sector(bytes)?;
     if bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0 {
@@ -90,10 +87,36 @@ pub fn parse_ata_smart_data(bytes: &[u8]) -> Result<AtaHealth, ParseError> {
             flags: u16::from_le_bytes([bytes[offset + 1], bytes[offset + 2]]),
             current: bytes[offset + 3],
             worst: bytes[offset + 4],
+            threshold: None,
             raw,
         });
     }
-    Ok(AtaHealth { attributes })
+    Ok(AtaHealth {
+        attributes,
+        thresholds_available: false,
+    })
+}
+
+/// Parse the 512-byte ATA SMART READ THRESHOLDS sector and join declared
+/// thresholds to matching READ DATA IDs. Attributes absent from the threshold
+/// table keep `threshold: None`; no threshold is synthesized.
+pub fn apply_ata_smart_thresholds(health: &mut AtaHealth, bytes: &[u8]) -> Result<(), ParseError> {
+    require_sector(bytes)?;
+    if bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0 {
+        return Err(ParseError::InvalidChecksum);
+    }
+    let thresholds = (0..30).filter_map(|slot| {
+        let offset = 2 + slot * 12;
+        let id = bytes[offset];
+        (id != 0).then_some((id, bytes[offset + 1]))
+    });
+    for (id, threshold) in thresholds {
+        if let Some(attribute) = health.attributes.iter_mut().find(|item| item.id == id) {
+            attribute.threshold = Some(threshold);
+        }
+    }
+    health.thresholds_available = true;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -144,6 +167,58 @@ mod tests {
         assert_eq!(parsed.attributes[0].id, 9);
         assert_eq!(parsed.attributes[0].raw, [0x78, 0x56, 0x34, 0x12, 0, 0]);
         assert_eq!(parsed.attributes[0].current, 99);
+        assert_eq!(parsed.attributes[0].threshold, None);
+    }
+
+    #[test]
+    fn joins_only_declared_matching_thresholds_and_checks_both_checksums() {
+        let mut data = [0u8; 512];
+        data[2..7].copy_from_slice(&[5, 0x01, 0, 90, 70]);
+        data[14..19].copy_from_slice(&[197, 0x01, 0, 95, 92]);
+        finish_ata_checksum(&mut data);
+        let mut health = parse_ata_smart_data(&data).unwrap();
+        assert!(!health.thresholds_available);
+
+        let mut thresholds = [0u8; 512];
+        thresholds[2..4].copy_from_slice(&[5, 10]);
+        thresholds[14..16].copy_from_slice(&[197, 0]);
+        thresholds[26..28].copy_from_slice(&[198, 8]);
+        finish_ata_checksum(&mut thresholds);
+        apply_ata_smart_thresholds(&mut health, &thresholds).unwrap();
+        assert!(health.thresholds_available);
+        assert_eq!(health.attributes[0].threshold, Some(10));
+        assert_eq!(health.attributes[1].threshold, Some(0));
+
+        thresholds[70] ^= 1;
+        assert_eq!(
+            apply_ata_smart_thresholds(&mut health, &thresholds),
+            Err(ParseError::InvalidChecksum)
+        );
+        assert_eq!(
+            apply_ata_smart_thresholds(&mut health, &[0; 511]),
+            Err(ParseError::InvalidLength {
+                expected: 512,
+                actual: 511
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_optional_threshold_sector_leaves_read_data_usable_but_unjoined() {
+        let mut data = [0u8; 512];
+        data[2..7].copy_from_slice(&[5, 1, 0, 100, 100]);
+        finish_ata_checksum(&mut data);
+        let mut health = parse_ata_smart_data(&data).unwrap();
+        let mut thresholds = [0u8; 512];
+        thresholds[2..4].copy_from_slice(&[5, 10]);
+        finish_ata_checksum(&mut thresholds);
+        thresholds[300] ^= 1;
+        assert_eq!(
+            apply_ata_smart_thresholds(&mut health, &thresholds),
+            Err(ParseError::InvalidChecksum)
+        );
+        assert!(!health.thresholds_available);
+        assert_eq!(health.attributes[0].threshold, None);
     }
 
     #[test]
