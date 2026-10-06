@@ -26,7 +26,7 @@ Requer Windows 10/11 e um terminal compatível com TUI. Releases incluem execut�
 - Clique em uma aba para selecionar o disco; a roda do mouse rola o painel ou, sobre as abas, alterna discos. Os botões auxiliares aparecem quando há espaço vertical suficiente.
 - Clique no botão de saída para encerrar; em larguras estreitas, ele aparece como `×`.
 - `q` ou `Esc`: sair.
-- Abaixo de 17 linhas de altura, o rodapé de botões fica oculto; use a roda do mouse no painel/abas ou o teclado. Abaixo de 10 linhas, cabeçalho e abas usam uma linha compacta.
+- Abaixo de 17 linhas de altura, o rodapé de botões fica oculto; use a roda do mouse no painel/abas ou o teclado. Abaixo de 11 linhas, cabeçalho e abas usam uma linha compacta.
 
 ## Desenvolvimento
 

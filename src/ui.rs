@@ -854,7 +854,7 @@ impl Layout {
         }
         // Normal-sized buttons have one cell of vertical padding above and below
         // their centered label. Preserve a one-row escape hatch for tiny terminals.
-        let button_height = if height >= 10 { 3 } else { 1 };
+        let button_height = if height >= 11 { 3 } else { 1 };
         let quit = if width >= 21 {
             HitArea {
                 x: width - 8,
@@ -2385,11 +2385,11 @@ mod tests {
             10,
         );
 
-        assert_eq!(Layout::new(100, 10, 9, 4).tab_at(20, 4), Some(5));
+        assert_eq!(Layout::new(100, 10, 9, 4).tab_at(20, 1), Some(5));
         dispatch_input(
             &mut app,
             &mut global,
-            mouse_event(MouseInputKind::MouseDown(Button::Left), 20, 4),
+            mouse_event(MouseInputKind::MouseDown(Button::Left), 20, 1),
         );
         assert_eq!(
             global.state.disks[global.state.selected].identity.id,
@@ -2928,10 +2928,10 @@ mod tests {
     fn compact_footer_reserves_space_for_the_health_summary() {
         let layout = Layout::new(30, 10, 2, 0);
         assert!(layout.controls.is_empty());
-        assert_eq!(layout.quit.height, 3);
+        assert_eq!(layout.quit.height, 1);
         assert_eq!(layout.tabs.len(), 1);
-        assert_eq!(layout.tabs[0].height, 3);
-        assert_eq!(body_view_height(&layout, 10), 4);
+        assert_eq!(layout.tabs[0].height, 1);
+        assert_eq!(body_view_height(&layout, 10), 8);
         let shorter = Layout::new(80, 14, 2, 0);
         assert!(shorter.controls.is_empty());
         assert_eq!(body_view_height(&shorter, 14), 8);
@@ -2939,7 +2939,7 @@ mod tests {
 
     #[test]
     fn standard_buttons_are_padded_centered_and_have_full_hitboxes() {
-        for (width, height) in [(100, 28), (70, 20), (80, 17), (30, 10)] {
+        for (width, height) in [(100, 28), (70, 20), (80, 17), (30, 11)] {
             let layout = Layout::new(width, height, 5, 0);
             assert_eq!(layout.quit.height, 3, "{width}x{height}");
             assert!(!layout.tabs.is_empty(), "{width}x{height}");
@@ -3262,8 +3262,8 @@ mod tests {
             ..Default::default()
         };
         let mut app = DashboardApp::default();
-        let mut global = test_global_data(state, 30, 10);
-        let layout = Layout::new(30, 10, 4, 0);
+        let mut global = test_global_data(state, 30, 6);
+        let layout = Layout::new(30, 6, 4, 0);
         assert!(layout.controls.is_empty());
 
         dispatch_input(
@@ -3272,13 +3272,13 @@ mod tests {
             mouse_event(
                 MouseInputKind::ScrollDown,
                 layout.tabs[0].x + 1,
-                layout.tabs[0].y + 1,
+                layout.tabs[0].y + layout.tabs[0].height / 2,
             ),
         );
         assert_eq!(global.state.selected, 1);
         assert_eq!(global.state.scroll, 1);
 
-        let selected_tab = Layout::new(30, 10, 4, global.state.scroll).tabs[0];
+        let selected_tab = Layout::new(30, 6, 4, global.state.scroll).tabs[0];
         dispatch_input(
             &mut app,
             &mut global,
@@ -3304,7 +3304,7 @@ mod tests {
                 mouse_event(
                     MouseInputKind::MouseDown(Button::Left),
                     layout.quit.x + 1,
-                    layout.quit.y + 1,
+                    layout.quit.y + layout.quit.height / 2,
                 ),
             ),
             EventPropagation::ExitMainEventLoop
@@ -3446,24 +3446,51 @@ mod tests {
                     }),
                 );
             }
+            let warning_render = rendered_text(&mut app, &mut global);
             assert!(
-                rendered_text(&mut app, &mut global).contains("Backup da memória volátil"),
+                warning_render.contains("Backup da memória volátil"),
                 "aviso fora da viewport em {width}x{height}"
             );
 
             if width == 80 {
+                let scroll_before_compacting = global.state.content_scroll;
+                let previous_first_visible_row =
+                    warning_render.lines().nth(layout.body_y).unwrap().trim();
                 global.window_size = r3bl_tui::Size::new((
                     r3bl_tui::ColWidth::new(width),
-                    r3bl_tui::RowHeight::new(10),
+                    r3bl_tui::RowHeight::new(9),
                 ));
-                assert!(global.state.content_scroll > 0);
-                let resized = rendered_text(&mut app, &mut global);
-                let resized_layout = Layout::new(width, 10, 1, global.state.scroll);
-                let resized_body_height = body_view_height(&resized_layout, 10);
-                let resized_max = disk_content_line_count(&disk, width, resized_body_height)
-                    .saturating_sub(resized_body_height);
-                assert_eq!(global.state.content_scroll, resized_max);
-                assert!(resized.contains("LIGADO"), "{resized}");
+                let compact_layout = Layout::new(width, 9, 1, global.state.scroll);
+                let compact_body_height = body_view_height(&compact_layout, 9);
+                let compact_max = disk_content_line_count(&disk, width, compact_body_height)
+                    .saturating_sub(compact_body_height);
+                let compact_scroll = scroll_before_compacting.min(compact_max);
+                let compact_resize_render = rendered_text(&mut app, &mut global);
+                assert_eq!(global.state.content_scroll, compact_scroll);
+                let compact_first_visible_row = compact_resize_render
+                    .lines()
+                    .nth(compact_layout.body_y)
+                    .unwrap()
+                    .trim();
+                assert_eq!(compact_first_visible_row, previous_first_visible_row);
+
+                global.state.content_scroll = compact_max;
+                let compact_render = rendered_text(&mut app, &mut global);
+                assert_eq!(global.state.content_scroll, compact_max);
+                assert!(compact_render.contains("LIGADO"), "{compact_render}");
+
+                global.window_size = r3bl_tui::Size::new((
+                    r3bl_tui::ColWidth::new(width),
+                    r3bl_tui::RowHeight::new(height),
+                ));
+                let expanded_layout = Layout::new(width, height, 1, global.state.scroll);
+                let expanded_body_height = body_view_height(&expanded_layout, height);
+                let expanded_max = disk_content_line_count(&disk, width, expanded_body_height)
+                    .saturating_sub(expanded_body_height);
+                assert!(compact_max > expanded_max);
+                let expanded_render = rendered_text(&mut app, &mut global);
+                assert_eq!(global.state.content_scroll, compact_max.min(expanded_max));
+                assert!(expanded_render.contains("LIGADO"), "{expanded_render}");
                 global.state.disks.clear();
                 let _ = rendered_text(&mut app, &mut global);
                 assert_eq!(global.state.content_scroll, 0);
