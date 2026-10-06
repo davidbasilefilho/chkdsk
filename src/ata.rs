@@ -11,6 +11,194 @@ pub(crate) struct ModelProfile {
     pub lifetime_remaining_label_pt_br: &'static str,
 }
 
+/// Narrow HDD profile used to interpret selected ATA raw counters. SMART raw
+/// fields are vendor-defined; this profile deliberately covers only the WD
+/// Blue WD10EZEX family visible in the user's hardware sample.
+pub(crate) const WD10EZEX_PROFILE: &str = "Western Digital WD10EZEX";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Raw5Encoding {
+    /// The primary low word is a count; upper words are optional subfields
+    /// and must be zero until their meaning has a separate verified mapping.
+    Raw16PrimaryOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PowerOnHoursEncoding {
+    Raw24Hours,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemperatureEncoding {
+    TempMinMaxCurrentByte,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HddModelProfile {
+    pub family: &'static str,
+    model_prefix: &'static str,
+    raw5_encoding: Raw5Encoding,
+    power_on_hours_encoding: PowerOnHoursEncoding,
+    temperature_encoding: TemperatureEncoding,
+}
+
+// In smartmontools' upstream drivedb v8.0, the DEFAULT preset maps ID 9 to
+// `raw24(raw8),Power_On_Hours` and ID 194 to `tempminmax,Temperature_Celsius`.
+// The checked database has no WD10EZEX-specific override, so this exact model
+// profile declares those default layouts explicitly rather than guessing for
+// other models/vendors.
+const HDD_MODEL_PROFILES: &[HddModelProfile] = &[HddModelProfile {
+    family: WD10EZEX_PROFILE,
+    model_prefix: "WD10EZEX",
+    raw5_encoding: Raw5Encoding::Raw16PrimaryOnly,
+    power_on_hours_encoding: PowerOnHoursEncoding::Raw24Hours,
+    temperature_encoding: TemperatureEncoding::TempMinMaxCurrentByte,
+}];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HddCounter {
+    ReallocatedSectors,
+    SpinRetries,
+    ReportedUncorrectable,
+    PendingSectors,
+    OfflineUncorrectable,
+}
+
+impl HddCounter {
+    pub(crate) const fn id(self) -> u8 {
+        match self {
+            Self::ReallocatedSectors => 5,
+            Self::SpinRetries => 10,
+            Self::ReportedUncorrectable => 187,
+            Self::PendingSectors => 197,
+            Self::OfflineUncorrectable => 198,
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::ReallocatedSectors => "reallocated sectors",
+            Self::SpinRetries => "spin retries",
+            Self::ReportedUncorrectable => "reported uncorrectable errors",
+            Self::PendingSectors => "pending sectors",
+            Self::OfflineUncorrectable => "offline uncorrectable sectors",
+        }
+    }
+}
+
+/// Model-scoped HDD layouts are intentionally explicit. Unknown models have
+/// no model profile; only the limited common HDD signal defaults below can
+/// still be used, never a guessed vendor health baseline. ATA ID 5 uses
+/// smartmontools' `raw16(raw16)` default convention: its primary count is
+/// accepted only when optional upper words are zero, so no high bytes are
+/// silently truncated. Other listed counters are raw48.
+pub(crate) fn hdd_profile(model: Option<&str>) -> Option<&'static HddModelProfile> {
+    let model = model?.trim().to_ascii_uppercase();
+    let model = model
+        .strip_prefix("ATA_")
+        .or_else(|| model.strip_prefix("ATA "))
+        .unwrap_or(&model)
+        .trim();
+    let model = model.strip_prefix("WDC ").unwrap_or(model).trim();
+    HDD_MODEL_PROFILES
+        .iter()
+        .find(|profile| model.starts_with(profile.model_prefix))
+}
+
+pub(crate) fn hdd_counter(
+    kind: crate::model::DiskKind,
+    profile_family: Option<&str>,
+    id: u8,
+    raw: [u8; 6],
+) -> Option<(HddCounter, u64)> {
+    if kind != crate::model::DiskKind::Hdd {
+        return None;
+    }
+    let raw5_encoding = match profile_family {
+        Some(family) => {
+            HDD_MODEL_PROFILES
+                .iter()
+                .find(|profile| profile.family == family)?
+                .raw5_encoding
+        }
+        None => {
+            // Common smartmontools DEFAULT conventions for widely used HDD
+            // problem counters. This is a decoding fallback only, not a
+            // guessed vendor health baseline or normalized-value threshold.
+            Raw5Encoding::Raw16PrimaryOnly
+        }
+    };
+    let counter = match id {
+        5 => {
+            let value = match raw5_encoding {
+                Raw5Encoding::Raw16PrimaryOnly => {
+                    // The smartmontools DEFAULT convention is raw16(raw16):
+                    // bytes 0..2 are the primary value and 2..6 are optional
+                    // extra words. Accept only an unambiguous primary count.
+                    // This avoids interpreting packed fields or silently
+                    // truncating them.
+                    if raw[2..].iter().any(|byte| *byte != 0) {
+                        return None;
+                    }
+                    u64::from(u16::from_le_bytes([raw[0], raw[1]]))
+                }
+            };
+            (HddCounter::ReallocatedSectors, value)
+        }
+        10 => (HddCounter::SpinRetries, raw_u48(raw)),
+        187 => (HddCounter::ReportedUncorrectable, raw_u48(raw)),
+        197 => (HddCounter::PendingSectors, raw_u48(raw)),
+        198 => (HddCounter::OfflineUncorrectable, raw_u48(raw)),
+        _ => return None,
+    };
+    Some(counter)
+}
+
+/// Decode the common SATA HDD temperature/hour fields only for a registered
+/// model family. Unknown/vendor-specific layouts remain absent.
+pub(crate) fn hdd_power_on_hours(
+    model: Option<&str>,
+    health: &crate::model::AtaHealth,
+) -> Option<u64> {
+    let profile = hdd_profile(model)?;
+    if profile.power_on_hours_encoding != PowerOnHoursEncoding::Raw24Hours {
+        return None;
+    }
+    let mut matches = health
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.id == 9);
+    let attribute = matches.next()?;
+    if matches.next().is_some() || attribute.raw[3..].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    Some(
+        u64::from(attribute.raw[0])
+            | (u64::from(attribute.raw[1]) << 8)
+            | (u64::from(attribute.raw[2]) << 16),
+    )
+}
+
+pub(crate) fn hdd_temperature_c(
+    model: Option<&str>,
+    health: &crate::model::AtaHealth,
+) -> Option<i16> {
+    let profile = hdd_profile(model)?;
+    if profile.temperature_encoding != TemperatureEncoding::TempMinMaxCurrentByte {
+        return None;
+    }
+    let mut matches = health
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.id == 194);
+    let attribute = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let celsius = attribute.raw[0];
+    (1..=100).contains(&celsius).then_some(i16::from(celsius))
+}
+
 /// Exact Crucial/Micron families from the upstream smartmontools drive DB,
 /// checked against Micron TN-FD-22: SMART 202's full 48-bit raw value is
 /// percent used.
@@ -130,6 +318,137 @@ mod tests {
             assert_eq!(attribute_name_pt_br(Some("MacroVIP MV240GB"), id), None);
             assert_eq!(raw_attribute_name_pt_br(Some("MacroVIP MV240GB"), id), None);
         }
+    }
+
+    #[test]
+    fn wd10ezex_profile_is_exact_and_common_hdd_counters_keep_full_raw_width() {
+        let profile = hdd_profile(Some("WDC WD10EZEX-00WN4A0")).unwrap();
+        assert_eq!(profile.family, WD10EZEX_PROFILE);
+        assert_eq!(
+            hdd_profile(Some("ATA WDC WD10EZEX-00WN4A0"))
+                .unwrap()
+                .family,
+            WD10EZEX_PROFILE
+        );
+        assert_eq!(hdd_profile(Some("WDC WD10EZRX-00DC0B0")), None);
+        assert_eq!(hdd_profile(Some("Other WDC WD10EZEX-00WN4A0")), None);
+
+        let raw_65_536 = [0, 0, 1, 0, 0, 0];
+        assert_eq!(
+            hdd_counter(
+                crate::model::DiskKind::Hdd,
+                Some(WD10EZEX_PROFILE),
+                197,
+                raw_65_536,
+            ),
+            Some((HddCounter::PendingSectors, 65_536))
+        );
+        assert_eq!(
+            hdd_counter(
+                crate::model::DiskKind::Hdd,
+                Some(WD10EZEX_PROFILE),
+                197,
+                [255; 6],
+            ),
+            Some((HddCounter::PendingSectors, 0x0000_ffff_ffff_ffff))
+        );
+        assert_eq!(
+            hdd_counter(
+                crate::model::DiskKind::Hdd,
+                Some(WD10EZEX_PROFILE),
+                5,
+                [3, 0, 0, 0, 0, 0],
+            ),
+            Some((HddCounter::ReallocatedSectors, 3))
+        );
+        // ID 5 follows raw16(raw16), so extra words are ambiguous and cannot
+        // be silently dropped to a falsely small primary count.
+        assert_eq!(
+            hdd_counter(
+                crate::model::DiskKind::Hdd,
+                Some(WD10EZEX_PROFILE),
+                5,
+                [1, 0, 1, 0, 0, 0],
+            ),
+            None
+        );
+        assert_eq!(
+            hdd_counter(
+                crate::model::DiskKind::Ssd,
+                Some(WD10EZEX_PROFILE),
+                197,
+                [1, 0, 0, 0, 0, 0],
+            ),
+            None
+        );
+        // Vendor-packed read/seek rates and unrecognized attributes stay out.
+        for id in [1, 7, 9, 177, 202] {
+            assert_eq!(
+                hdd_counter(
+                    crate::model::DiskKind::Hdd,
+                    Some(WD10EZEX_PROFILE),
+                    id,
+                    [9, 0, 0, 0, 0, 0],
+                ),
+                None,
+                "attribute {id}"
+            );
+        }
+        assert_eq!(
+            hdd_counter(crate::model::DiskKind::Hdd, None, 197, raw_65_536,),
+            Some((HddCounter::PendingSectors, 65_536)),
+            "documented common HDD defaults apply without assuming a model profile"
+        );
+    }
+
+    #[test]
+    fn hdd_temperature_and_hours_are_decoded_only_for_the_supported_wdc_profile() {
+        let health = crate::model::AtaHealth {
+            attributes: vec![
+                crate::model::AtaAttribute {
+                    id: 9,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    threshold: None,
+                    raw: [0x07, 0x1a, 0, 0, 0, 0],
+                },
+                crate::model::AtaAttribute {
+                    id: 194,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    threshold: None,
+                    raw: [40, 55, 63, 0, 0, 0],
+                },
+            ],
+            thresholds_available: false,
+        };
+        let model = Some("WDC WD10EZEX-00WN4A0");
+        assert_eq!(hdd_power_on_hours(model, &health), Some(6663));
+        assert_eq!(hdd_temperature_c(model, &health), Some(40));
+        assert_eq!(
+            hdd_power_on_hours(Some("Unverified WDC HDD"), &health),
+            None
+        );
+        assert_eq!(hdd_temperature_c(Some("Unverified WDC HDD"), &health), None);
+
+        let ambiguous_hours = crate::model::AtaHealth {
+            attributes: vec![crate::model::AtaAttribute {
+                raw: [0x07, 0x1a, 0, 1, 0, 0],
+                ..health.attributes[0].clone()
+            }],
+            thresholds_available: false,
+        };
+        assert_eq!(hdd_power_on_hours(model, &ambiguous_hours), None);
+        let invalid_temperature = crate::model::AtaHealth {
+            attributes: vec![crate::model::AtaAttribute {
+                raw: [101, 0, 0, 0, 0, 0],
+                ..health.attributes[1].clone()
+            }],
+            thresholds_available: false,
+        };
+        assert_eq!(hdd_temperature_c(model, &invalid_temperature), None);
     }
 
     #[test]

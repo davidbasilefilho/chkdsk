@@ -14,11 +14,11 @@ use r3bl_tui::{
     ZOrder,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{Display, Formatter},
     io::Write,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
@@ -109,6 +109,23 @@ pub struct DiskView {
     pub error_message: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotificationSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Notification {
+    generation: u64,
+    disk_id: Option<String>,
+    title: String,
+    details: Vec<String>,
+    severity: NotificationSeverity,
+    expires_at: Instant,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Dashboard {
     pub disks: Vec<DiskView>,
@@ -117,9 +134,77 @@ pub struct Dashboard {
     pub hovered_tab: Option<usize>,
     pub content_scroll: usize,
     pub notice: Option<String>,
+    notifications: VecDeque<Notification>,
+    notifications_open: bool,
+    notification_scroll: usize,
+    last_issue_keys: HashMap<String, HashSet<String>>,
+    inventory_initialized: bool,
+    toast_was_active: bool,
     pub history: History,
     pub generation: u64,
     pub frame: usize,
+}
+
+const MAX_NOTIFICATION_HISTORY: usize = 64;
+const TOAST_DURATION: Duration = Duration::from_secs(6);
+
+fn active_notification(state: &Dashboard, now: Instant) -> Option<&Notification> {
+    state
+        .notifications
+        .iter()
+        .rev()
+        .find(|notice| notice.generation == state.generation && notice.expires_at > now)
+}
+
+fn push_notification(
+    state: &mut Dashboard,
+    disk_id: Option<String>,
+    title: String,
+    details: Vec<String>,
+    severity: NotificationSeverity,
+    now: Instant,
+) {
+    state.notifications.push_back(Notification {
+        generation: state.generation,
+        disk_id,
+        title,
+        details,
+        severity,
+        expires_at: now + TOAST_DURATION,
+    });
+    while state.notifications.len() > MAX_NOTIFICATION_HISTORY {
+        state.notifications.pop_front();
+    }
+    state.notification_scroll = 0;
+}
+
+fn reset_notifications_for_generation(state: &mut Dashboard) {
+    state.notifications.clear();
+    state.last_issue_keys.clear();
+    state.notification_scroll = 0;
+    state.notifications_open = false;
+}
+
+fn disk_label(identity: &DiskIdentity) -> String {
+    let model = identity
+        .model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    match model {
+        Some(model) => format!("Disco #{} · {model}", identity.index),
+        None => format!("Disco #{}", identity.index),
+    }
+}
+
+fn record_issue_transition(
+    state: &mut Dashboard,
+    owner: &str,
+    current_keys: HashSet<String>,
+) -> bool {
+    let previous = state.last_issue_keys.entry(owner.to_owned()).or_default();
+    let has_new_issue = current_keys.iter().any(|key| !previous.contains(key));
+    *previous = current_keys;
+    has_new_issue
 }
 
 impl Display for Dashboard {
@@ -190,8 +275,18 @@ impl App for DashboardApp {
         let state = &mut global.state;
         match event {
             InputEvent::Keyboard(KeyPress::Plain { key }) => match key {
-                Key::Character('q') | Key::SpecialKey(SpecialKey::Esc) => {
+                Key::Character('q') => {
                     return Ok(EventPropagation::ExitMainEventLoop);
+                }
+                Key::SpecialKey(SpecialKey::Esc) if state.notifications_open => {
+                    state.notifications_open = false;
+                    return Ok(EventPropagation::ConsumedRender);
+                }
+                Key::SpecialKey(SpecialKey::Esc) => {
+                    return Ok(EventPropagation::ExitMainEventLoop);
+                }
+                Key::Character('n') => {
+                    toggle_notification_center(state);
                 }
                 Key::SpecialKey(SpecialKey::Left) | Key::SpecialKey(SpecialKey::BackTab) => {
                     apply_footer_action(state, FooterAction::PreviousDisk);
@@ -200,28 +295,39 @@ impl App for DashboardApp {
                     apply_footer_action(state, FooterAction::NextDisk);
                 }
                 Key::SpecialKey(SpecialKey::Up) | Key::Character('k') => {
-                    apply_footer_action(state, FooterAction::ScrollUp);
+                    if state.notifications_open {
+                        state.notification_scroll = state.notification_scroll.saturating_sub(1);
+                    } else {
+                        apply_footer_action(state, FooterAction::ScrollUp);
+                    }
                 }
                 Key::SpecialKey(SpecialKey::Down) | Key::Character('j') => {
-                    apply_footer_action(state, FooterAction::ScrollDown);
+                    if state.notifications_open {
+                        state.notification_scroll = state.notification_scroll.saturating_add(1);
+                    } else {
+                        apply_footer_action(state, FooterAction::ScrollDown);
+                    }
                 }
                 Key::SpecialKey(SpecialKey::PageUp) => {
-                    state.content_scroll = state.content_scroll.saturating_sub(5);
+                    if state.notifications_open {
+                        state.notification_scroll = state.notification_scroll.saturating_sub(5);
+                    } else {
+                        state.content_scroll = state.content_scroll.saturating_sub(5);
+                    }
                 }
                 Key::SpecialKey(SpecialKey::PageDown) => {
-                    state.content_scroll = state.content_scroll.saturating_add(5);
+                    if state.notifications_open {
+                        state.notification_scroll = state.notification_scroll.saturating_add(5);
+                    } else {
+                        state.content_scroll = state.content_scroll.saturating_add(5);
+                    }
                 }
                 _ => return Ok(EventPropagation::Propagate),
             },
             InputEvent::Mouse(mouse) => {
                 let x: usize = (*mouse.pos.col_index).into();
                 let y: usize = (*mouse.pos.row_index).into();
-                let layout = Layout::new(
-                    (*global.window_size.col_width).into(),
-                    (*global.window_size.row_height).into(),
-                    state.disks.len(),
-                    state.scroll,
-                );
+                let layout = layout_for_state(width, height, state);
                 if mouse.kind == MouseInputKind::MouseMove {
                     let hovered_tab = layout.tab_at(x, y);
                     if state.hovered_tab != hovered_tab {
@@ -235,7 +341,15 @@ impl App for DashboardApp {
                         if layout.quit.contains(x, y) {
                             return Ok(EventPropagation::ExitMainEventLoop);
                         }
-                        if let Some(action) = layout.control_at(x, y) {
+                        if layout.notification_button.contains(x, y) {
+                            toggle_notification_center(state);
+                        } else if !state.notifications_open
+                            && layout.toast.contains(x, y)
+                            && active_notification(state, Instant::now()).is_some()
+                        {
+                            state.notifications_open = true;
+                            state.notification_scroll = 0;
+                        } else if let Some(action) = layout.control_at(x, y) {
                             apply_footer_action(state, action);
                         } else if let Some(index) = layout.tab_at(x, y) {
                             state.selected = index;
@@ -257,6 +371,12 @@ impl App for DashboardApp {
                         if layout.tabs.iter().any(|tab| tab.contains(x, y)) =>
                     {
                         move_selection(state, true, 1);
+                    }
+                    MouseInputKind::ScrollUp if state.notifications_open => {
+                        state.notification_scroll = state.notification_scroll.saturating_sub(1)
+                    }
+                    MouseInputKind::ScrollDown if state.notifications_open => {
+                        state.notification_scroll = state.notification_scroll.saturating_add(1)
                     }
                     MouseInputKind::ScrollUp => {
                         state.content_scroll = state.content_scroll.saturating_sub(1)
@@ -292,6 +412,13 @@ impl App for DashboardApp {
                 if *generation < state.generation {
                     return Ok(EventPropagation::Consumed);
                 }
+                let topology_changed =
+                    state.inventory_initialized && *generation != state.generation;
+                if topology_changed {
+                    // Retire old-generation toasts before the new inventory
+                    // starts issuing SMART work; new results can notify afresh.
+                    reset_notifications_for_generation(state);
+                }
                 state.generation = *generation;
                 let old_id = state
                     .disks
@@ -299,6 +426,39 @@ impl App for DashboardApp {
                     .map(|disk| disk.identity.id.clone());
                 let previous_selection = state.selected;
                 let previous = std::mem::take(&mut state.disks);
+                record_issue_transition(state, "@inventory", HashSet::new());
+                if topology_changed {
+                    let previous_ids = previous
+                        .iter()
+                        .map(|disk| disk.identity.id.as_str())
+                        .collect::<HashSet<_>>();
+                    let next_ids = disks
+                        .iter()
+                        .map(|disk| disk.id.as_str())
+                        .collect::<HashSet<_>>();
+                    let mut changes = disks
+                        .iter()
+                        .filter(|disk| !previous_ids.contains(disk.id.as_str()))
+                        .map(|disk| format!("Conectado: {}", disk_label(disk)))
+                        .collect::<Vec<_>>();
+                    changes.extend(
+                        previous
+                            .iter()
+                            .filter(|disk| !next_ids.contains(disk.identity.id.as_str()))
+                            .map(|disk| format!("Removido: {}", disk_label(&disk.identity))),
+                    );
+                    if changes.is_empty() {
+                        changes.push(format!("{} discos detectados", disks.len()));
+                    }
+                    push_notification(
+                        state,
+                        None,
+                        "Inventário de discos atualizado".into(),
+                        changes,
+                        NotificationSeverity::Info,
+                        Instant::now(),
+                    );
+                }
                 state.disks = disks
                     .iter()
                     .cloned()
@@ -331,6 +491,7 @@ impl App for DashboardApp {
                 } else {
                     None
                 };
+                state.inventory_initialized = true;
                 clamp_tab_scroll(state, width, height);
                 ensure_selected_visible(state, width, height);
             }
@@ -341,7 +502,18 @@ impl App for DashboardApp {
                 if *generation < state.generation {
                     return Ok(EventPropagation::Consumed);
                 }
-                state.notice = Some("Não foi possível localizar os discos".into())
+                state.notice = Some("Não foi possível localizar os discos".into());
+                let keys = HashSet::from(["enumeration-failed".to_owned()]);
+                if record_issue_transition(state, "@inventory", keys) {
+                    push_notification(
+                        state,
+                        None,
+                        "Não foi possível atualizar o inventário".into(),
+                        vec!["A lista atual de discos foi mantida.".into()],
+                        NotificationSeverity::Warning,
+                        Instant::now(),
+                    );
+                }
             }
             AppSignal::QueryFinished {
                 generation,
@@ -351,11 +523,14 @@ impl App for DashboardApp {
                 if *generation != state.generation {
                     return Ok(EventPropagation::Consumed);
                 }
+                let mut disk_name = None;
+                let mut query_error = None;
                 if let Some(disk) = state
                     .disks
                     .iter_mut()
                     .find(|disk| disk.identity.id == *disk_id)
                 {
+                    disk_name = Some(disk_label(&disk.identity));
                     if let Ok(telemetry) = result {
                         disk.querying = false;
                         disk.computing = true;
@@ -379,21 +554,38 @@ impl App for DashboardApp {
                         disk.querying = false;
                         disk.computing = false;
                         disk.telemetry = None;
-                        disk.error_message = Some(
-                            match result {
-                                Err(QueryErrorState::Permission) => {
+                        if let Err(error) = result {
+                            let message = match error {
+                                QueryErrorState::Permission => {
                                     "Permissão insuficiente para consultar o dispositivo"
                                 }
-                                Err(QueryErrorState::Unsupported) => {
+                                QueryErrorState::Unsupported => {
                                     "Leitura de saúde não compatível com o dispositivo"
                                 }
-                                Err(QueryErrorState::Transient | QueryErrorState::Partial) => {
+                                QueryErrorState::Transient | QueryErrorState::Partial => {
                                     "Não foi possível consultar os dados de saúde"
                                 }
-                                Ok(_) => unreachable!(),
-                            }
-                            .into(),
-                        );
+                            };
+                            disk.error_message = Some(message.into());
+                            query_error = Some((format!("{error:?}"), message.to_owned()));
+                        }
+                    }
+                }
+                if let Some(disk_name) = disk_name {
+                    let issue_owner = format!("query:{disk_id}");
+                    if let Some((key, message)) = query_error {
+                        if record_issue_transition(state, &issue_owner, HashSet::from([key])) {
+                            push_notification(
+                                state,
+                                Some(disk_id.clone()),
+                                format!("Falha na consulta · {disk_name}"),
+                                vec![message],
+                                NotificationSeverity::Warning,
+                                Instant::now(),
+                            );
+                        }
+                    } else {
+                        record_issue_transition(state, &issue_owner, HashSet::new());
                     }
                 }
             }
@@ -404,6 +596,7 @@ impl App for DashboardApp {
                 if *generation != state.generation {
                     return Ok(EventPropagation::Consumed);
                 }
+                let mut health_notice = None;
                 if let Some(disk) = state
                     .disks
                     .iter_mut()
@@ -413,6 +606,15 @@ impl App for DashboardApp {
                     if let Some(telemetry) = disk.pending_telemetry.take() {
                         let kind = effective_disk_kind(&disk.identity, &telemetry);
                         let score = score_health(kind, &telemetry);
+                        let (issue_keys, details, severity) =
+                            health_notification_snapshot(&score, &telemetry);
+                        health_notice = Some((
+                            disk.identity.id.clone(),
+                            disk_label(&disk.identity),
+                            issue_keys,
+                            details,
+                            severity,
+                        ));
                         if let Some(timestamp_unix_secs) = next_timestamp(&state.history, disk_id) {
                             let sample = HealthSample {
                                 disk_id: disk.identity.id.clone(),
@@ -432,13 +634,35 @@ impl App for DashboardApp {
                         disk.telemetry = Some(telemetry);
                     }
                 }
+                if let Some((disk_id, label, issue_keys, details, severity)) = health_notice {
+                    if record_issue_transition(state, &disk_id, issue_keys) {
+                        let title = match severity {
+                            NotificationSeverity::Info => "Informação de saúde",
+                            NotificationSeverity::Warning => "Atenção à saúde",
+                            NotificationSeverity::Critical => "Falha de saúde",
+                        };
+                        push_notification(
+                            state,
+                            Some(disk_id),
+                            format!("{title} · {label}"),
+                            details,
+                            severity,
+                            Instant::now(),
+                        );
+                    }
+                }
             }
             AppSignal::HistoryLoaded(history) => state.history = history.clone(),
             AppSignal::Frame => {
+                let active_toast = active_notification(state, Instant::now()).is_some();
+                let toast_expired = state.toast_was_active && !active_toast;
+                state.toast_was_active = active_toast;
                 if !state
                     .disks
                     .iter()
                     .any(|disk| disk.querying || disk.computing)
+                    && !active_toast
+                    && !toast_expired
                 {
                     return Ok(EventPropagation::Consumed);
                 }
@@ -465,8 +689,9 @@ impl App for DashboardApp {
         clamp_tab_scroll(&mut global.state, width, height);
         ensure_selected_visible(&mut global.state, width, height);
         clamp_content_scroll(&mut global.state, width, height);
+        clamp_notification_scroll(&mut global.state, width, height);
         let state = &global.state;
-        let layout = Layout::new(width, height, state.disks.len(), state.scroll);
+        let layout = layout_for_state(width, height, state);
         let mut pipeline = RenderPipeline::default();
         let mut ops = RenderOpIRVec::new();
         ops += RenderOpCommon::SetBgColor(TuiColor::Rgb(TOKYO_BG));
@@ -494,7 +719,12 @@ impl App for DashboardApp {
         }
         let title_x = usize::from(width >= 24);
         let full_title = format!("chkdsk v{}", env!("CARGO_PKG_VERSION"));
-        let title_width = layout.quit.x.saturating_sub(title_x + 1);
+        let title_right = if layout.notification_button.visible() {
+            layout.notification_button.x
+        } else {
+            layout.quit.x
+        };
+        let title_width = title_right.saturating_sub(title_x + 1);
         let title = if r3bl_tui::GCStringOwned::new(&full_title)
             .display_width()
             .as_usize()
@@ -524,10 +754,30 @@ impl App for DashboardApp {
                 true,
             );
         }
+        if layout.notification_button.visible() {
+            let label = if layout.notification_button.width >= 11 {
+                if state.notifications_open {
+                    "Fechar".to_owned()
+                } else {
+                    format!("Avisos {}", state.notifications.len().min(99))
+                }
+            } else {
+                if state.notifications_open { "×" } else { "!" }.to_owned()
+            };
+            let active = active_notification(state, Instant::now());
+            let (fg, bg) = match active.map(|notice| notice.severity) {
+                Some(NotificationSeverity::Critical) => (TOKYO_BG_DARK1, TOKYO_RED),
+                Some(NotificationSeverity::Warning) => (TOKYO_BG_DARK1, TOKYO_YELLOW),
+                Some(NotificationSeverity::Info) => (TOKYO_BG_DARK1, TOKYO_BLUE),
+                None if !state.notifications.is_empty() => (TOKYO_FG, TOKYO_BG_VISUAL),
+                None => (TOKYO_FG_DARK, TOKYO_BG_DARK1),
+            };
+            paint_button(&mut ops, layout.notification_button, &label, fg, bg, true);
+        }
         for (position, area) in layout.tabs.iter().enumerate() {
             let index = layout.tab_indices[position];
             let disk = &state.disks[index];
-            let mark = if index == state.selected { "> " } else { "" };
+            let mark = if index == state.selected { "> " } else { "  " };
             // Disk identity belongs in the permanent tab; the model appears once below.
             let label = format!("{mark}Disco #{}", disk.identity.index);
             let (fg, bg) = if index == state.selected {
@@ -539,15 +789,18 @@ impl App for DashboardApp {
             };
             paint_button(&mut ops, *area, &label, fg, bg, index == state.selected);
         }
-        if height > layout.body_y {
-            if let Some(disk) = state.disks.get(state.selected) {
+        let body_height = body_view_height(&layout, height);
+        if height > layout.body_y && body_height > 0 {
+            if state.notifications_open {
+                render_notification_center(&mut ops, state, layout.body_y, width, body_height);
+            } else if let Some(disk) = state.disks.get(state.selected) {
                 render_disk(
                     &mut ops,
                     disk,
                     &state.history,
                     layout.body_y,
                     width,
-                    body_view_height(&layout, height),
+                    body_height,
                     state.content_scroll,
                     state.frame,
                 );
@@ -560,6 +813,34 @@ impl App for DashboardApp {
                     TOKYO_FG_DARK,
                     false,
                     width.saturating_sub(2),
+                    Some(TOKYO_BG_DARK1),
+                );
+            }
+        }
+        if layout.toast.visible() && layout.toast_reserved {
+            fill_row(&mut ops, layout.toast.y, width, TOKYO_BG_DARK1);
+            if !state.notifications_open
+                && let Some(notice) = active_notification(state, Instant::now())
+            {
+                let color = match notice.severity {
+                    NotificationSeverity::Info => TOKYO_CYAN,
+                    NotificationSeverity::Warning => TOKYO_YELLOW,
+                    NotificationSeverity::Critical => TOKYO_RED,
+                };
+                let detail = notice.details.first().map_or("", String::as_str);
+                let toast_text = if detail.is_empty() {
+                    notice.title.clone()
+                } else {
+                    format!("{} · {}", notice.title, detail)
+                };
+                paint_background(
+                    &mut ops,
+                    layout.toast.x,
+                    layout.toast.y,
+                    &toast_text,
+                    color,
+                    true,
+                    layout.toast.width,
                     Some(TOKYO_BG_DARK1),
                 );
             }
@@ -602,17 +883,26 @@ fn apply_footer_action(state: &mut Dashboard, action: FooterAction) {
     match action {
         FooterAction::PreviousDisk => move_selection(state, false, 1),
         FooterAction::NextDisk => move_selection(state, true, 1),
-        FooterAction::ScrollUp => {
-            state.content_scroll = state.content_scroll.saturating_sub(1);
+        FooterAction::ScrollUp if state.notifications_open => {
+            state.notification_scroll = state.notification_scroll.saturating_sub(1);
         }
-        FooterAction::ScrollDown => {
-            state.content_scroll = state.content_scroll.saturating_add(1);
+        FooterAction::ScrollDown if state.notifications_open => {
+            state.notification_scroll = state.notification_scroll.saturating_add(1);
         }
+        FooterAction::ScrollUp => state.content_scroll = state.content_scroll.saturating_sub(1),
+        FooterAction::ScrollDown => state.content_scroll = state.content_scroll.saturating_add(1),
+    }
+}
+
+fn toggle_notification_center(state: &mut Dashboard) {
+    state.notifications_open = !state.notifications_open;
+    if state.notifications_open {
+        state.notification_scroll = 0;
     }
 }
 
 fn ensure_selected_visible(state: &mut Dashboard, width: usize, height: usize) {
-    let layout = Layout::new(width, height, state.disks.len(), state.scroll);
+    let layout = Layout::for_state(width, height, state);
     if layout.tab_indices.contains(&state.selected) {
         return;
     }
@@ -635,7 +925,16 @@ fn clamp_tab_scroll(state: &mut Dashboard, width: usize, height: usize) {
         state.scroll = 0;
         return;
     }
-    let visible_count = Layout::new(width, height, disk_count, 0).tab_indices.len();
+    let index_digits = state
+        .disks
+        .iter()
+        .map(|disk| disk.identity.index.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let visible_count =
+        Layout::new_with_index_digits(width, height, disk_count, 0, index_digits, false)
+            .tab_indices
+            .len();
     let max_scroll = if visible_count == 0 {
         disk_count - 1
     } else {
@@ -826,11 +1125,18 @@ pub struct Layout {
     pub tabs: Vec<HitArea>,
     pub tab_indices: Vec<usize>,
     pub quit: HitArea,
+    pub notification_button: HitArea,
+    pub toast: HitArea,
+    toast_reserved: bool,
     controls: Vec<FooterControl>,
     pub body_y: usize,
 }
 
-const TAB_BUTTON_WIDTH: usize = 18;
+fn tab_button_width(index_digits: usize) -> usize {
+    // Two fixed selector cells, "Disco #", the longest index, and one cell
+    // of horizontal padding on either side.
+    2 + 7 + index_digits + 2
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FooterAction {
@@ -849,6 +1155,35 @@ struct FooterControl {
 
 impl Layout {
     pub fn new(width: usize, height: usize, disks: usize, scroll: usize) -> Self {
+        let index_digits = disks.saturating_sub(1).max(1).to_string().len();
+        Self::new_with_index_digits(width, height, disks, scroll, index_digits, false)
+    }
+
+    fn for_state(width: usize, height: usize, state: &Dashboard) -> Self {
+        let index_digits = state
+            .disks
+            .iter()
+            .map(|disk| disk.identity.index.to_string().len())
+            .max()
+            .unwrap_or(1);
+        Self::new_with_index_digits(
+            width,
+            height,
+            state.disks.len(),
+            state.scroll,
+            index_digits,
+            state.notifications_open,
+        )
+    }
+
+    fn new_with_index_digits(
+        width: usize,
+        height: usize,
+        disks: usize,
+        scroll: usize,
+        index_digits: usize,
+        notifications_open: bool,
+    ) -> Self {
         if width == 0 || height == 0 {
             return Self::default();
         }
@@ -857,16 +1192,16 @@ impl Layout {
         let button_height = if height >= 11 { 3 } else { 1 };
         let quit = if width >= 21 {
             HitArea {
-                x: width - 8,
+                x: width - 7,
                 y: 0,
-                width: 7,
+                width: 6,
                 height: button_height,
             }
         } else if width >= 18 {
             HitArea {
-                x: width - 5,
+                x: width - 4,
                 y: 0,
-                width: 4,
+                width: 3,
                 height: button_height,
             }
         } else {
@@ -877,6 +1212,31 @@ impl Layout {
                 height: button_height,
             }
         };
+        let notification_button = if width >= 36 {
+            let button_width = 11;
+            HitArea {
+                x: quit.x.saturating_sub(button_width + 1),
+                y: 0,
+                width: button_width,
+                height: button_height,
+            }
+        } else if width >= 10 {
+            HitArea {
+                x: quit.x.saturating_sub(2),
+                y: 0,
+                width: 1,
+                height: button_height,
+            }
+        } else if width >= 2 {
+            HitArea {
+                x: width - 2,
+                y: 0,
+                width: 1,
+                height: button_height,
+            }
+        } else {
+            HitArea::default()
+        };
         let mut tabs = Vec::new();
         let mut tab_indices = Vec::new();
         // Leave a quiet one-cell gutter around the horizontal tab strip when
@@ -885,13 +1245,14 @@ impl Layout {
         let mut x = side_margin;
         let y = button_height;
         let start = scroll.min(disks.saturating_sub(1));
+        let max_tab_width = tab_button_width(index_digits);
         if width >= 3 && height > 2 * button_height {
             for index in start..disks {
                 let remaining = width.saturating_sub(x + side_margin);
-                if remaining < TAB_BUTTON_WIDTH && !tabs.is_empty() {
+                if remaining < max_tab_width && !tabs.is_empty() {
                     break;
                 }
-                let available = TAB_BUTTON_WIDTH.min(remaining);
+                let available = max_tab_width.min(remaining);
                 if available == 0 {
                     break;
                 }
@@ -909,11 +1270,25 @@ impl Layout {
             }
         }
         let body_y = (2 * button_height).min(height);
-        let controls = footer_controls(width, height);
+        let controls = footer_controls(width, height, notifications_open);
+        let footer_height = controls.first().map_or(0, |control| control.area.height);
+        let toast = if width >= 12 && height >= 12 {
+            HitArea {
+                x: 1.min(width.saturating_sub(1)),
+                y: height.saturating_sub(footer_height + 1),
+                width: width.saturating_sub(2),
+                height: 1,
+            }
+        } else {
+            HitArea::default()
+        };
         Self {
             tabs,
             tab_indices,
             quit,
+            notification_button,
+            toast,
+            toast_reserved: false,
             controls,
             body_y,
         }
@@ -933,40 +1308,57 @@ impl Layout {
     }
 }
 
-fn footer_controls(width: usize, height: usize) -> Vec<FooterControl> {
+fn footer_controls(width: usize, height: usize, notifications_open: bool) -> Vec<FooterControl> {
     // Compact screens reserve their height for the health summary. The same
     // mouse actions remain available through tab clicks and wheel scrolling.
     if width < 21 || height < 17 {
         return Vec::new();
     }
     let button_height = 3;
-    let controls: &[(&str, FooterAction)] = if width >= 54 {
-        &[
+    let (scroll_up_label, scroll_down_label) = if notifications_open {
+        if width >= 39 {
+            ("↑ Avisos", "↓ Avisos")
+        } else if width >= 33 {
+            ("↑Avis", "↓Avis")
+        } else {
+            ("↑A", "↓A")
+        }
+    } else if width >= 54 {
+        ("↑ Detalhes", "↓ Detalhes")
+    } else if width >= 39 {
+        ("↑ Info", "↓ Info")
+    } else if width >= 33 {
+        ("↑Dados", "↓Dados")
+    } else {
+        ("↑I", "↓I")
+    };
+    let controls = if width >= 54 {
+        vec![
             ("← Discos", FooterAction::PreviousDisk),
             ("→ Discos", FooterAction::NextDisk),
-            ("↑ Detalhes", FooterAction::ScrollUp),
-            ("↓ Detalhes", FooterAction::ScrollDown),
+            (scroll_up_label, FooterAction::ScrollUp),
+            (scroll_down_label, FooterAction::ScrollDown),
         ]
     } else if width >= 39 {
-        &[
+        vec![
             ("← Disco", FooterAction::PreviousDisk),
             ("→ Disco", FooterAction::NextDisk),
-            ("↑ Info", FooterAction::ScrollUp),
-            ("↓ Info", FooterAction::ScrollDown),
+            (scroll_up_label, FooterAction::ScrollUp),
+            (scroll_down_label, FooterAction::ScrollDown),
         ]
     } else if width >= 33 {
-        &[
+        vec![
             ("←Dsc", FooterAction::PreviousDisk),
             ("→Dsc", FooterAction::NextDisk),
-            ("↑Dados", FooterAction::ScrollUp),
-            ("↓Dados", FooterAction::ScrollDown),
+            (scroll_up_label, FooterAction::ScrollUp),
+            (scroll_down_label, FooterAction::ScrollDown),
         ]
     } else {
-        &[
+        vec![
             ("←D", FooterAction::PreviousDisk),
             ("→D", FooterAction::NextDisk),
-            ("↑I", FooterAction::ScrollUp),
-            ("↓I", FooterAction::ScrollDown),
+            (scroll_up_label, FooterAction::ScrollUp),
+            (scroll_down_label, FooterAction::ScrollDown),
         ]
     };
     let mut x = 1;
@@ -1011,22 +1403,33 @@ fn body_view_height(layout: &Layout, height: usize) -> usize {
         .controls
         .first()
         .map_or(0, |control| control.area.height);
-    height.saturating_sub(layout.body_y + footer_height)
+    height.saturating_sub(layout.body_y + footer_height + usize::from(layout.toast_reserved))
+}
+
+fn layout_for_state(width: usize, height: usize, state: &Dashboard) -> Layout {
+    let mut layout = Layout::for_state(width, height, state);
+    layout.toast_reserved = !state.notifications_open
+        && active_notification(state, Instant::now()).is_some()
+        && layout.toast.visible();
+    layout
 }
 
 fn disk_content_line_count(disk: &DiskView, width: usize, body_height: usize) -> usize {
     let Some(telemetry) = disk.telemetry.as_ref() else {
-        return 5;
+        return 6;
     };
 
-    let kind = effective_disk_kind(&disk.identity, telemetry);
-    let health = score_health(kind, telemetry);
     let large_score = body_height >= 9 && width >= 26;
-    10 + usize::from(large_score) * 5 + health_detail_messages(&health, telemetry).len()
+    let unknown_health = score_health(effective_disk_kind(&disk.identity, telemetry), telemetry)
+        .outcome
+        == HealthOutcome::Unknown;
+    // Model, health label, ETA, confidence/status, details heading and six
+    // essential metrics. Detailed warning explanations live in notifications.
+    11 + usize::from(unknown_health && !large_score)
 }
 
 fn clamp_content_scroll(state: &mut Dashboard, width: usize, height: usize) {
-    let layout = Layout::new(width, height, state.disks.len(), state.scroll);
+    let layout = layout_for_state(width, height, state);
     let body_height = body_view_height(&layout, height);
     let max_scroll = state
         .disks
@@ -1034,6 +1437,146 @@ fn clamp_content_scroll(state: &mut Dashboard, width: usize, height: usize) {
         .map(|disk| disk_content_line_count(disk, width, body_height).saturating_sub(body_height))
         .unwrap_or_default();
     state.content_scroll = state.content_scroll.min(max_scroll);
+}
+
+#[derive(Clone, Debug)]
+struct NotificationLine {
+    text: String,
+    foreground: RgbValue,
+    background: RgbValue,
+    bold: bool,
+}
+
+fn notification_center_lines(state: &Dashboard, max_width: usize) -> Vec<NotificationLine> {
+    let mut lines = Vec::new();
+    for notice in state.notifications.iter().rev() {
+        let color = match notice.severity {
+            NotificationSeverity::Info => TOKYO_CYAN,
+            NotificationSeverity::Warning => TOKYO_YELLOW,
+            NotificationSeverity::Critical => TOKYO_RED,
+        };
+        lines.extend(wrap_text(&notice.title, max_width).into_iter().map(|text| {
+            NotificationLine {
+                text,
+                foreground: color,
+                background: TOKYO_BG_DARK1,
+                bold: true,
+            }
+        }));
+        for detail in &notice.details {
+            let (prefix, indent_width) = if max_width >= 4 {
+                ("  · ", 4)
+            } else if max_width >= 2 {
+                ("· ", 2)
+            } else {
+                ("", 0)
+            };
+            let indent = " ".repeat(indent_width);
+            let wrapped = wrap_text(detail, max_width.saturating_sub(indent_width).max(1));
+            lines.extend(
+                wrapped
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, text)| NotificationLine {
+                        text: format!("{}{}", if index == 0 { prefix } else { &indent }, text),
+                        foreground: TOKYO_FG,
+                        background: TOKYO_BG_DARK,
+                        bold: false,
+                    }),
+            );
+        }
+        lines.push(NotificationLine {
+            text: String::new(),
+            foreground: TOKYO_FG_DARK,
+            background: TOKYO_BG,
+            bold: false,
+        });
+    }
+    if lines.is_empty() {
+        lines.extend(
+            wrap_text("Nenhum aviso nesta atualização de hardware", max_width)
+                .into_iter()
+                .map(|text| NotificationLine {
+                    text,
+                    foreground: TOKYO_FG_DARK,
+                    background: TOKYO_BG_DARK,
+                    bold: false,
+                }),
+        );
+    }
+    lines
+}
+
+fn clamp_notification_scroll(state: &mut Dashboard, width: usize, height: usize) {
+    if !state.notifications_open {
+        return;
+    }
+    let layout = layout_for_state(width, height, state);
+    let body_height = body_view_height(&layout, height);
+    let visible_lines = body_height.saturating_sub(2);
+    state.notification_scroll = state.notification_scroll.min(
+        notification_center_lines(state, width.saturating_sub(2))
+            .len()
+            .saturating_sub(visible_lines),
+    );
+}
+
+fn render_notification_center(
+    ops: &mut RenderOpIRVec,
+    state: &Dashboard,
+    top: usize,
+    width: usize,
+    height: usize,
+) {
+    fill_row(ops, top, width, TOKYO_BG_DARK1);
+    paint_background(
+        ops,
+        1.min(width.saturating_sub(1)),
+        top,
+        &format!("CENTRAL DE NOTIFICAÇÕES · {}", state.notifications.len()),
+        TOKYO_BLUE,
+        true,
+        width.saturating_sub(1),
+        Some(TOKYO_BG_DARK1),
+    );
+    if height < 2 {
+        return;
+    }
+    fill_row(ops, top + 1, width, TOKYO_BG_DARK);
+    let navigation_help = if width >= 44 {
+        "N/Esc fecha · roda, ↑/↓, j/k ou PgUp/PgDn percorrem"
+    } else {
+        "N/Esc fecha · roda/↑/↓"
+    };
+    paint_background(
+        ops,
+        1.min(width.saturating_sub(1)),
+        top + 1,
+        navigation_help,
+        TOKYO_FG_DARK,
+        false,
+        width.saturating_sub(1),
+        Some(TOKYO_BG_DARK),
+    );
+    for (offset, line) in notification_center_lines(state, width.saturating_sub(2))
+        .iter()
+        .skip(state.notification_scroll)
+        .take(height.saturating_sub(2))
+        .enumerate()
+    {
+        let y = top + 2 + offset;
+        fill_row(ops, y, width, line.background);
+        paint_background(
+            ops,
+            1.min(width.saturating_sub(1)),
+            y,
+            &line.text,
+            line.foreground,
+            line.bold,
+            width.saturating_sub(1),
+            Some(line.background),
+        );
+    }
 }
 
 fn centered_button_text(area: HitArea, label: &str) -> Option<(usize, usize, String)> {
@@ -1153,13 +1696,15 @@ fn render_disk(
         if line >= scroll && line - scroll < available_height {
             let y = top + line - scroll;
             fill_row(ops, y, width, bg);
-            paint_background(
+            let italic = !bold && (text.starts_with("ETA") || text.starts_with("Sem ETA"));
+            paint_background_with_attributes(
                 ops,
                 1.min(width.saturating_sub(1)),
                 y,
                 text,
                 fg,
                 bold,
+                italic,
                 width.saturating_sub(1),
                 Some(bg),
             );
@@ -1196,6 +1741,11 @@ fn render_disk(
             TOKYO_RED
         };
         row(ops, message, color, TOKYO_BG_DARK1, true);
+        let spacer = available_height.saturating_sub(6);
+        for _ in 0..spacer {
+            row(ops, "", TOKYO_FG_DARK, TOKYO_BG, false);
+        }
+        row(ops, "DETALHES DO DISCO", TOKYO_BLUE, TOKYO_BG_DARK1, true);
         let kind = match disk.identity.kind {
             DiskKind::Hdd => "HDD",
             DiskKind::Ssd => "SSD",
@@ -1237,12 +1787,14 @@ fn render_disk(
             .contains(&HealthWarningReason::EnduranceExhausted);
     let basic_smart = is_basic_smart_pass(&health);
     let large_score = available_height >= 9 && width >= 26;
-    let headline = if large_score || health.outcome == HealthOutcome::Unknown {
-        if label.starts_with("SAÚDE") {
-            label.to_owned()
+    let headline = if health.outcome == HealthOutcome::Unknown {
+        if large_score {
+            "SAÚDE INDETERMINADA · N/A".to_owned()
         } else {
-            format!("SAÚDE · {label}")
+            "SAÚDE INDETERMINADA".to_owned()
         }
+    } else if large_score {
+        format!("{label} · {}%", health.score)
     } else if nominal_attention {
         format!("NOMINAL · {}%", health.score)
     } else if basic_smart {
@@ -1252,14 +1804,26 @@ fn render_disk(
     };
     row(ops, &headline, color, TOKYO_BG_DARK1, true);
 
-    if large_score {
-        let score_text = if health.outcome == HealthOutcome::Unknown {
-            "N/A".to_owned()
-        } else {
-            format!("{}%", health.score)
-        };
-        for score_row in ascii_score_lines(&score_text) {
-            row(ops, &score_row, color, TOKYO_BG, true);
+    if health.outcome == HealthOutcome::Unknown && !large_score {
+        // Keep N/A explicit in short terminals where the health/state pair
+        // cannot fit on a single dominant line.
+        let score_text = "N/A";
+        let score_width = r3bl_tui::GCStringOwned::new(score_text)
+            .display_width()
+            .as_usize();
+        let score_x = 1 + width.saturating_sub(score_width + 2) / 2;
+        if let Some(y) = row(ops, "", color, TOKYO_BG, false) {
+            paint_background_with_attributes(
+                ops,
+                score_x,
+                y,
+                score_text,
+                color,
+                true,
+                false,
+                score_width,
+                Some(TOKYO_BG),
+            );
         }
     }
     let eta = if kind == DiskKind::Hdd {
@@ -1292,18 +1856,24 @@ fn render_disk(
     row(ops, &eta, TOKYO_FG_DARK, TOKYO_BG_DARK, false);
 
     let full_status = telemetry_status(telemetry);
-    let status = if basic_smart {
-        if width < 40 {
-            "SMART básico: baixa confiança"
+    let status = if disk.querying || disk.computing {
+        if width >= 40 {
+            "Atualizando telemetria · última leitura mantida"
         } else {
-            "SMART básico: escore de baixa confiança; sem mapeamento detalhado"
+            "Atualizando telemetria"
+        }
+    } else if basic_smart {
+        "SMART básico · baixa confiança"
+    } else if health.outcome == HealthOutcome::Unknown {
+        if width >= 40 {
+            "Saúde indeterminada · índice indisponível"
+        } else {
+            "Saúde indeterminada"
         }
     } else if width >= 40 {
         full_status
     } else if full_status.contains("permissão") {
         "Permissão insuficiente"
-    } else if health.outcome == HealthOutcome::Unknown {
-        "Dados de saúde indisponíveis"
     } else if health.outcome == HealthOutcome::Fail {
         "Falha reportada"
     } else if full_status.contains("parcial") {
@@ -1311,22 +1881,26 @@ fn render_disk(
     } else {
         "Sem falha reportada"
     };
-    let status_color =
-        if full_status.contains("permissão") || matches!(health.outcome, HealthOutcome::Fail) {
-            TOKYO_RED
-        } else if health.outcome == HealthOutcome::Unknown
-            || full_status.contains("parcial")
-            || basic_smart
-            || !health.warnings.is_empty()
-        {
-            TOKYO_YELLOW
-        } else {
-            TOKYO_GREEN
-        };
+    let status_color = if disk.querying || disk.computing {
+        TOKYO_CYAN
+    } else if full_status.contains("permissão") || matches!(health.outcome, HealthOutcome::Fail) {
+        TOKYO_RED
+    } else if health.outcome == HealthOutcome::Unknown
+        || full_status.contains("parcial")
+        || basic_smart
+        || !health.warnings.is_empty()
+    {
+        TOKYO_YELLOW
+    } else {
+        TOKYO_GREEN
+    };
     row(ops, status, status_color, TOKYO_BG_DARK1, false);
-    for (message, color) in health_detail_messages(&health, telemetry) {
-        row(ops, &message, color, TOKYO_BG_DARK1, color == TOKYO_RED);
+    let spacer =
+        available_height.saturating_sub(disk_content_line_count(disk, width, available_height));
+    for _ in 0..spacer {
+        row(ops, "", TOKYO_FG_DARK, TOKYO_BG, false);
     }
+    row(ops, "DETALHES DO DISCO", TOKYO_BLUE, TOKYO_BG_DARK1, true);
     let kind = match kind {
         DiskKind::Hdd => "HDD",
         DiskKind::Ssd => "SSD",
@@ -1410,7 +1984,7 @@ fn health_presentation(health: &crate::health::HealthScore) -> (&'static str, Rg
             ("VIDA NOMINAL ESGOTADA", TOKYO_YELLOW)
         }
         HealthOutcome::Pass if !health.warnings.is_empty() => {
-            ("ATENÇÃO · VER AVISOS", TOKYO_YELLOW)
+            ("ATENÇÃO · SINAIS SMART", TOKYO_YELLOW)
         }
         HealthOutcome::Pass if health.score <= 50 => ("ATENÇÃO · SAÚDE REDUZIDA", TOKYO_YELLOW),
         HealthOutcome::Pass if is_basic_smart_pass(health) => {
@@ -1486,6 +2060,24 @@ fn health_detail_messages(
             HealthWarningReason::EnduranceExhausted => {
                 vec!["Vida útil nominal do dispositivo esgotada".into()]
             }
+            HealthWarningReason::AtaReallocatedSectors => {
+                vec!["Setores realocados registrados na mídia".into()]
+            }
+            HealthWarningReason::AtaSpinRetries => {
+                vec!["Tentativas repetidas de giro registradas".into()]
+            }
+            HealthWarningReason::AtaReportedUncorrectable => {
+                vec!["Erros incorrigíveis reportados pelo dispositivo".into()]
+            }
+            HealthWarningReason::AtaPendingSectors => {
+                vec!["Setores pendentes aguardando remapeamento".into()]
+            }
+            HealthWarningReason::AtaOfflineUncorrectable => {
+                vec!["Setores incorrigíveis encontrados em verificações offline".into()]
+            }
+            HealthWarningReason::AtaRawEncodingAmbiguous => {
+                vec!["Codificação bruta SMART ambígua; índice de saúde HDD indisponível".into()]
+            }
             HealthWarningReason::NvmeMediaErrors => vec![match &telemetry.nvme {
                 QueryState::Success(nvme) => nvme
                     .media_errors
@@ -1513,6 +2105,68 @@ fn health_detail_messages(
         );
     }
     messages
+}
+
+fn health_notification_snapshot(
+    health: &crate::health::HealthScore,
+    telemetry: &Telemetry,
+) -> (HashSet<String>, Vec<String>, NotificationSeverity) {
+    let basic_smart = is_basic_smart_pass(health);
+    let status = telemetry_status(telemetry);
+    let status_is_warning = !matches!(
+        status,
+        "Dados SMART disponíveis" | "Sem falha geral relatada pelo dispositivo"
+    );
+    let mut keys = health
+        .warnings
+        .iter()
+        .map(|warning| format!("warning:{warning:?}"))
+        .collect::<HashSet<_>>();
+    if health.outcome == HealthOutcome::Fail {
+        keys.insert("health-failure".into());
+    }
+    if health.outcome == HealthOutcome::Unknown {
+        keys.insert("health-unavailable".into());
+    }
+    if health.score <= 50 && health.outcome == HealthOutcome::Pass {
+        keys.insert("low-score".into());
+    }
+    if basic_smart {
+        keys.insert("basic-smart".into());
+    }
+    if status_is_warning {
+        keys.insert(format!("telemetry-status:{status}"));
+    }
+
+    let mut details = health_detail_messages(health, telemetry)
+        .into_iter()
+        .map(|(message, _)| message)
+        .collect::<Vec<_>>();
+    if basic_smart {
+        details.push("Leitura SMART básica; o escore tem baixa confiança".into());
+    }
+    if status_is_warning && !details.iter().any(|message| message == status) {
+        details.push(status.into());
+    }
+    if details.is_empty() && health.score <= 50 && health.outcome == HealthOutcome::Pass {
+        details.push(format!("Saúde em nível reduzido ({}%)", health.score));
+    }
+    if details.is_empty() && health.outcome == HealthOutcome::Unknown {
+        details.push(
+            "Índice indisponível: não há evidência suficiente para calcular uma porcentagem".into(),
+        );
+    }
+    details.sort();
+    details.dedup();
+
+    let severity = if health.outcome == HealthOutcome::Fail {
+        NotificationSeverity::Critical
+    } else if !keys.is_empty() {
+        NotificationSeverity::Warning
+    } else {
+        NotificationSeverity::Info
+    };
+    (keys, details, severity)
 }
 
 fn ata_threshold_messages(telemetry: &Telemetry, near: bool) -> Option<Vec<String>> {
@@ -1548,37 +2202,6 @@ fn ata_threshold_messages(telemetry: &Telemetry, near: bool) -> Option<Vec<Strin
         })
         .collect::<Vec<_>>();
     (!messages.is_empty()).then_some(messages)
-}
-
-fn ascii_score_lines(value: &str) -> Vec<String> {
-    let glyph = |ch: char| -> [&'static str; 5] {
-        match ch {
-            '0' => ["███", "█ █", "█ █", "█ █", "███"],
-            '1' => [" █ ", "██ ", " █ ", " █ ", "███"],
-            '2' => ["███", "  █", "███", "█  ", "███"],
-            '3' => ["███", "  █", " ██", "  █", "███"],
-            '4' => ["█ █", "█ █", "███", "  █", "  █"],
-            '5' => ["███", "█  ", "███", "  █", "███"],
-            '6' => ["███", "█  ", "███", "█ █", "███"],
-            '7' => ["███", "  █", "  █", " █ ", " █ "],
-            '8' => ["███", "█ █", "███", "█ █", "███"],
-            '9' => ["███", "█ █", "███", "  █", "███"],
-            'N' => ["█ █", "███", "███", "███", "█ █"],
-            'A' => ["███", "█ █", "███", "█ █", "█ █"],
-            '/' => ["  █", "  █", " █ ", "█  ", "█  "],
-            '%' => ["█ █", "  █", " █ ", "█  ", "█ █"],
-            _ => ["   "; 5],
-        }
-    };
-    (0..5)
-        .map(|row| {
-            value
-                .chars()
-                .map(|ch| glyph(ch)[row])
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect()
 }
 
 fn telemetry_has_usable_data(telemetry: &Telemetry) -> bool {
@@ -1658,6 +2281,21 @@ fn paint_background(
     max_width: usize,
     background: Option<RgbValue>,
 ) {
+    paint_background_with_attributes(ops, x, y, text, color, bold, false, max_width, background);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_background_with_attributes(
+    ops: &mut RenderOpIRVec,
+    x: usize,
+    y: usize,
+    text: &str,
+    color: RgbValue,
+    bold: bool,
+    italic: bool,
+    max_width: usize,
+    background: Option<RgbValue>,
+) {
     if max_width == 0 {
         return;
     }
@@ -1672,6 +2310,7 @@ fn paint_background(
         color_bg: Some(TuiColor::Rgb(background)),
         attribs: r3bl_tui::TuiStyleAttribs {
             bold: bold.then_some(r3bl_tui::tui_style_attrib::Bold),
+            italic: italic.then_some(r3bl_tui::tui_style_attrib::Italic),
             ..Default::default()
         },
         ..Default::default()
@@ -1702,6 +2341,57 @@ fn clipped(text: &str, limit: usize) -> String {
         end_byte = segment.end_byte_index.as_usize();
     }
     text[..end_byte].to_owned()
+}
+
+fn display_width(text: &str) -> usize {
+    r3bl_tui::GCStringOwned::new(text)
+        .display_width()
+        .as_usize()
+}
+
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for word in text.split_whitespace() {
+        let mut remaining = word.to_owned();
+        while display_width(&remaining) > max_width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            let chunk = clipped(&remaining, max_width);
+            if chunk.is_empty() {
+                break;
+            }
+            remaining = remaining[chunk.len()..].to_owned();
+            lines.push(chunk);
+        }
+        if remaining.is_empty() {
+            continue;
+        }
+        let word_width = display_width(&remaining);
+        if !current.is_empty() && current_width + 1 + word_width > max_width {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+            current_width += 1;
+        }
+        current.push_str(&remaining);
+        current_width += word_width;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn pad_to_columns(text: &str, width: usize) -> String {
@@ -2019,6 +2709,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bold_and_italic_styles_reach_the_terminal_ansi_renderer() {
+        let mut ops = RenderOpIRVec::new();
+        paint_background_with_attributes(
+            &mut ops,
+            0,
+            0,
+            "SAÚDE",
+            TOKYO_GREEN,
+            true,
+            false,
+            8,
+            Some(TOKYO_BG),
+        );
+        paint_background_with_attributes(
+            &mut ops,
+            0,
+            1,
+            "ETA",
+            TOKYO_FG_DARK,
+            false,
+            true,
+            3,
+            Some(TOKYO_BG),
+        );
+        let mut pipeline = RenderPipeline::default();
+        pipeline.push(ZOrder::Normal, ops);
+        let size = r3bl_tui::Size::new((r3bl_tui::ColWidth::new(10), r3bl_tui::RowHeight::new(2)));
+        let mut buffer = r3bl_tui::OffscreenBuffer::new_empty(size);
+        pipeline.compose_render_ops_into_ofs_buf(
+            size,
+            &mut buffer,
+            &mut r3bl_tui::MemoizedLenMap::default(),
+        );
+        let ansi = String::from_utf8(r3bl_tui::RenderToAnsi::render_to_ansi(&buffer)).unwrap();
+        assert!(
+            ansi.contains("\u{1b}[1"),
+            "renderer omitted bold SGR: {ansi:?}"
+        );
+        assert!(
+            ansi.contains("\u{1b}[3"),
+            "renderer omitted italic SGR: {ansi:?}"
+        );
+    }
+
     fn escape_cell(ch: char) -> &'static str {
         match ch {
             '&' => "&amp;",
@@ -2028,6 +2763,99 @@ mod tests {
             '"' => "&quot;",
             _ => "",
         }
+    }
+
+    fn fixture_buffer(state: Dashboard, width: usize, height: usize) -> r3bl_tui::OffscreenBuffer {
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(state, width, height);
+        let pipeline = app
+            .app_render(
+                &mut global,
+                &mut ComponentRegistryMap::default(),
+                &mut HasFocus::default(),
+            )
+            .unwrap();
+        let size = r3bl_tui::Size::new((
+            r3bl_tui::ColWidth::new(width),
+            r3bl_tui::RowHeight::new(height),
+        ));
+        let mut buffer = r3bl_tui::OffscreenBuffer::new_empty(size);
+        pipeline.compose_render_ops_into_ofs_buf(
+            size,
+            &mut buffer,
+            &mut r3bl_tui::MemoizedLenMap::default(),
+        );
+        buffer
+    }
+
+    fn append_fixture_cells(
+        html: &mut String,
+        label: &str,
+        width: usize,
+        height: usize,
+        buffer: &r3bl_tui::OffscreenBuffer,
+    ) {
+        html.push_str(&format!(
+            "<section><div class=\"case\">{label} · {width} × {height}</div><div class=\"viewport\">"
+        ));
+        for cells in buffer.iter() {
+            html.push_str(&format!(
+                "<div class=\"row\" style=\"grid-template-columns:repeat({width},8px)\">"
+            ));
+            let mut cell_iter = cells.iter().peekable();
+            while let Some(cell) = cell_iter.next() {
+                let r3bl_tui::PixelChar::PlainText {
+                    display_char,
+                    style,
+                } = cell
+                else {
+                    panic!("unpainted cell in {label} at {width}x{height}: {cell:?}");
+                };
+                let fg = style
+                    .color_fg
+                    .map(rgb_hex)
+                    .expect("cell without explicit foreground");
+                let bg = style
+                    .color_bg
+                    .map(rgb_hex)
+                    .expect("cell without explicit background");
+                assert!(is_tokyo_moon_color(style.color_fg.unwrap()));
+                assert!(is_tokyo_moon_color(style.color_bg.unwrap()));
+                let glyph_width = r3bl_tui::GCStringOwned::width_char(*display_char)
+                    .as_usize()
+                    .max(1);
+                if glyph_width == 2 && matches!(cell_iter.peek(), Some(r3bl_tui::PixelChar::Void)) {
+                    cell_iter.next();
+                }
+                let escaped = escape_cell(*display_char);
+                let ch = if escaped.is_empty() {
+                    display_char.to_string()
+                } else {
+                    escaped.into()
+                };
+                let cell_class = if glyph_width == 2 {
+                    "cell wide"
+                } else {
+                    "cell"
+                };
+                let font_weight = if style.attribs.bold.is_some() {
+                    "bold"
+                } else {
+                    "normal"
+                };
+                let font_style = if style.attribs.italic.is_some() {
+                    "italic"
+                } else {
+                    "normal"
+                };
+                html.push_str(&format!("<span class=\"{cell_class}\" style=\"color:{fg};background:{bg};font-weight:{font_weight};font-style:{font_style}\">{ch}</span>"));
+            }
+            html.push_str("</div>");
+        }
+        html.push_str("</div></section>");
     }
 
     #[test]
@@ -2083,7 +2911,7 @@ mod tests {
             ),
         ];
         let mut html = String::from(
-            "<!doctype html><meta charset=\"utf-8\"><title>chkdsk · Tokyo Night Moon</title><style>body{margin:24px;background:#222436;color:#C8D3F5;font:14px system-ui,sans-serif}h1{font-size:18px;font-weight:600;margin:0 0 20px}section{margin:0 0 30px}.case{color:#828BB8;margin:8px 0 5px}.viewport{overflow:auto;display:inline-block;background:#222436;padding:2px}.row{display:grid;grid-auto-rows:16px}.cell{display:block;width:8px;height:16px;padding:0;margin:0;overflow:hidden;font-family:\"Cascadia Mono\",\"Cascadia Code\",Consolas,monospace;font-size:13px;line-height:16px;letter-spacing:0;font-kerning:none;white-space:pre}.cell.wide{grid-column:span 2;width:16px}</style><h1>chkdsk · Tokyo Night Moon · renderização exata de células</h1>",
+            "<!doctype html><meta charset=\"utf-8\"><title>chkdsk · Tokyo Night Moon</title><style>body{margin:24px;background:#222436;color:#C8D3F5;font:14px system-ui,sans-serif}h1{font-size:18px;font-weight:600;margin:0 0 20px}section{margin:0 0 30px}.case{color:#828BB8;margin:8px 0 5px}.viewport{overflow:auto;display:inline-block;background:#222436;padding:2px}.row{display:grid;grid-auto-rows:16px}.cell{display:block;width:8px;height:16px;padding:0;margin:0;overflow:hidden;font-family:\"Cascadia Mono\",\"Cascadia Code\",Consolas,monospace;font-size:13px;line-height:16px;letter-spacing:0;font-kerning:none;white-space:pre}.cell.wide{grid-column:span 2;width:16px}</style><h1>chkdsk · Tokyo Night Moon · renderização exata de células com peso/estilo</h1>",
         );
         let output_dir = std::env::var_os("CHKDSK_UI_PROOF_DIR").map(PathBuf::from);
         for (fixture_name, kind, model, bus, telemetry) in fixtures {
@@ -2205,12 +3033,95 @@ mod tests {
                         } else {
                             "cell"
                         };
-                        html.push_str(&format!("<span class=\"{cell_class}\" style=\"color:{fg};background:{bg}\">{ch}</span>"));
+                        let font_weight = if style.attribs.bold.is_some() {
+                            "bold"
+                        } else {
+                            "normal"
+                        };
+                        let font_style = if style.attribs.italic.is_some() {
+                            "italic"
+                        } else {
+                            "normal"
+                        };
+                        html.push_str(&format!("<span class=\"{cell_class}\" style=\"color:{fg};background:{bg};font-weight:{font_weight};font-style:{font_style}\">{ch}</span>"));
                     }
                     html.push_str("</div>");
                 }
                 html.push_str("</div></section>");
             }
+        }
+        // Synthetic interaction fixtures supplement the disk-only viewport
+        // cases with a real rendered toast and both full/compact center views.
+        let mut nvme_telemetry = Telemetry::default();
+        nvme_telemetry.apply_nvme(crate::model::NvmeHealth {
+            percentage_used: Some(4),
+            ..Default::default()
+        });
+        let mut nvme_identity = identity("fixture-xpg", 0);
+        nvme_identity.model = Some("XPG GAMMIX S41".into());
+        nvme_identity.bus = Some("NVMe".into());
+        nvme_identity.kind = DiskKind::Nvme;
+        let hdd_telemetry = Telemetry {
+            ata: QueryState::Success(crate::model::AtaHealth {
+                attributes: vec![crate::model::AtaAttribute {
+                    id: 197,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    threshold: None,
+                    raw: [1, 0, 0, 0, 0, 0],
+                }],
+                thresholds_available: false,
+            }),
+            ata_profile: Some(crate::ata::WD10EZEX_PROFILE.to_owned()),
+            ..Default::default()
+        };
+        let mut hdd_identity = identity("fixture-wdc", 1);
+        hdd_identity.model = Some("WDC WD10EZEX-00WN4A0".into());
+        hdd_identity.bus = Some("SATA".into());
+        hdd_identity.kind = DiskKind::Hdd;
+        let (_, hdd_details, hdd_severity) = health_notification_snapshot(
+            &score_health(DiskKind::Hdd, &hdd_telemetry),
+            &hdd_telemetry,
+        );
+        let mut notification_state = Dashboard {
+            disks: vec![
+                DiskView {
+                    identity: nvme_identity,
+                    telemetry: Some(nvme_telemetry),
+                    querying: false,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                },
+                DiskView {
+                    identity: hdd_identity,
+                    telemetry: Some(hdd_telemetry),
+                    querying: false,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                },
+            ],
+            generation: 1,
+            ..Default::default()
+        };
+        push_notification(
+            &mut notification_state,
+            Some("fixture-wdc".into()),
+            "Atenção à saúde · Disco #1".into(),
+            hdd_details,
+            hdd_severity,
+            Instant::now(),
+        );
+        for (label, open, width, height) in [
+            ("fixture sintético · toast", false, 100, 28),
+            ("fixture sintético · central", true, 100, 28),
+            ("fixture sintético · central compacta", true, 30, 10),
+        ] {
+            notification_state.notifications_open = open;
+            let buffer = fixture_buffer(notification_state.clone(), width, height);
+            append_fixture_cells(&mut html, label, width, height, &buffer);
         }
         if let Some(output_dir) = output_dir {
             std::fs::create_dir_all(&output_dir).unwrap();
@@ -2250,11 +3161,14 @@ mod tests {
                 r3bl_tui::RowHeight::new(height),
             ));
             let rendered = rendered_text(&mut app, &mut global);
-            let layout = Layout::new(width, height, global.state.disks.len(), global.state.scroll);
+            let layout = Layout::for_state(width, height, &global.state);
             assert_eq!(global.state.selected, 8);
             if width == 100 {
-                assert_eq!(global.state.scroll, 4);
-                assert_eq!(layout.tab_indices, vec![4, 5, 6, 7, 8]);
+                assert_eq!(
+                    global.state.scroll,
+                    8usize.saturating_sub(layout.tab_indices.len().saturating_sub(1))
+                );
+                assert_eq!(layout.tab_indices.last(), Some(&8));
             }
             assert!(
                 layout.tab_indices.contains(&8),
@@ -2292,18 +3206,32 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let visible = Layout::new(100, 28, state.disks.len(), state.scroll);
-        assert_eq!(visible.tab_indices, vec![0, 1, 2, 3, 4]);
-        assert_eq!(visible.tab_at(20, 4), Some(1));
-        assert_eq!(visible.tab_at(37, 4), Some(1));
-        assert_eq!(visible.tab_at(38, 4), None);
-        assert_eq!(visible.tab_at(39, 4), Some(2));
-        state.selected = 5;
+        let visible = Layout::for_state(100, 28, &state);
+        assert_eq!(
+            visible.tab_indices,
+            (0..visible.tabs.len()).collect::<Vec<_>>()
+        );
+        let second_tab = visible.tabs[1];
+        let second_y = second_tab.y + second_tab.height / 2;
+        assert_eq!(visible.tab_at(second_tab.x, second_y), Some(1));
+        assert_eq!(
+            visible.tab_at(second_tab.x + second_tab.width - 1, second_y),
+            Some(1)
+        );
+        assert_eq!(
+            visible.tab_at(second_tab.x + second_tab.width, second_y),
+            None
+        );
+        state.selected = 8;
         ensure_selected_visible(&mut state, 100, 28);
-        let shifted = Layout::new(100, 28, state.disks.len(), state.scroll);
-        assert_eq!(shifted.tab_indices, vec![1, 2, 3, 4, 5]);
-        assert_eq!(shifted.tab_at(1, 4), Some(1));
-        assert_eq!(shifted.tab_at(1 + 4 * 19, 4), Some(5));
+        let shifted = Layout::for_state(100, 28, &state);
+        assert_eq!(shifted.tab_indices.last(), Some(&8));
+        assert_eq!(shifted.tab_indices.len(), visible.tab_indices.len());
+        let first_shifted = shifted.tabs[0];
+        assert_eq!(
+            shifted.tab_at(first_shifted.x, first_shifted.y),
+            shifted.tab_indices.first().copied()
+        );
 
         let mut app = DashboardApp {
             started: true,
@@ -2317,15 +3245,19 @@ mod tests {
             100,
             28,
         );
+        let hover_layout = Layout::for_state(100, 28, &global.state);
+        let hover_area = hover_layout.tabs[1];
+        let hover_x = hover_area.x + hover_area.width / 2;
+        let hover_y = hover_area.y + hover_area.height / 2;
         assert!(matches!(
             dispatch_input(
                 &mut app,
                 &mut global,
-                mouse_event(MouseInputKind::MouseMove, 20, 4)
+                mouse_event(MouseInputKind::MouseMove, hover_x, hover_y)
             ),
             EventPropagation::ConsumedRender
         ));
-        assert_eq!(global.state.hovered_tab, Some(1));
+        assert_eq!(global.state.hovered_tab, Some(hover_layout.tab_indices[1]));
         let pipeline = app
             .app_render(
                 &mut global,
@@ -2342,7 +3274,7 @@ mod tests {
             &mut r3bl_tui::MemoizedLenMap::default(),
         );
         assert!(
-            matches!(buffer[4][24], r3bl_tui::PixelChar::PlainText { style, .. } if style.color_bg == Some(TuiColor::Rgb(TOKYO_BG_HIGHLIGHT)))
+            matches!(buffer[hover_y][hover_x], r3bl_tui::PixelChar::PlainText { style, .. } if style.color_bg == Some(TuiColor::Rgb(TOKYO_BG_HIGHLIGHT)))
         );
     }
 
@@ -2600,7 +3532,7 @@ mod tests {
         };
         assert_eq!(
             health_presentation(&warning_at_70),
-            ("ATENÇÃO · VER AVISOS", TOKYO_YELLOW)
+            ("ATENÇÃO · SINAIS SMART", TOKYO_YELLOW)
         );
         let failed = crate::health::HealthScore {
             score: 20,
@@ -2723,6 +3655,41 @@ mod tests {
             health_detail_messages(&critical, &overall_failure)
                 .contains(&("Falha geral reportada pelo dispositivo".into(), TOKYO_RED))
         );
+    }
+
+    #[test]
+    fn hdd_counter_warning_variants_have_clear_brazilian_portuguese_details() {
+        let health = crate::health::HealthScore {
+            score: 60,
+            outcome: HealthOutcome::Pass,
+            confidence: 0.8,
+            provenance: vec![],
+            warnings: vec![
+                HealthWarningReason::AtaReallocatedSectors,
+                HealthWarningReason::AtaSpinRetries,
+                HealthWarningReason::AtaReportedUncorrectable,
+                HealthWarningReason::AtaPendingSectors,
+                HealthWarningReason::AtaOfflineUncorrectable,
+            ],
+        };
+        let details = health_detail_messages(&health, &Telemetry::default());
+        let messages = details
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "Setores realocados registrados na mídia",
+            "Tentativas repetidas de giro registradas",
+            "Erros incorrigíveis reportados pelo dispositivo",
+            "Setores pendentes aguardando remapeamento",
+            "Setores incorrigíveis encontrados em verificações offline",
+        ] {
+            assert!(
+                messages.contains(&expected),
+                "missing {expected:?}: {messages:?}"
+            );
+        }
+        assert!(details.iter().all(|(_, color)| *color == TOKYO_YELLOW));
     }
 
     #[test]
@@ -2893,7 +3860,9 @@ mod tests {
                 .iter()
                 .copied()
                 .chain(layout.controls.iter().map(|control| control.area))
+                .chain(std::iter::once(layout.notification_button))
                 .chain(std::iter::once(layout.quit))
+                .chain(std::iter::once(layout.toast))
                 .filter(|area| area.visible())
                 .collect::<Vec<_>>();
             for (index, area) in areas.iter().enumerate() {
@@ -2929,7 +3898,7 @@ mod tests {
         let layout = Layout::new(30, 10, 2, 0);
         assert!(layout.controls.is_empty());
         assert_eq!(layout.quit.height, 1);
-        assert_eq!(layout.tabs.len(), 1);
+        assert_eq!(layout.tabs.len(), 2);
         assert_eq!(layout.tabs[0].height, 1);
         assert_eq!(body_view_height(&layout, 10), 8);
         let shorter = Layout::new(80, 14, 2, 0);
@@ -2953,9 +3922,12 @@ mod tests {
             );
 
             let mut buttons = vec![(layout.quit, "Sair".to_owned())];
+            if layout.notification_button.visible() && width >= 36 {
+                buttons.push((layout.notification_button, "Avisos 0".to_owned()));
+            }
             buttons.extend(layout.tabs.iter().enumerate().map(|(position, area)| {
                 let index = layout.tab_indices[position];
-                let marker = if index == 0 { "> " } else { "" };
+                let marker = if index == 0 { "> " } else { "  " };
                 (*area, format!("{marker}Disco #{index}"))
             }));
             buttons.extend(
@@ -2989,6 +3961,510 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn temporary_notices_expire_but_remain_available_to_keyboard_and_mouse() {
+        let mut notice_identity = identity("notice-disk", 0);
+        notice_identity.kind = DiskKind::Nvme;
+        let mut notice_telemetry = Telemetry::default();
+        notice_telemetry.apply_nvme(crate::model::NvmeHealth {
+            percentage_used: Some(12),
+            ..Default::default()
+        });
+        let mut state = Dashboard {
+            disks: vec![DiskView {
+                identity: notice_identity,
+                telemetry: Some(notice_telemetry),
+                querying: false,
+                computing: false,
+                pending_telemetry: None,
+                error_message: None,
+            }],
+            generation: 7,
+            ..Default::default()
+        };
+        push_notification(
+            &mut state,
+            Some("notice-disk".into()),
+            "Atenção à saúde · Disco #0".into(),
+            (0..20)
+                .map(|index| format!("Detalhe SMART {index}"))
+                .collect(),
+            NotificationSeverity::Warning,
+            Instant::now(),
+        );
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(state, 100, 17);
+
+        // The active toast is a full-row mouse target and opens the center.
+        let layout = Layout::for_state(100, 17, &global.state);
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(
+                MouseInputKind::MouseDown(Button::Left),
+                layout.toast.x,
+                layout.toast.y,
+            ),
+        );
+        assert!(global.state.notifications_open);
+        let center = rendered_text(&mut app, &mut global);
+        assert!(center.contains("CENTRAL DE NOTIFICAÇÕES"), "{center}");
+        assert!(center.contains("Fechar"), "{center}");
+        assert!(center.contains("↑ Avisos"), "{center}");
+        assert!(center.contains("↓ Avisos"), "{center}");
+        assert!(!center.contains("↑ Detalhes"), "{center}");
+        assert!(center.contains("Detalhe SMART 0"), "{center}");
+
+        // Mouse scrolling and keyboard scrolling operate on the same history.
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(MouseInputKind::ScrollDown, 50, layout.body_y + 3),
+        );
+        assert_eq!(global.state.notification_scroll, 1);
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::SpecialKey(SpecialKey::PageDown),
+            }),
+        );
+        let _ = rendered_text(&mut app, &mut global);
+        assert!(global.state.notification_scroll > 1);
+        let center_layout = Layout::for_state(100, 17, &global.state);
+        let scroll_button = center_layout
+            .controls
+            .iter()
+            .find(|control| control.action == FooterAction::ScrollDown)
+            .unwrap();
+        assert_eq!(scroll_button.label, "↓ Avisos");
+        let scroll_before_button = global.state.notification_scroll;
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(
+                MouseInputKind::MouseDown(Button::Left),
+                scroll_button.area.x + scroll_button.area.width / 2,
+                scroll_button.area.y + scroll_button.area.height / 2,
+            ),
+        );
+        assert_eq!(global.state.notification_scroll, scroll_before_button + 1);
+
+        // A body click is consumed by the open center and cannot scroll the
+        // dashboard content hidden underneath it.
+        global.state.content_scroll = 2;
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(
+                MouseInputKind::MouseDown(Button::Left),
+                50,
+                layout.body_y + 4,
+            ),
+        );
+        assert_eq!(global.state.content_scroll, 2);
+
+        // The header's full notification hitbox closes it, and Escape is
+        // intercepted here rather than by the global terminal exit keys.
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(
+                MouseInputKind::MouseDown(Button::Left),
+                layout.notification_button.x,
+                layout.notification_button.y,
+            ),
+        );
+        assert!(!global.state.notifications_open);
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::Character('n'),
+            }),
+        );
+        assert!(global.state.notifications_open);
+        assert!(matches!(
+            dispatch_input(
+                &mut app,
+                &mut global,
+                InputEvent::Keyboard(KeyPress::Plain {
+                    key: Key::SpecialKey(SpecialKey::Esc),
+                }),
+            ),
+            EventPropagation::ConsumedRender
+        ));
+        assert!(!global.state.notifications_open);
+
+        // Auto-hide clears only the toast. The current-generation history is
+        // still searchable and the next frame repaints the cleared toast row.
+        global.state.toast_was_active = true;
+        global.state.notifications[0].expires_at = Instant::now() - Duration::from_millis(1);
+        assert!(active_notification(&global.state, Instant::now()).is_none());
+        assert!(
+            notification_center_lines(&global.state, 98)
+                .iter()
+                .any(|line| line.text.contains("Atenção à saúde"))
+        );
+        assert!(matches!(
+            dispatch_signal(&mut app, &mut global, AppSignal::Frame),
+            EventPropagation::ConsumedRender
+        ));
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(
+                MouseInputKind::MouseDown(Button::Left),
+                layout.notification_button.x,
+                layout.notification_button.y,
+            ),
+        );
+        assert!(global.state.notifications_open);
+        assert!(rendered_text(&mut app, &mut global).contains("Detalhe SMART 0"));
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(
+                MouseInputKind::MouseDown(Button::Left),
+                layout.notification_button.x,
+                layout.notification_button.y,
+            ),
+        );
+        assert!(!global.state.notifications_open);
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::Character('n'),
+            }),
+        );
+        assert!(rendered_text(&mut app, &mut global).contains("Detalhe SMART 0"));
+    }
+
+    #[test]
+    fn compact_notification_center_wraps_long_warnings_and_mouse_can_read_to_the_end() {
+        let mut state = Dashboard {
+            generation: 2,
+            ..Default::default()
+        };
+        push_notification(
+            &mut state,
+            None,
+            "Atenção à saúde".into(),
+            vec![
+                "Setores pendentes aguardando remapeamento".into(),
+                "A lista de avisos permanece nesta geração".into(),
+                "Último aviso completo".into(),
+            ],
+            NotificationSeverity::Warning,
+            Instant::now(),
+        );
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(state, 30, 10);
+        let layout = Layout::for_state(30, 10, &global.state);
+        assert_eq!(layout.notification_button.width, 1);
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(
+                MouseInputKind::MouseDown(Button::Left),
+                layout.notification_button.x,
+                layout.notification_button.y,
+            ),
+        );
+        assert!(global.state.notifications_open);
+        let first_page = rendered_text(&mut app, &mut global);
+        let first_page_words = first_page.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(first_page.contains("roda/↑/↓"), "{first_page}");
+        assert!(
+            first_page_words.contains("Setores pendentes aguardando remapeamento"),
+            "a frase deve ser refluída sem truncamento: {first_page}"
+        );
+        for _ in 0..8 {
+            dispatch_input(
+                &mut app,
+                &mut global,
+                mouse_event(MouseInputKind::ScrollDown, 10, layout.body_y + 2),
+            );
+        }
+        let last_page = rendered_text(&mut app, &mut global);
+        assert!(last_page.contains("Último aviso completo"), "{last_page}");
+        dispatch_input(
+            &mut app,
+            &mut global,
+            mouse_event(
+                MouseInputKind::MouseDown(Button::Left),
+                layout.notification_button.x,
+                layout.notification_button.y,
+            ),
+        );
+        assert!(!global.state.notifications_open);
+    }
+
+    #[test]
+    fn hardware_generation_resets_notices_preserves_selection_and_rejects_late_results() {
+        let keep = identity("stable-drive-id", 0);
+        let remove = identity("removed-drive-id", 1);
+        let mut state = Dashboard {
+            disks: [keep.clone(), remove.clone()]
+                .into_iter()
+                .map(|identity| DiskView {
+                    identity,
+                    telemetry: None,
+                    querying: false,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                })
+                .collect(),
+            selected: 0,
+            generation: 5,
+            inventory_initialized: true,
+            notifications_open: true,
+            ..Default::default()
+        };
+        push_notification(
+            &mut state,
+            Some(keep.id.clone()),
+            "Aviso antigo".into(),
+            vec!["Resultado da geração anterior".into()],
+            NotificationSeverity::Critical,
+            Instant::now(),
+        );
+        state.notifications_open = true;
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(state, 100, 28);
+        let added = identity("new-drive-id", 2);
+        assert!(matches!(
+            dispatch_signal(
+                &mut app,
+                &mut global,
+                AppSignal::Discovered {
+                    generation: 6,
+                    result: Ok(vec![keep.clone(), added.clone()]),
+                },
+            ),
+            EventPropagation::ConsumedRender
+        ));
+        assert_eq!(global.state.selected, 0);
+        assert_eq!(
+            global.state.disks[global.state.selected].identity.id,
+            keep.id
+        );
+        assert!(!global.state.notifications_open);
+        assert!(
+            global
+                .state
+                .notifications
+                .iter()
+                .all(|notice| notice.title != "Aviso antigo")
+        );
+        assert_eq!(global.state.notifications.len(), 1);
+        assert_eq!(global.state.notifications[0].generation, 6);
+        assert!(
+            global.state.notifications[0]
+                .details
+                .iter()
+                .any(|text| text.contains("Conectado"))
+        );
+        assert!(
+            global.state.notifications[0]
+                .details
+                .iter()
+                .any(|text| text.contains("Removido"))
+        );
+
+        // Both an old query completion and delayed compute are ignored.
+        global.state.disks[0].computing = true;
+        global.state.disks[0].pending_telemetry = Some(Telemetry::default());
+        dispatch_signal(
+            &mut app,
+            &mut global,
+            AppSignal::QueryFinished {
+                generation: 5,
+                disk_id: keep.id.clone(),
+                result: Err(QueryErrorState::Transient),
+            },
+        );
+        dispatch_signal(
+            &mut app,
+            &mut global,
+            AppSignal::ComputeFinished {
+                generation: 5,
+                disk_id: keep.id.clone(),
+            },
+        );
+        assert!(global.state.disks[0].computing);
+        assert_eq!(global.state.notifications.len(), 1);
+
+        // A current-generation result can notify again immediately.
+        let warning_telemetry = Telemetry {
+            nvme: QueryState::Success(crate::model::NvmeHealth {
+                critical_warning: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        global.state.disks[0].pending_telemetry = Some(warning_telemetry);
+        dispatch_signal(
+            &mut app,
+            &mut global,
+            AppSignal::ComputeFinished {
+                generation: 6,
+                disk_id: keep.id.clone(),
+            },
+        );
+        assert_eq!(global.state.notifications.len(), 2);
+        assert!(global.state.notifications[1].generation == 6);
+        assert_eq!(
+            global.state.notifications[1].severity,
+            NotificationSeverity::Critical
+        );
+        assert!(active_notification(&global.state, Instant::now()).is_some());
+
+        global.state.notifications[1].expires_at = Instant::now() - Duration::from_millis(1);
+        global.state.toast_was_active = true;
+        let _ = dispatch_signal(&mut app, &mut global, AppSignal::Frame);
+        let main_view = rendered_text(&mut app, &mut global);
+        assert!(main_view.contains("FALHA DETECTADA"), "{main_view}");
+        assert!(
+            !main_view.contains("Reserva NVMe em nível crítico"),
+            "detalhe deve ficar fora do resumo: {main_view}"
+        );
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::Character('n'),
+            }),
+        );
+        let center_view = rendered_text(&mut app, &mut global);
+        assert!(
+            center_view.contains("Reserva NVMe em nível crítico"),
+            "aviso detalhado acessível na central: {center_view}"
+        );
+
+        // Identical routine polls do not create duplicate toasts; a recovery
+        // clears the active issue key so a later recurrence can notify again.
+        global.state.disks[0].pending_telemetry = Some(Telemetry {
+            nvme: QueryState::Success(crate::model::NvmeHealth::default()),
+            ..Default::default()
+        });
+        dispatch_signal(
+            &mut app,
+            &mut global,
+            AppSignal::ComputeFinished {
+                generation: 6,
+                disk_id: keep.id.clone(),
+            },
+        );
+        assert_eq!(global.state.notifications.len(), 2);
+        global.state.disks[0].pending_telemetry = Some(Telemetry {
+            nvme: QueryState::Success(crate::model::NvmeHealth {
+                critical_warning: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        dispatch_signal(
+            &mut app,
+            &mut global,
+            AppSignal::ComputeFinished {
+                generation: 6,
+                disk_id: keep.id,
+            },
+        );
+        assert_eq!(global.state.notifications.len(), 3);
+    }
+
+    #[test]
+    fn failed_inventory_refresh_keeps_the_last_snapshot_and_reports_the_failure() {
+        let identities = vec![identity("drive-a", 0), identity("drive-b", 1)];
+        let state = Dashboard {
+            disks: identities
+                .iter()
+                .cloned()
+                .map(|identity| DiskView {
+                    identity,
+                    telemetry: None,
+                    querying: false,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                })
+                .collect(),
+            generation: 3,
+            inventory_initialized: true,
+            selected: 1,
+            ..Default::default()
+        };
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(state, 100, 28);
+        for _ in 0..2 {
+            dispatch_signal(
+                &mut app,
+                &mut global,
+                AppSignal::Discovered {
+                    generation: 3,
+                    result: Err("falha de enumeração".into()),
+                },
+            );
+        }
+        assert_eq!(global.state.disks.len(), 2);
+        assert_eq!(
+            global.state.disks[global.state.selected].identity.id,
+            "drive-b"
+        );
+        assert_eq!(
+            global.state.notice.as_deref(),
+            Some("Não foi possível localizar os discos")
+        );
+        assert_eq!(global.state.notifications.len(), 1);
+        assert_eq!(
+            global.state.notifications[0].severity,
+            NotificationSeverity::Warning
+        );
+        assert!(
+            global.state.notifications[0].details[0].contains("lista atual de discos foi mantida")
+        );
+
+        let mut empty_app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut empty = test_global_data(
+            Dashboard {
+                generation: 8,
+                inventory_initialized: true,
+                ..Default::default()
+            },
+            100,
+            28,
+        );
+        dispatch_signal(
+            &mut empty_app,
+            &mut empty,
+            AppSignal::Discovered {
+                generation: 8,
+                result: Err("falha de enumeração".into()),
+            },
+        );
+        let empty_render = rendered_text(&mut empty_app, &mut empty);
+        assert!(empty_render.contains("Não foi possível localizar os discos"));
     }
 
     #[test]
@@ -3040,7 +4516,7 @@ mod tests {
             0,
         );
         let unknown_screen = format!("{unknown_ops:?}");
-        assert!(unknown_screen.contains("INDISPONÍVEL"));
+        assert!(unknown_screen.contains("INDETERMINADA"));
         assert!(unknown_screen.contains("N/A"));
         assert!(!unknown_screen.contains("% saúde"));
         assert!(!unknown_screen.contains("0 / 100"));
@@ -3276,9 +4752,15 @@ mod tests {
             ),
         );
         assert_eq!(global.state.selected, 1);
-        assert_eq!(global.state.scroll, 1);
+        assert_eq!(global.state.scroll, 0);
 
-        let selected_tab = Layout::new(30, 6, 4, global.state.scroll).tabs[0];
+        let selected_layout = Layout::for_state(30, 6, &global.state);
+        let selected_position = selected_layout
+            .tab_indices
+            .iter()
+            .position(|index| *index == global.state.selected)
+            .unwrap();
+        let selected_tab = selected_layout.tabs[selected_position];
         dispatch_input(
             &mut app,
             &mut global,
@@ -3419,43 +4901,15 @@ mod tests {
                 .trim();
             assert!(last_visible_row.contains("LIGADO"), "{rendered}");
 
-            let telemetry = disk.telemetry.as_ref().unwrap();
-            let health = score_health(effective_disk_kind(&disk.identity, telemetry), telemetry);
-            let warning_position = health_detail_messages(&health, telemetry)
-                .iter()
-                .position(|(message, _)| message.contains("Backup da memória volátil"))
-                .expect("telemetria NVMe contém aviso de backup");
-            let score_rows = usize::from(body_height >= 9 && width >= 26) * 5;
-            let warning_line = 4 + score_rows + warning_position;
-            let warning_scroll = warning_line.saturating_sub(body_height - 1);
-            while global.state.content_scroll > warning_scroll {
-                dispatch_input(
-                    &mut app,
-                    &mut global,
-                    InputEvent::Keyboard(KeyPress::Plain {
-                        key: Key::SpecialKey(SpecialKey::Up),
-                    }),
-                );
-            }
-            while global.state.content_scroll < warning_scroll {
-                dispatch_input(
-                    &mut app,
-                    &mut global,
-                    InputEvent::Keyboard(KeyPress::Plain {
-                        key: Key::SpecialKey(SpecialKey::Down),
-                    }),
-                );
-            }
-            let warning_render = rendered_text(&mut app, &mut global);
             assert!(
-                warning_render.contains("Backup da memória volátil"),
-                "aviso fora da viewport em {width}x{height}"
+                !rendered.contains("Backup da memória volátil"),
+                "detalhes do aviso não devem poluir o painel: {rendered}"
             );
 
             if width == 80 {
                 let scroll_before_compacting = global.state.content_scroll;
                 let previous_first_visible_row =
-                    warning_render.lines().nth(layout.body_y).unwrap().trim();
+                    rendered.lines().nth(layout.body_y).unwrap().trim();
                 global.window_size = r3bl_tui::Size::new((
                     r3bl_tui::ColWidth::new(width),
                     r3bl_tui::RowHeight::new(9),
@@ -3814,7 +5268,7 @@ mod tests {
                 &mut r3bl_tui::MemoizedLenMap::default(),
             );
             if width == 100 {
-                let layout = Layout::new(width, height, state.disks.len(), state.scroll);
+                let layout = Layout::for_state(width, height, &state);
                 assert!(
                     matches!(
                         buffer[layout.tabs[0].y][layout.tabs[0].x],
@@ -3849,7 +5303,7 @@ mod tests {
             }
             if width == 100 {
                 assert!(cell_has_colors(&buffer[1][1], TOKYO_BLUE, TOKYO_BG_DARK));
-                let layout = Layout::new(width, height, state.disks.len(), state.scroll);
+                let layout = Layout::for_state(width, height, &state);
                 assert!(cell_has_colors(
                     &buffer[layout.tabs[0].y][layout.tabs[0].x],
                     TOKYO_FG,
@@ -3914,11 +5368,11 @@ mod tests {
                     rendered.contains("#4") && rendered.contains("#8") && rendered.contains("#12"),
                     "{rendered}"
                 );
-                assert!(rendered.contains("SAÚDE · SAUDÁVEL"));
+                assert!(rendered.contains("SAUDÁVEL · 88%"));
+                assert!(rendered.contains("88%"), "{rendered}");
                 assert!(
-                    ascii_score_lines("88%")
-                        .iter()
-                        .all(|score_row| rendered.contains(score_row.trim_end()))
+                    !rendered.contains("██"),
+                    "score compacto esperado: {rendered}"
                 );
             }
             if width == 30 {
@@ -3945,8 +5399,28 @@ mod tests {
             score_health(DiskKind::Unknown, &unknown).outcome,
             HealthOutcome::Unknown
         );
-        let digits = ascii_score_lines("N/A").join("\n");
-        assert!(!digits.contains("000"));
+        let mut unknown_app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut unknown_global = test_global_data(
+            Dashboard {
+                disks: vec![DiskView {
+                    identity: identity("unknown-score", 0),
+                    telemetry: Some(unknown),
+                    querying: false,
+                    computing: false,
+                    pending_telemetry: None,
+                    error_message: None,
+                }],
+                ..Default::default()
+            },
+            30,
+            10,
+        );
+        let unknown_render = rendered_text(&mut unknown_app, &mut unknown_global);
+        assert!(unknown_render.contains("N/A"), "{unknown_render}");
+        assert!(!unknown_render.contains("0%"), "{unknown_render}");
         let permission = Telemetry {
             nvme: QueryState::Failed {
                 message: "Access is denied (5)".into(),
@@ -3960,7 +5434,7 @@ mod tests {
     }
 
     #[test]
-    fn coarse_smart_pass_explains_low_confidence_in_full_and_compact_views() {
+    fn coarse_smart_pass_is_indeterminate_instead_of_fabricating_a_percentage() {
         let disk = DiskView {
             identity: DiskIdentity {
                 kind: DiskKind::Hdd,
@@ -3983,36 +5457,15 @@ mod tests {
             started: true,
             ..Default::default()
         };
-        for (width, height, health_label, confidence_note) in [
-            (
-                100,
-                28,
-                "SAÚDE · LEITURA SMART BÁSICA",
-                "SMART básico: escore de baixa confiança; sem mapeamento detalhado",
-            ),
-            (
-                70,
-                20,
-                "SAÚDE · LEITURA SMART BÁSICA",
-                "SMART básico: escore de baixa confiança; sem mapeamento detalhado",
-            ),
-            (
-                30,
-                10,
-                "SAÚDE · SMART BÁSICO · 100%",
-                "SMART básico: baixa confiança",
-            ),
-        ] {
+        for (width, height) in [(100, 28), (70, 20), (30, 10)] {
             let mut global = test_global_data(state.clone(), width, height);
             let rendered = rendered_text(&mut app, &mut global);
             assert!(
-                rendered.contains(health_label),
+                rendered.contains("SAÚDE INDETERMINADA"),
                 "{width}x{height}: {rendered}"
             );
-            assert!(
-                rendered.contains(confidence_note),
-                "{width}x{height}: {rendered}"
-            );
+            assert!(rendered.contains("N/A"), "{width}x{height}: {rendered}");
+            assert!(!rendered.contains("100%"), "{width}x{height}: {rendered}");
             assert!(
                 rendered.contains("ETA não aplicável"),
                 "{width}x{height}: {rendered}"
@@ -4022,6 +5475,110 @@ mod tests {
                 "{width}x{height}: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn ambiguous_hdd_raw_is_n_a_with_reason_available_in_notification_center() {
+        let mut telemetry = Telemetry {
+            overall_failure: QueryState::Success(false),
+            ata: QueryState::Success(crate::model::AtaHealth {
+                attributes: vec![
+                    crate::model::AtaAttribute {
+                        id: 5,
+                        flags: 0,
+                        current: 100,
+                        worst: 100,
+                        threshold: None,
+                        raw: [1, 0, 0, 0, 1, 0],
+                    },
+                    crate::model::AtaAttribute {
+                        id: 197,
+                        flags: 0,
+                        current: 100,
+                        worst: 100,
+                        threshold: None,
+                        raw: [1, 0, 0, 0, 0, 0],
+                    },
+                ],
+                thresholds_available: false,
+            }),
+            ..Default::default()
+        };
+        telemetry.ata_profile = Some(crate::ata::WD10EZEX_PROFILE.to_owned());
+        let mut disk_identity = identity("ambiguous-hdd", 0);
+        disk_identity.kind = DiskKind::Hdd;
+        disk_identity.model = Some("WDC WD10EZEX-00WN4A0".into());
+        let health = score_health(DiskKind::Hdd, &telemetry);
+        assert_eq!(health.outcome, HealthOutcome::Unknown);
+        assert_eq!(health.score, 0);
+        assert!(
+            health
+                .warnings
+                .contains(&HealthWarningReason::AtaPendingSectors)
+        );
+        assert!(
+            health
+                .warnings
+                .contains(&HealthWarningReason::AtaRawEncodingAmbiguous)
+        );
+        let (_, details, severity) = health_notification_snapshot(&health, &telemetry);
+        assert_eq!(severity, NotificationSeverity::Warning);
+        assert!(
+            details
+                .iter()
+                .any(|text| text.contains("pendentes aguardando"))
+        );
+        assert!(
+            details
+                .iter()
+                .any(|text| text.contains("Codificação bruta SMART ambígua"))
+        );
+
+        let mut state = Dashboard {
+            disks: vec![DiskView {
+                identity: disk_identity,
+                telemetry: Some(telemetry),
+                querying: false,
+                computing: false,
+                pending_telemetry: None,
+                error_message: None,
+            }],
+            ..Default::default()
+        };
+        push_notification(
+            &mut state,
+            Some("ambiguous-hdd".into()),
+            "Atenção à saúde · Disco #0".into(),
+            details,
+            severity,
+            Instant::now(),
+        );
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(state, 100, 28);
+        let main_view = rendered_text(&mut app, &mut global);
+        assert!(main_view.contains("SAÚDE INDETERMINADA"), "{main_view}");
+        assert!(main_view.contains("N/A"), "{main_view}");
+        assert!(!main_view.contains("0%"), "{main_view}");
+        assert!(!main_view.contains("pendentes aguardando"), "{main_view}");
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::Character('n'),
+            }),
+        );
+        let details_view = rendered_text(&mut app, &mut global);
+        assert!(
+            details_view.contains("pendentes aguardando"),
+            "{details_view}"
+        );
+        assert!(
+            details_view.contains("Codificação bruta SMART ambígua"),
+            "{details_view}"
+        );
     }
 
     #[test]

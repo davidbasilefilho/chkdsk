@@ -588,29 +588,53 @@ mod windows {
         current_task_file: [u8; 8],
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     enum AtaCommandError {
         Io(u32),
         ShortResponse,
-        Device { status: u8, error: u8 },
+        Device {
+            status: u8,
+            error: u8,
+        },
+        InvalidSmartData(String),
+        FallbackFailed {
+            primary: Box<AtaCommandError>,
+            legacy: Box<AtaCommandError>,
+        },
     }
 
     impl AtaCommandError {
-        fn code(self) -> u32 {
+        fn code(&self) -> u32 {
             match self {
-                Self::Io(code) => code,
+                Self::Io(code) => *code,
                 Self::ShortResponse => 13,
                 Self::Device { .. } => 31,
+                Self::InvalidSmartData(_) => 13,
+                Self::FallbackFailed { primary, legacy } => {
+                    if classify(primary.code()) == QueryErrorState::Permission {
+                        primary.code()
+                    } else {
+                        legacy.code()
+                    }
+                }
             }
         }
 
-        fn message(self) -> String {
+        fn message(&self) -> String {
             match self {
-                Self::Io(code) => io::Error::from_raw_os_error(code as i32).to_string(),
+                Self::Io(code) => io::Error::from_raw_os_error(*code as i32).to_string(),
                 Self::ShortResponse => "ATA pass-through returned an incomplete response".into(),
                 Self::Device { status, error } => {
                     format!("ATA command failed (status 0x{status:02x}, error 0x{error:02x})")
                 }
+                Self::InvalidSmartData(reason) => {
+                    format!("ATA SMART READ DATA was malformed: {reason}")
+                }
+                Self::FallbackFailed { primary, legacy } => format!(
+                    "ATA pass-through failed: {}; SMART_RCV_DRIVE_DATA fallback failed: {}",
+                    primary.message(),
+                    legacy.message()
+                ),
             }
         }
     }
@@ -815,19 +839,65 @@ mod windows {
         pass_through: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
         legacy: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
     ) -> Result<Vec<u8>, AtaCommandError> {
-        pass_through().or_else(|pass_error| legacy().map_err(|_| pass_error))
+        match pass_through() {
+            Ok(sector) => Ok(sector),
+            Err(primary) => match legacy() {
+                Ok(sector) => Ok(sector),
+                Err(legacy) => Err(AtaCommandError::FallbackFailed {
+                    primary: Box::new(primary),
+                    legacy: Box::new(legacy),
+                }),
+            },
+        }
+    }
+
+    fn ata_data_sector_validated(
+        pass_through: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
+        legacy: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
+        validate: impl Fn(&[u8]) -> Result<(), AtaCommandError>,
+    ) -> Result<Vec<u8>, AtaCommandError> {
+        let primary_error = match pass_through() {
+            Ok(sector) => match validate(&sector) {
+                Ok(()) => return Ok(sector),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        let legacy_error = match legacy() {
+            Ok(sector) => match validate(&sector) {
+                Ok(()) => return Ok(sector),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        Err(AtaCommandError::FallbackFailed {
+            primary: Box::new(primary_error),
+            legacy: Box::new(legacy_error),
+        })
+    }
+
+    fn validate_ata_smart_data_sector(sector: &[u8]) -> Result<(), AtaCommandError> {
+        let health = parse::parse_ata_smart_data(sector)
+            .map_err(|error| AtaCommandError::InvalidSmartData(error.to_string()))?;
+        if health.attributes.is_empty() {
+            return Err(AtaCommandError::InvalidSmartData(
+                "valid sector contains no SMART attributes".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn ata_health(device: &Device) -> Result<crate::model::AtaHealth, AtaCommandError> {
-        let sector = ata_data_sector(
+        let sector = ata_data_sector_validated(
             || {
                 ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_DATA, true)
                     .map(|(sector, _)| sector)
             },
             || legacy_smart_sector(device, ATA_SMART_READ_DATA),
+            validate_ata_smart_data_sector,
         )?;
-        let mut health =
-            parse::parse_ata_smart_data(&sector).map_err(|_| AtaCommandError::ShortResponse)?;
+        let mut health = parse::parse_ata_smart_data(&sector)
+            .map_err(|error| AtaCommandError::InvalidSmartData(error.to_string()))?;
 
         if let Ok(thresholds) = ata_data_sector(
             || {
@@ -1013,13 +1083,68 @@ mod windows {
             let fallback = ata_data_sector(|| Err(AtaCommandError::Io(5)), || Ok(vec![2])).unwrap();
             assert_eq!(fallback, [2]);
 
-            assert_eq!(
-                ata_data_sector(
-                    || Err(AtaCommandError::Io(5)),
-                    || Err(AtaCommandError::Io(1)),
-                ),
-                Err(AtaCommandError::Io(5))
+            let error = ata_data_sector(
+                || Err(AtaCommandError::Io(5)),
+                || Err(AtaCommandError::Io(1)),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), 5, "preserve permission precedence");
+            let message = error.message();
+            assert!(message.contains("pass-through failed"));
+            assert!(message.contains("SMART_RCV_DRIVE_DATA fallback failed"));
+            assert!(message.contains(&io::Error::from_raw_os_error(5).to_string()));
+            assert!(message.contains(&io::Error::from_raw_os_error(1).to_string()));
+        }
+
+        fn finish_smart_checksum(sector: &mut [u8; 512]) {
+            sector[511] = 0;
+            sector[511] = 0u8.wrapping_sub(
+                sector[..511]
+                    .iter()
+                    .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
             );
+        }
+
+        fn valid_smart_data_sector() -> Vec<u8> {
+            let mut sector = [0u8; 512];
+            sector[2..7].copy_from_slice(&[197, 1, 0, 100, 100]);
+            finish_smart_checksum(&mut sector);
+            sector.to_vec()
+        }
+
+        #[test]
+        fn malformed_pass_through_sector_retries_legacy_and_preserves_both_errors_if_needed() {
+            let valid = valid_smart_data_sector();
+            let mut bad_checksum = valid.clone();
+            bad_checksum[511] ^= 1;
+            let read = ata_data_sector_validated(
+                || Ok(bad_checksum),
+                || Ok(valid.clone()),
+                validate_ata_smart_data_sector,
+            )
+            .unwrap();
+            assert_eq!(read, valid);
+
+            let read = ata_data_sector_validated(
+                || Ok(vec![0; 512]), // Checksummed-but-empty is not mapped data.
+                || Ok(valid.clone()),
+                validate_ata_smart_data_sector,
+            )
+            .unwrap();
+            assert_eq!(read, valid);
+
+            let error = ata_data_sector_validated(
+                || Ok(vec![0; 511]),
+                || Ok(vec![0; 512]),
+                validate_ata_smart_data_sector,
+            )
+            .unwrap_err();
+            let message = error.message();
+            assert!(message.contains("pass-through failed"));
+            assert!(message.contains("SMART_RCV_DRIVE_DATA fallback failed"));
+            assert!(message.contains("expected 512-byte sector, got 511"));
+            assert!(message.contains("valid sector contains no SMART attributes"));
+            assert_eq!(error.code(), 13);
         }
 
         #[test]

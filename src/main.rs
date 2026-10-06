@@ -12,7 +12,7 @@ mod model;
 mod parse;
 mod ui;
 
-use r3bl_tui::{InputEvent, Key, KeyPress, SpecialKey, TerminalWindow};
+use r3bl_tui::{InputEvent, Key, KeyPress, TerminalWindow};
 use std::process::ExitCode;
 
 #[tokio::main]
@@ -42,14 +42,9 @@ async fn main() -> ExitCode {
 
     let _console_modes = elevation::enable_virtual_terminal_processing();
 
-    let exit_keys = [
-        InputEvent::Keyboard(KeyPress::Plain {
-            key: Key::Character('q'),
-        }),
-        InputEvent::Keyboard(KeyPress::Plain {
-            key: Key::SpecialKey(SpecialKey::Esc),
-        }),
-    ];
+    let exit_keys = [InputEvent::Keyboard(KeyPress::Plain {
+        key: Key::Character('q'),
+    })];
     let app = ui::DashboardApp::new_boxed();
     let result = match TerminalWindow::main_event_loop(app, &exit_keys, ui::Dashboard::default()) {
         Ok(future) => future.await,

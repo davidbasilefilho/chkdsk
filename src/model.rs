@@ -33,6 +33,12 @@ pub enum DiskKind {
 pub enum HealthWarningReason {
     AtaThresholdMargin,
     AtaThresholdReached,
+    AtaReallocatedSectors,
+    AtaSpinRetries,
+    AtaReportedUncorrectable,
+    AtaPendingSectors,
+    AtaOfflineUncorrectable,
+    AtaRawEncodingAmbiguous,
     EnduranceExhausted,
     NvmeMediaErrors,
     NvmeTemperatureThreshold,
@@ -89,6 +95,8 @@ pub struct AtaAttribute {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AtaHealth {
+    /// Parsed SMART rows. Duplicate IDs remain present for diagnosis, but
+    /// scoring excludes the duplicated IDs as ambiguous evidence.
     pub attributes: Vec<AtaAttribute>,
     /// Whether a valid SMART READ THRESHOLDS sector was received.
     #[serde(default)]
@@ -102,7 +110,7 @@ pub struct Telemetry {
     /// Wear consumed, 0..=100. Only populate when the device/model mapping
     /// establishes the semantics; never infer it from an ATA attribute ID.
     pub endurance_percent: Option<f64>,
-    /// Manufacturer/model profile that authorized ATA lifetime semantics.
+    /// Manufacturer/model profile used to decode or interpret ATA attributes.
     #[serde(default)]
     pub ata_profile: Option<String>,
     pub power_on_hours: Option<u64>,
@@ -124,10 +132,19 @@ impl Telemetry {
         self.nvme = QueryState::Success(health);
     }
 
-    /// Apply ATA attributes and only profile-backed wear semantics.
+    /// Apply ATA attributes and profile-backed raw-value semantics.
     pub fn apply_ata(&mut self, health: AtaHealth, model: Option<&str>) {
         let profile = crate::ata::profile(model);
-        self.ata_profile = profile.map(|profile| profile.family.to_owned());
+        let hdd_profile = crate::ata::hdd_profile(model);
+        self.ata_profile = profile
+            .map(|profile| profile.family.to_owned())
+            .or_else(|| hdd_profile.map(|profile| profile.family.to_owned()));
+        self.power_on_hours = self
+            .power_on_hours
+            .or_else(|| crate::ata::hdd_power_on_hours(model, &health));
+        self.temperature_c = self
+            .temperature_c
+            .or_else(|| crate::ata::hdd_temperature_c(model, &health));
         let endurance = profile.and_then(|profile| {
             health
                 .attributes
@@ -188,6 +205,55 @@ mod tests {
             assert_eq!(unprofiled.endurance_percent, None, "{model}");
             assert_eq!(unprofiled.ata_profile, None, "{model}");
         }
+    }
+
+    #[test]
+    fn wd10ezex_profile_enables_hdd_signal_decoding_without_inventing_wear() {
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_ata(
+            AtaHealth {
+                attributes: vec![
+                    AtaAttribute {
+                        id: 9,
+                        flags: 0,
+                        current: 100,
+                        worst: 100,
+                        threshold: None,
+                        raw: [0x07, 0x1a, 0, 0, 0, 0],
+                    },
+                    AtaAttribute {
+                        id: 194,
+                        flags: 0,
+                        current: 100,
+                        worst: 100,
+                        threshold: None,
+                        raw: [40, 55, 63, 0, 0, 0],
+                    },
+                    AtaAttribute {
+                        id: 197,
+                        flags: 0,
+                        current: 100,
+                        worst: 100,
+                        threshold: None,
+                        raw: [0, 0, 1, 0, 0, 0],
+                    },
+                ],
+                thresholds_available: false,
+            },
+            Some("WDC WD10EZEX-00WN4A0"),
+        );
+        assert_eq!(
+            telemetry.ata_profile.as_deref(),
+            Some(crate::ata::WD10EZEX_PROFILE)
+        );
+        assert_eq!(telemetry.endurance_percent, None);
+        assert_eq!(telemetry.power_on_hours, Some(6663));
+        assert_eq!(telemetry.temperature_c, Some(40));
+        assert!(matches!(
+            telemetry.ata,
+            QueryState::Success(AtaHealth { ref attributes, .. })
+                if attributes[2].raw == [0, 0, 1, 0, 0, 0]
+        ));
     }
 
     #[test]

@@ -1,11 +1,10 @@
 //! Deterministic, conservative health scoring (higher is healthier).
 //!
-//! Endurance-used is scored as `100 - used` and never alone means failure.
-//! Device-declared failures and pre-failure ATA threshold trips determine
-//! Fail; low scores from wear or other noncritical signals remain Pass. ATA normalized values
-//! use only device-declared thresholds and small normalized-point margin caps,
-//! not a guessed vendor baseline or remaining-lifetime estimate.
-//! Confidence describes evidence, not statistical certainty.
+//! Version 1 is a deterministic health index, not a failure probability or
+//! remaining-lifetime estimate. It combines device-declared thresholds and
+//! documented, model-gated ATA/NVMe signals; correlated counters are heuristic
+//! evidence, not independent probabilities. Missing or blocked telemetry is
+//! Unknown, never an invented healthy 100%.
 
 use crate::model::{AtaHealth, DiskKind, HealthWarningReason, NvmeHealth, QueryState, Telemetry};
 use serde::{Deserialize, Serialize};
@@ -32,6 +31,7 @@ pub struct HealthScore {
 #[derive(Default)]
 struct Evidence {
     available: bool,
+    indeterminate: bool,
     critical_failure: bool,
 }
 
@@ -48,7 +48,7 @@ fn add_warning(warnings: &mut Vec<HealthWarningReason>, reason: HealthWarningRea
 /// Return the same result for the same disk kind and telemetry. The disk kind
 /// parameter is retained for the domain API; HDD score is still a snapshot,
 /// never a wear/remaining-life forecast.
-pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
+pub fn score_health(kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
     let mut score = 100.0;
     let mut cap = 100.0_f64;
     let mut confidence = 0.0_f64;
@@ -94,12 +94,17 @@ pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
         evidence.available = true;
         provenance.push("device-reported overall failure".to_owned());
     } else if let QueryState::Success(false) = &telemetry.overall_failure {
-        confidence += 0.10;
-        evidence.available = true;
-        provenance.push("device-reported no threshold failure (coarse only)".to_owned());
+        // A firmware PASS is useful context but is not enough to calculate a
+        // health percentage: it can coexist with degraded raw counters.
+        provenance.push(
+            "device-reported no threshold failure (coarse status only; not a health percentage)"
+                .to_owned(),
+        );
     }
     if let QueryState::Success(ata) = &telemetry.ata {
         add_ata_evidence(
+            kind,
+            telemetry.ata_profile.as_deref(),
             ata,
             &mut score,
             &mut cap,
@@ -108,15 +113,8 @@ pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
             &mut provenance,
             &mut warnings,
         );
-        if ata
-            .attributes
-            .iter()
-            .any(|attribute| (1..=254).contains(&attribute.current))
-        {
-            confidence += 0.10;
-        }
         provenance.push(format!(
-            "{} ATA attributes retained (vendor raw values remain opaque)",
+            "{} ATA attributes retained; unrecognized/vendor-specific raw fields remain opaque",
             ata.attributes.len()
         ));
     }
@@ -132,16 +130,20 @@ pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
         provenance.push("no health telemetry available".to_owned());
     }
     confidence = confidence.min(1.0);
-    let score = if evidence.available {
+    let has_usable_index = evidence.available && !evidence.indeterminate;
+    let score = if has_usable_index || evidence.critical_failure {
         clamp_score(score.min(cap))
     } else {
-        // Unknown telemetry is not a healthy 100% reading.
+        // Coarse overall SMART PASS or ambiguous required signals are not a
+        // computable percentage; UI must render this Unknown state as N/A.
         0
     };
     let outcome = if !evidence.available {
         HealthOutcome::Unknown
     } else if evidence.critical_failure {
         HealthOutcome::Fail
+    } else if evidence.indeterminate {
+        HealthOutcome::Unknown
     } else {
         HealthOutcome::Pass
     };
@@ -155,6 +157,8 @@ pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
 }
 
 fn add_ata_evidence(
+    kind: DiskKind,
+    profile_family: Option<&str>,
     ata: &AtaHealth,
     score: &mut f64,
     cap: &mut f64,
@@ -166,13 +170,79 @@ fn add_ata_evidence(
     let mut threshold_evidence = false;
     let mut threshold_reached = false;
     let mut near_threshold = false;
+    let mut id_counts = [0u8; 256];
     for attribute in &ata.attributes {
+        id_counts[usize::from(attribute.id)] =
+            id_counts[usize::from(attribute.id)].saturating_add(1);
+    }
+    let mut mapped_count = 0usize;
+    let mut ambiguous_count = 0usize;
+    let mut seen_counters = [false; 256];
+    let mut valid_normalized_evidence = false;
+    for attribute in &ata.attributes {
+        let duplicate_id = id_counts[usize::from(attribute.id)] > 1;
+        if duplicate_id {
+            ambiguous_count += 1;
+            // Duplicate health counters or duplicate rows with declared
+            // thresholds can affect the index. Duplicates of informational
+            // or unrecognized vendor attributes only reduce display coverage.
+            if (kind == DiskKind::Hdd && matches!(attribute.id, 5 | 10 | 187 | 197 | 198))
+                || ((1..=254).contains(&attribute.current)
+                    && attribute.threshold.is_some_and(|value| value > 0))
+            {
+                evidence.indeterminate = true;
+            }
+        }
+        if attribute.id == 0 || duplicate_id {
+            continue;
+        }
+
+        // Raw problem counters and normalized threshold values are separate
+        // evidence channels. Decode a supported raw count even when its
+        // current normalized value has no threshold record.
+        if let Some((counter, count)) =
+            crate::ata::hdd_counter(kind, profile_family, attribute.id, attribute.raw)
+        {
+            let id = usize::from(counter.id());
+            if !seen_counters[id] {
+                seen_counters[id] = true;
+                mapped_count += 1;
+                let penalty = hdd_counter_penalty(counter, count);
+                // Multiplicative combination is a heuristic way to bound
+                // combined deterioration. It does not claim independence.
+                *score *= f64::from(100 - penalty) / 100.0;
+                if count > 0 {
+                    add_warning(warnings, hdd_warning(counter));
+                }
+                let source = if profile_family == Some(crate::ata::WD10EZEX_PROFILE) {
+                    crate::ata::WD10EZEX_PROFILE
+                } else {
+                    "common HDD SMART default mapping"
+                };
+                provenance.push(format!(
+                    "health index v1: {source}, ATA ID {} ({}), raw count {count}, penalty {penalty}%",
+                    counter.id(), counter.label()
+                ));
+            }
+        } else if kind == DiskKind::Hdd && matches!(attribute.id, 5 | 10 | 187 | 197 | 198) {
+            // E.g. ID 5 carries nonzero optional raw16(raw16) subfields. Do
+            // not drop those bytes and score just the low word.
+            evidence.indeterminate = true;
+            *confidence = (*confidence - 0.05).max(0.0);
+            add_warning(warnings, HealthWarningReason::AtaRawEncodingAmbiguous);
+            provenance.push(format!(
+                "ATA ID {} raw encoding is ambiguous or unsupported; retained but not decoded; overall HDD index is unavailable to avoid a false recovery",
+                attribute.id
+            ));
+        }
+
         // Generic 1..=254 range follows current smartctl documentation; vendor
         // exceptions require a verified profile. Retain unavailable bytes
         // without using them for threshold evidence or confidence.
         if !(1..=254).contains(&attribute.current) {
             continue;
         }
+        valid_normalized_evidence = true;
         let Some(threshold) = attribute.threshold.filter(|value| *value > 0) else {
             continue;
         };
@@ -217,6 +287,26 @@ fn add_ata_evidence(
     if near_threshold {
         *score = score.min(70.0);
         *confidence += 0.10;
+    }
+    if valid_normalized_evidence {
+        *confidence += 0.10;
+    }
+    if ambiguous_count > 0 {
+        provenance.push(format!(
+            "{ambiguous_count} duplicate ATA attribute entries ignored as ambiguous"
+        ));
+    }
+    if mapped_count > 0 {
+        // The model-scoped profile is stronger evidence than the generic
+        // common-attribute default. Coverage affects confidence, never the
+        // percent itself.
+        let model_profile = profile_family == Some(crate::ata::WD10EZEX_PROFILE);
+        *confidence += if model_profile { 0.16 } else { 0.10 };
+        *confidence += mapped_count as f64 * if model_profile { 0.14 } else { 0.12 };
+        evidence.available = true;
+        provenance.push(format!(
+            "health index v1: {mapped_count}/5 supported HDD counters mapped; weights are deterministic heuristic deductions, not independent probabilities"
+        ));
     }
 }
 
@@ -291,6 +381,47 @@ fn add_nvme_evidence(
         *score = score.min(70.0) - penalty;
         add_warning(warnings, HealthWarningReason::NvmeMediaErrors);
         provenance.push(format!("NVMe media/data integrity errors: {errors}"));
+    }
+}
+
+fn hdd_counter_penalty(counter: crate::ata::HddCounter, count: u64) -> u8 {
+    if count == 0 {
+        return 0;
+    }
+    // Project-defined v1 calibration, not a coefficient set taken from
+    // HD Sentinel or a device vendor: event classes with direct media/data
+    // risk start higher than historical remaps/retries; each decimal order
+    // adds a bounded increment so gigantic raw counters cannot overflow or
+    // dominate linearly. The separate penalties compound as a deterministic
+    // heuristic, not as independent probabilities.
+    let (base, per_decimal_order, maximum) = match counter {
+        crate::ata::HddCounter::ReallocatedSectors => (4u8, 3u8, 25u8),
+        crate::ata::HddCounter::SpinRetries => (10, 4, 35),
+        crate::ata::HddCounter::ReportedUncorrectable => (20, 8, 55),
+        crate::ata::HddCounter::PendingSectors => (25, 10, 65),
+        crate::ata::HddCounter::OfflineUncorrectable => (30, 10, 70),
+    };
+    let mut decimal_orders = 0u8;
+    let mut threshold = 10u64;
+    while count >= threshold && threshold != u64::MAX {
+        decimal_orders = decimal_orders.saturating_add(1);
+        threshold = threshold.saturating_mul(10);
+    }
+    base.saturating_add(per_decimal_order.saturating_mul(decimal_orders))
+        .min(maximum)
+}
+
+fn hdd_warning(counter: crate::ata::HddCounter) -> HealthWarningReason {
+    match counter {
+        crate::ata::HddCounter::ReallocatedSectors => HealthWarningReason::AtaReallocatedSectors,
+        crate::ata::HddCounter::SpinRetries => HealthWarningReason::AtaSpinRetries,
+        crate::ata::HddCounter::ReportedUncorrectable => {
+            HealthWarningReason::AtaReportedUncorrectable
+        }
+        crate::ata::HddCounter::PendingSectors => HealthWarningReason::AtaPendingSectors,
+        crate::ata::HddCounter::OfflineUncorrectable => {
+            HealthWarningReason::AtaOfflineUncorrectable
+        }
     }
 }
 
@@ -393,15 +524,21 @@ mod tests {
     }
 
     #[test]
-    fn coarse_no_failure_status_is_usable_but_low_confidence() {
+    fn coarse_no_failure_status_alone_does_not_invent_a_healthy_percentage() {
         let telemetry = Telemetry {
             overall_failure: QueryState::Success(false),
             ..Default::default()
         };
         let result = score_health(DiskKind::Hdd, &telemetry);
-        assert_eq!(result.score, 100);
-        assert_eq!(result.outcome, HealthOutcome::Pass);
-        assert_eq!(result.confidence, 0.10);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.outcome, HealthOutcome::Unknown);
+        assert_eq!(result.confidence, 0.0);
+        assert!(
+            result
+                .provenance
+                .iter()
+                .any(|item| item.contains("coarse status only"))
+        );
     }
 
     #[test]
@@ -410,7 +547,7 @@ mod tests {
             let mut telemetry = Telemetry {
                 ata: QueryState::Success(AtaHealth {
                     attributes: vec![crate::model::AtaAttribute {
-                        id: 5,
+                        id: 202,
                         flags: 1,
                         current,
                         worst: 1,
@@ -430,9 +567,9 @@ mod tests {
             assert_eq!(telemetry, retained);
             telemetry.overall_failure = QueryState::Success(false);
             let result = score_health(DiskKind::Hdd, &telemetry);
-            assert_eq!(result.outcome, HealthOutcome::Pass);
-            assert_eq!(result.score, 100);
-            assert_eq!(result.confidence, 0.10);
+            assert_eq!(result.outcome, HealthOutcome::Unknown);
+            assert_eq!(result.score, 0);
+            assert_eq!(result.confidence, 0.0);
             telemetry.overall_failure = QueryState::Success(true);
             let result = score_health(DiskKind::Hdd, &telemetry);
             assert_eq!(result.outcome, HealthOutcome::Fail);
@@ -461,7 +598,7 @@ mod tests {
             let result = score_health(DiskKind::Hdd, &telemetry);
             assert_eq!(result.outcome, HealthOutcome::Pass, "current {current}");
             assert_eq!(result.score, 100);
-            assert_eq!(result.confidence, 0.25);
+            assert_eq!(result.confidence, 0.47);
         }
     }
     #[test]
@@ -658,8 +795,8 @@ mod tests {
     }
 
     #[test]
-    fn unprofiled_hdd_raw_sector_ids_do_not_invent_health_semantics() {
-        for id in [5, 197, 198] {
+    fn unrecognized_vendor_specific_raw_ids_do_not_invent_health_semantics() {
+        for id in [1, 7, 177, 202] {
             let telemetry = Telemetry {
                 ata: QueryState::Success(AtaHealth {
                     attributes: vec![crate::model::AtaAttribute {
@@ -680,6 +817,279 @@ mod tests {
                 assert_eq!(result.outcome, HealthOutcome::Unknown, "id {id}");
             }
         }
+    }
+
+    fn ata_attribute(id: u8, raw: [u8; 6]) -> crate::model::AtaAttribute {
+        crate::model::AtaAttribute {
+            id,
+            flags: 0,
+            current: 100,
+            worst: 100,
+            threshold: None,
+            raw,
+        }
+    }
+
+    #[test]
+    fn wd10ezex_clean_hdd_counters_produce_a_supported_health_index() {
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_ata(
+            AtaHealth {
+                attributes: [5, 10, 187, 197, 198]
+                    .into_iter()
+                    .map(|id| ata_attribute(id, [0; 6]))
+                    .collect(),
+                thresholds_available: false,
+            },
+            Some("WDC WD10EZEX-00WN4A0"),
+        );
+        telemetry.overall_failure = QueryState::Success(false);
+
+        let result = score_health(DiskKind::Hdd, &telemetry);
+        assert_eq!(result.score, 100);
+        assert_eq!(result.outcome, HealthOutcome::Pass);
+        assert!(result.confidence >= 0.9);
+        assert!(result.provenance.iter().any(|item| {
+            item.contains(crate::ata::WD10EZEX_PROFILE) && item.contains("raw count 0")
+        }));
+        assert!(
+            result
+                .provenance
+                .iter()
+                .any(|item| item.contains("5/5 supported HDD counters"))
+        );
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn hdd_bad_sector_signals_reduce_health_even_when_firmware_says_pass() {
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_ata(
+            AtaHealth {
+                attributes: vec![
+                    ata_attribute(5, [3, 0, 0, 0, 0, 0]),
+                    ata_attribute(197, [1, 0, 0, 0, 0, 0]),
+                    ata_attribute(198, [1, 0, 0, 0, 0, 0]),
+                    ata_attribute(7, [255, 255, 255, 255, 255, 255]),
+                ],
+                thresholds_available: false,
+            },
+            Some("WDC WD10EZEX-00WN4A0"),
+        );
+        telemetry.overall_failure = QueryState::Success(false);
+
+        let result = score_health(DiskKind::Hdd, &telemetry);
+        assert!(result.score < 100);
+        assert_eq!(
+            result.outcome,
+            HealthOutcome::Pass,
+            "raw counters are warnings, not device-declared failure"
+        );
+        assert!(
+            result
+                .warnings
+                .contains(&HealthWarningReason::AtaReallocatedSectors)
+        );
+        assert!(
+            result
+                .warnings
+                .contains(&HealthWarningReason::AtaPendingSectors)
+        );
+        assert!(
+            result
+                .warnings
+                .contains(&HealthWarningReason::AtaOfflineUncorrectable)
+        );
+        assert!(
+            !result
+                .provenance
+                .iter()
+                .any(|item| item.contains("ATA ID 7"))
+        );
+    }
+
+    #[test]
+    fn hdd_counter_index_is_monotonic_saturating_and_model_gated() {
+        let score_for = |count: u64, kind: DiskKind, profile: Option<&str>| {
+            let bytes = count.to_le_bytes();
+            let raw: [u8; 6] = bytes[..6].try_into().unwrap();
+            let telemetry = Telemetry {
+                ata: QueryState::Success(AtaHealth {
+                    attributes: vec![ata_attribute(197, raw)],
+                    thresholds_available: false,
+                }),
+                ata_profile: profile.map(str::to_owned),
+                ..Default::default()
+            };
+            score_health(kind, &telemetry).score
+        };
+        let mut previous = 100;
+        for count in [0, 1, 9, 10, 100, 10_000, (1u64 << 48) - 1] {
+            let score = score_for(count, DiskKind::Hdd, None);
+            assert!(
+                score <= previous,
+                "count {count}: score {score} > {previous}"
+            );
+            previous = score;
+        }
+        assert_eq!(score_for(1, DiskKind::Ssd, None), 0);
+        assert_eq!(score_for(1, DiskKind::Unknown, None), 0);
+    }
+
+    #[test]
+    fn duplicate_smart_attribute_ids_are_ignored_and_reported_as_ambiguous() {
+        let telemetry = Telemetry {
+            ata: QueryState::Success(AtaHealth {
+                attributes: vec![
+                    ata_attribute(197, [1, 0, 0, 0, 0, 0]),
+                    ata_attribute(197, [100, 0, 0, 0, 0, 0]),
+                ],
+                thresholds_available: false,
+            }),
+            ata_profile: Some(crate::ata::WD10EZEX_PROFILE.to_owned()),
+            ..Default::default()
+        };
+        let result = score_health(DiskKind::Hdd, &telemetry);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.outcome, HealthOutcome::Unknown);
+        assert_eq!(result.confidence, 0.0);
+        assert!(
+            result
+                .provenance
+                .iter()
+                .any(|item| item.contains("duplicate ATA attribute entries ignored"))
+        );
+        assert!(
+            !result
+                .warnings
+                .contains(&HealthWarningReason::AtaPendingSectors)
+        );
+    }
+
+    #[test]
+    fn ambiguous_id5_upper_words_are_not_silently_truncated_to_a_small_count() {
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_ata(
+            AtaHealth {
+                attributes: vec![ata_attribute(5, [1, 0, 0, 0, 1, 0])],
+                thresholds_available: false,
+            },
+            Some("WDC WD10EZEX-00WN4A0"),
+        );
+        let result = score_health(DiskKind::Hdd, &telemetry);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.outcome, HealthOutcome::Unknown);
+        assert!(
+            result
+                .provenance
+                .iter()
+                .any(|item| item.contains("raw encoding is ambiguous or unsupported"))
+        );
+        assert!(
+            result
+                .warnings
+                .contains(&HealthWarningReason::AtaRawEncodingAmbiguous)
+        );
+    }
+
+    #[test]
+    fn id5_ambiguous_upper_words_make_the_index_indeterminate_without_fabricated_damage() {
+        let result_for = |reallocated: [u8; 6]| {
+            let mut telemetry = Telemetry::default();
+            telemetry.apply_ata(
+                AtaHealth {
+                    attributes: vec![ata_attribute(5, reallocated), ata_attribute(197, [0; 6])],
+                    thresholds_available: false,
+                },
+                Some("WDC WD10EZEX-00WN4A0"),
+            );
+            score_health(DiskKind::Hdd, &telemetry)
+        };
+        let largest_plain_primary = result_for([255, 255, 0, 0, 0, 0]);
+        let next_upper_word = result_for([0, 0, 1, 0, 0, 0]);
+        assert_eq!(largest_plain_primary.score, 84);
+        assert_eq!(next_upper_word.score, 0);
+        assert_eq!(next_upper_word.outcome, HealthOutcome::Unknown);
+        assert!(next_upper_word.score < largest_plain_primary.score);
+        assert!(
+            next_upper_word
+                .warnings
+                .contains(&HealthWarningReason::AtaRawEncodingAmbiguous)
+        );
+
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_ata(
+            AtaHealth {
+                attributes: vec![
+                    ata_attribute(5, [0, 0, 1, 0, 0, 0]),
+                    ata_attribute(197, [1, 0, 0, 0, 0, 0]),
+                ],
+                thresholds_available: false,
+            },
+            Some("WDC WD10EZEX-00WN4A0"),
+        );
+        let unknown = score_health(DiskKind::Hdd, &telemetry);
+        assert_eq!(unknown.outcome, HealthOutcome::Unknown);
+        assert!(
+            unknown
+                .warnings
+                .contains(&HealthWarningReason::AtaPendingSectors)
+        );
+        assert!(
+            unknown
+                .warnings
+                .contains(&HealthWarningReason::AtaRawEncodingAmbiguous)
+        );
+    }
+
+    #[test]
+    fn duplicate_smart_entries_make_the_overall_index_indeterminate_but_keep_known_warnings() {
+        let telemetry = Telemetry {
+            ata: QueryState::Success(AtaHealth {
+                attributes: vec![
+                    ata_attribute(197, [1, 0, 0, 0, 0, 0]),
+                    ata_attribute(197, [100, 0, 0, 0, 0, 0]),
+                    ata_attribute(198, [1, 0, 0, 0, 0, 0]),
+                ],
+                thresholds_available: false,
+            }),
+            ata_profile: Some(crate::ata::WD10EZEX_PROFILE.to_owned()),
+            ..Default::default()
+        };
+        let result = score_health(DiskKind::Hdd, &telemetry);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.outcome, HealthOutcome::Unknown);
+        assert!(
+            result
+                .warnings
+                .contains(&HealthWarningReason::AtaOfflineUncorrectable)
+        );
+    }
+
+    #[test]
+    fn duplicate_informational_or_unmapped_ids_do_not_discard_supported_health_evidence() {
+        let telemetry = Telemetry {
+            ata: QueryState::Success(AtaHealth {
+                attributes: vec![
+                    ata_attribute(194, [40, 50, 60, 0, 0, 0]),
+                    ata_attribute(194, [41, 50, 60, 0, 0, 0]),
+                    ata_attribute(197, [0; 6]),
+                    ata_attribute(198, [0; 6]),
+                ],
+                thresholds_available: false,
+            }),
+            ata_profile: Some(crate::ata::WD10EZEX_PROFILE.to_owned()),
+            ..Default::default()
+        };
+        let result = score_health(DiskKind::Hdd, &telemetry);
+        assert_eq!(result.score, 100);
+        assert_eq!(result.outcome, HealthOutcome::Pass);
+        assert!(
+            result
+                .provenance
+                .iter()
+                .any(|item| { item.contains("duplicate ATA attribute entries ignored") })
+        );
     }
 
     #[test]
