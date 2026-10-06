@@ -157,6 +157,11 @@ mod tests {
             QueryState::Success(health) if health.attributes[0].current == 77
         ));
 
+        let mut four_tb = Telemetry::default();
+        four_tb.apply_ata(health(202, 23), Some("ATA_CT4000MX500SSD1"));
+        assert_eq!(four_tb.endurance_percent, Some(23.0));
+        assert_eq!(four_tb.ata_profile.as_deref(), Some("Crucial MX500"));
+
         for (model, id) in [
             ("Samsung SSD 850 EVO", 177),
             ("Samsung SSD 860 EVO", 177),

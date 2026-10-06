@@ -16,11 +16,19 @@ pub(crate) struct ModelProfile {
 /// The normalized field is `max(100 - raw, 0)` and is not the used percent.
 pub(crate) fn profile(model: Option<&str>) -> Option<ModelProfile> {
     let model = model?.trim().to_ascii_uppercase();
+    // Some generic storage descriptors prepend their vendor as "ATA". Strip
+    // only that exact token, then the known Crucial brand token; keep the
+    // original identity untouched for display and reject arbitrary prefixes.
+    let model = model
+        .strip_prefix("ATA_")
+        .or_else(|| model.strip_prefix("ATA "))
+        .unwrap_or(&model)
+        .trim();
     let product = model
         .strip_prefix("CRUCIAL_")
         .or_else(|| model.strip_prefix("CRUCIAL "))
-        .unwrap_or(&model)
-        .trim_start_matches(|character: char| !character.is_ascii_alphanumeric());
+        .unwrap_or(model)
+        .trim();
     if !product.starts_with("CT") {
         return None;
     }
@@ -47,6 +55,7 @@ pub(crate) fn profile(model: Option<&str>) -> Option<ModelProfile> {
         "CT500MX500SSD",
         "CT1000MX500SSD",
         "CT2000MX500SSD",
+        "CT4000MX500SSD",
     ]
     .iter()
     .any(|prefix| {
@@ -147,8 +156,15 @@ mod tests {
         for model in [
             "CT275MX300SSD1",
             "Crucial CT1050MX300SSD4",
+            "ATA CT500MX500SSD1",
+            "ATA_CT500MX500SSD1",
+            "ATA Crucial_CT500MX500SSD1",
+            "Crucial_CT500MX500SSD1",
             "CT500MX500SSD1A",
             "CT2000MX500SSD4",
+            "CT4000MX500SSD1",
+            "ATA CT4000MX500SSD1",
+            "ATA_CT4000MX500SSD1",
             "CT120BX500SSD1",
             "CT4000BX500SSD1",
         ] {
@@ -174,6 +190,9 @@ mod tests {
         assert_eq!(profile(Some("CT500MX500SSD2")), None);
         assert_eq!(profile(Some("CT120BX500SSD4")), None);
         assert_eq!(profile(Some("Other CT500MX500SSD1")), None);
+        assert_eq!(profile(Some("ATAx CT500MX500SSD1")), None);
+        assert_eq!(profile(Some("ATA_CT4000MX500SSD2")), None);
+        assert_eq!(profile(Some("CT4000MX500SSD2")), None);
         assert_eq!(profile(Some("MacroVIP MV240GB")), None);
         assert_eq!(profile(Some("Samsung SSD 870 EVO")), None);
         assert_eq!(
