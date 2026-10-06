@@ -24,8 +24,9 @@ Requer Windows 10/11 e um terminal compatível com TUI. Releases incluem execut�
 - `←` / `→` ou `Tab` / `Shift+Tab`: alternar entre discos.
 - `↑` / `↓` ou `j` / `k`: rolar o conteúdo do painel.
 - Clique em uma aba para selecionar o disco; a roda do mouse rola o painel ou, sobre as abas, alterna discos. Os botões auxiliares aparecem quando há espaço vertical suficiente.
-- Clique no botão `Sair` para encerrar.
+- Clique no botão de saída para encerrar; em larguras estreitas, ele aparece como `×`.
 - `q` ou `Esc`: sair.
+- Abaixo de 17 linhas de altura, o rodapé de botões fica oculto; use a roda do mouse no painel/abas ou o teclado. Abaixo de 10 linhas, cabeçalho e abas usam uma linha compacta.
 
 ## Desenvolvimento
 

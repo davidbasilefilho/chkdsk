@@ -854,7 +854,7 @@ impl Layout {
         }
         // Normal-sized buttons have one cell of vertical padding above and below
         // their centered label. Preserve a one-row escape hatch for tiny terminals.
-        let button_height = if height >= 7 { 3 } else { 1 };
+        let button_height = if height >= 10 { 3 } else { 1 };
         let quit = if width >= 21 {
             HitArea {
                 x: width - 8,
@@ -936,7 +936,7 @@ impl Layout {
 fn footer_controls(width: usize, height: usize) -> Vec<FooterControl> {
     // Compact screens reserve their height for the health summary. The same
     // mouse actions remain available through tab clicks and wheel scrolling.
-    if width < 21 || height < 14 {
+    if width < 21 || height < 17 {
         return Vec::new();
     }
     let button_height = 3;
@@ -2439,10 +2439,12 @@ mod tests {
                 .tab_indices
                 .contains(&global.state.selected)
         );
+        let rendered = rendered_text(&mut app, &mut global);
+        let layout = Layout::new(100, 10, global.state.disks.len(), global.state.scroll);
         assert!(
-            rendered_text(&mut app, &mut global)
+            rendered
                 .lines()
-                .nth(1)
+                .nth(layout.tabs[0].y + layout.tabs[0].height / 2)
                 .unwrap()
                 .contains("> Disco #5")
         );
@@ -2876,7 +2878,15 @@ mod tests {
 
     #[test]
     fn layouts_and_tab_hits_stay_inside_viewport_without_overlap() {
-        for (width, height) in [(0, 0), (1, 1), (4, 2), (12, 6), (80, 24)] {
+        for (width, height) in [
+            (0, 0),
+            (1, 1),
+            (4, 2),
+            (12, 6),
+            (80, 17),
+            (80, 24),
+            (100, 10),
+        ] {
             let layout = Layout::new(width, height, 100, 20);
             let areas = layout
                 .tabs
@@ -2922,11 +2932,14 @@ mod tests {
         assert_eq!(layout.tabs.len(), 1);
         assert_eq!(layout.tabs[0].height, 3);
         assert_eq!(body_view_height(&layout, 10), 4);
+        let shorter = Layout::new(80, 14, 2, 0);
+        assert!(shorter.controls.is_empty());
+        assert_eq!(body_view_height(&shorter, 14), 8);
     }
 
     #[test]
     fn standard_buttons_are_padded_centered_and_have_full_hitboxes() {
-        for (width, height) in [(100, 28), (70, 20), (30, 10)] {
+        for (width, height) in [(100, 28), (70, 20), (80, 17), (30, 10)] {
             let layout = Layout::new(width, height, 5, 0);
             assert_eq!(layout.quit.height, 3, "{width}x{height}");
             assert!(!layout.tabs.is_empty(), "{width}x{height}");
@@ -3176,8 +3189,8 @@ mod tests {
             started: true,
             ..Default::default()
         };
-        let mut global = test_global_data(state, 80, 14);
-        let layout = Layout::new(80, 14, global.state.disks.len(), 0);
+        let mut global = test_global_data(state, 80, 17);
+        let layout = Layout::new(80, 17, global.state.disks.len(), 0);
         let click =
             |app: &mut DashboardApp, global: &mut GlobalData<Dashboard, AppSignal>, action| {
                 let button = layout
@@ -3315,7 +3328,7 @@ mod tests {
             error_message: None,
         };
 
-        for (width, height) in [(80, 14), (30, 10)] {
+        for (width, height) in [(80, 17), (30, 10)] {
             let mut app = DashboardApp {
                 started: true,
                 ..Default::default()
@@ -3393,18 +3406,50 @@ mod tests {
             }
             assert_eq!(global.state.content_scroll, expected_max);
             let rendered = rendered_text(&mut app, &mut global);
-            assert!(rendered.contains("Backup da memória volátil"), "{rendered}");
             assert!(rendered.contains("Sair"), "{rendered}");
-            assert!(
-                rendered.contains(if width >= 54 {
-                    "↑ Detalhes"
-                } else {
-                    "↑ Info"
-                }),
-                "{rendered}"
-            );
-            let last_visible_row = rendered.lines().nth(height - 2).unwrap().trim();
+            if height >= 17 {
+                assert!(rendered.contains("↑ Detalhes"), "{rendered}");
+            } else {
+                assert!(Layout::new(width, height, 1, 0).controls.is_empty());
+            }
+            let last_visible_row = rendered
+                .lines()
+                .nth(layout.body_y + body_height - 1)
+                .unwrap()
+                .trim();
             assert!(last_visible_row.contains("LIGADO"), "{rendered}");
+
+            let telemetry = disk.telemetry.as_ref().unwrap();
+            let health = score_health(effective_disk_kind(&disk.identity, telemetry), telemetry);
+            let warning_position = health_detail_messages(&health, telemetry)
+                .iter()
+                .position(|(message, _)| message.contains("Backup da memória volátil"))
+                .expect("telemetria NVMe contém aviso de backup");
+            let score_rows = usize::from(body_height >= 9 && width >= 26) * 5;
+            let warning_line = 4 + score_rows + warning_position;
+            let warning_scroll = warning_line.saturating_sub(body_height - 1);
+            while global.state.content_scroll > warning_scroll {
+                dispatch_input(
+                    &mut app,
+                    &mut global,
+                    InputEvent::Keyboard(KeyPress::Plain {
+                        key: Key::SpecialKey(SpecialKey::Up),
+                    }),
+                );
+            }
+            while global.state.content_scroll < warning_scroll {
+                dispatch_input(
+                    &mut app,
+                    &mut global,
+                    InputEvent::Keyboard(KeyPress::Plain {
+                        key: Key::SpecialKey(SpecialKey::Down),
+                    }),
+                );
+            }
+            assert!(
+                rendered_text(&mut app, &mut global).contains("Backup da memória volátil"),
+                "aviso fora da viewport em {width}x{height}"
+            );
 
             if width == 80 {
                 global.window_size = r3bl_tui::Size::new((
