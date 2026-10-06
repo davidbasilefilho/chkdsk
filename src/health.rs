@@ -108,7 +108,13 @@ pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
             &mut provenance,
             &mut warnings,
         );
-        confidence += 0.10;
+        if ata
+            .attributes
+            .iter()
+            .any(|attribute| (1..=254).contains(&attribute.current))
+        {
+            confidence += 0.10;
+        }
         provenance.push(format!(
             "{} ATA attributes retained (vendor raw values remain opaque)",
             ata.attributes.len()
@@ -161,6 +167,12 @@ fn add_ata_evidence(
     let mut threshold_reached = false;
     let mut near_threshold = false;
     for attribute in &ata.attributes {
+        // Generic 1..=254 range follows current smartctl documentation; vendor
+        // exceptions require a verified profile. Retain unavailable bytes
+        // without using them for threshold evidence or confidence.
+        if !(1..=254).contains(&attribute.current) {
+            continue;
+        }
         let Some(threshold) = attribute.threshold.filter(|value| *value > 0) else {
             continue;
         };
@@ -231,7 +243,7 @@ fn add_nvme_evidence(
         provenance.push(format!(
             "NVMe available spare {spare}% (threshold {threshold}%)"
         ));
-        if spare <= threshold {
+        if spare < threshold {
             *cap = cap.min(25.0);
             *critical_failure = true;
         }
@@ -393,6 +405,91 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_ata_normalized_currents_do_not_supply_health_evidence() {
+        for current in [0, 255] {
+            let mut telemetry = Telemetry {
+                ata: QueryState::Success(AtaHealth {
+                    attributes: vec![crate::model::AtaAttribute {
+                        id: 5,
+                        flags: 1,
+                        current,
+                        worst: 1,
+                        threshold: Some(10),
+                        raw: [1, 2, 3, 4, 5, 6],
+                    }],
+                    thresholds_available: true,
+                }),
+                ..Default::default()
+            };
+            let retained = telemetry.clone();
+            let result = score_health(DiskKind::Hdd, &telemetry);
+            assert_eq!(result.outcome, HealthOutcome::Unknown, "current {current}");
+            assert_eq!(result.score, 0);
+            assert_eq!(result.confidence, 0.0);
+            assert!(result.warnings.is_empty());
+            assert_eq!(telemetry, retained);
+            telemetry.overall_failure = QueryState::Success(false);
+            let result = score_health(DiskKind::Hdd, &telemetry);
+            assert_eq!(result.outcome, HealthOutcome::Pass);
+            assert_eq!(result.score, 100);
+            assert_eq!(result.confidence, 0.10);
+            telemetry.overall_failure = QueryState::Success(true);
+            let result = score_health(DiskKind::Hdd, &telemetry);
+            assert_eq!(result.outcome, HealthOutcome::Fail);
+            assert_eq!(result.score, 20);
+            assert_eq!(result.confidence, 0.35);
+        }
+    }
+
+    #[test]
+    fn ata_normalized_currents_253_and_254_remain_valid_threshold_evidence() {
+        for current in [253, 254] {
+            let telemetry = Telemetry {
+                ata: QueryState::Success(AtaHealth {
+                    attributes: vec![crate::model::AtaAttribute {
+                        id: 5,
+                        flags: 1,
+                        current,
+                        worst: current,
+                        threshold: Some(10),
+                        raw: [0; 6],
+                    }],
+                    thresholds_available: true,
+                }),
+                ..Default::default()
+            };
+            let result = score_health(DiskKind::Hdd, &telemetry);
+            assert_eq!(result.outcome, HealthOutcome::Pass, "current {current}");
+            assert_eq!(result.score, 100);
+            assert_eq!(result.confidence, 0.25);
+        }
+    }
+    #[test]
+    fn nvme_spare_threshold_equality_requires_a_device_critical_warning_to_fail() {
+        for (spare, warning, expected_outcome, expected_score) in [
+            (10, 0, HealthOutcome::Pass, 73),
+            (9, 0, HealthOutcome::Fail, 25),
+            (10, 1, HealthOutcome::Fail, 25),
+            (11, 1, HealthOutcome::Fail, 25),
+        ] {
+            let telemetry = Telemetry {
+                nvme: QueryState::Success(NvmeHealth {
+                    available_spare_percent: Some(spare),
+                    available_spare_threshold_percent: Some(10),
+                    critical_warning: warning,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let result = score_health(DiskKind::Nvme, &telemetry);
+            assert_eq!(
+                result.outcome, expected_outcome,
+                "spare {spare}, warning {warning}"
+            );
+            assert_eq!(result.score, expected_score);
+        }
+    }
+    #[test]
     fn declared_threshold_trip_caps_score_even_when_endurance_looks_good() {
         let telemetry = Telemetry {
             endurance_percent: Some(0.0),
@@ -429,7 +526,7 @@ mod tests {
                 attributes: vec![crate::model::AtaAttribute {
                     id: 202,
                     flags: 0,
-                    current: 0,
+                    current: 1,
                     worst: 0,
                     threshold: Some(1),
                     raw: [100, 0, 0, 0, 0, 0],
