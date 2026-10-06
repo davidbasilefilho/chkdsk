@@ -81,11 +81,13 @@ const TOKYO_YELLOW: RgbValue = RgbValue {
     green: 199,
     blue: 119,
 };
+#[cfg(test)]
 const TOKYO_ORANGE: RgbValue = RgbValue {
     red: 255,
     green: 150,
     blue: 108,
 };
+#[cfg(test)]
 const TOKYO_PURPLE: RgbValue = RgbValue {
     red: 252,
     green: 167,
@@ -2962,9 +2964,9 @@ mod tests {
                     area.x + (area.width - text_width) / 2,
                     "{width}x{height}: {area:?}"
                 );
-                assert!(text_x >= area.x + 1, "{width}x{height}: {area:?}");
+                assert!(text_x > area.x, "{width}x{height}: {area:?}");
                 assert!(
-                    text_x + text_width <= area.x + area.width - 1,
+                    text_x + text_width < area.x + area.width,
                     "{width}x{height}: {area:?}"
                 );
                 for y in area.y..area.y + area.height {
