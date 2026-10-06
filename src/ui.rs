@@ -1120,7 +1120,7 @@ fn render_disk(
             DiskKind::Hdd => "HDD",
             DiskKind::Ssd => "SSD",
             DiskKind::Nvme => "NVMe",
-            DiskKind::Unknown => "Tipo desconhecido",
+            DiskKind::Unknown => "Desconhecido",
         };
         let mut stripe = false;
         for (label, value) in [
@@ -1248,7 +1248,7 @@ fn render_disk(
         DiskKind::Hdd => "HDD",
         DiskKind::Ssd => "SSD",
         DiskKind::Nvme => "NVMe",
-        DiskKind::Unknown => "Tipo desconhecido",
+        DiskKind::Unknown => "Desconhecido",
     };
     let bus = disk
         .identity
@@ -3062,6 +3062,22 @@ mod tests {
         let rendered = rendered_text(&mut app, &mut global);
         assert!(
             rendered.contains("Sem ETA: tipo desconhecido"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .any(|line| { line.contains("TIPO") && line.contains("Desconhecido") }),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Tipo desconheci"), "{rendered}");
+
+        global.state.disks[0].telemetry = None;
+        let rendered = rendered_text(&mut app, &mut global);
+        assert!(
+            rendered
+                .lines()
+                .any(|line| { line.contains("TIPO") && line.contains("Desconhecido") }),
             "{rendered}"
         );
     }
