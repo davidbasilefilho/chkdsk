@@ -2029,7 +2029,8 @@ fn health_detail_messages(
         }
         if let QueryState::Success(ata) = &telemetry.ata {
             for attribute in &ata.attributes {
-                if (1..=254).contains(&attribute.current)
+                if crate::ata::unique_attribute(ata, attribute.id).is_some()
+                    && (1..=254).contains(&attribute.current)
                     && attribute.flags & 1 != 0
                     && let Some(threshold) = attribute.threshold.filter(|value| *value > 0)
                     && attribute.current <= threshold
@@ -3739,6 +3740,35 @@ mod tests {
             );
             assert!(ata_threshold_messages(&telemetry, false).is_none());
         }
+    }
+
+    #[test]
+    fn failure_details_ignore_ambiguous_duplicate_ata_ids() {
+        let telemetry = Telemetry {
+            overall_failure: QueryState::Success(true),
+            ata: QueryState::Success(crate::model::AtaHealth {
+                attributes: [5, 5]
+                    .into_iter()
+                    .map(|id| crate::model::AtaAttribute {
+                        id,
+                        flags: 1,
+                        current: 5,
+                        worst: 5,
+                        threshold: Some(10),
+                        raw: [0; 6],
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let health = score_health(DiskKind::Hdd, &telemetry);
+
+        assert_eq!(health.outcome, HealthOutcome::Fail);
+        assert_eq!(
+            health_detail_messages(&health, &telemetry),
+            vec![("Falha geral reportada pelo dispositivo".into(), TOKYO_RED)]
+        );
     }
 
     #[test]
