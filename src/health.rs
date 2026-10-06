@@ -1,13 +1,13 @@
 //! Deterministic, conservative health scoring (higher is healthier).
 //!
 //! Endurance-used is scored as `100 - used` and never alone means failure.
-//! Device-declared failures and ATA threshold trips determine Fail; low scores
-//! from wear or other noncritical signals remain Pass. ATA normalized values
+//! Device-declared failures and pre-failure ATA threshold trips determine
+//! Fail; low scores from wear or other noncritical signals remain Pass. ATA normalized values
 //! use only device-declared thresholds and small normalized-point margin caps,
 //! not a guessed vendor baseline or remaining-lifetime estimate.
 //! Confidence describes evidence, not statistical certainty.
 
-use crate::model::{AtaHealth, DiskKind, NvmeHealth, QueryState, Telemetry};
+use crate::model::{AtaHealth, DiskKind, HealthWarningReason, NvmeHealth, QueryState, Telemetry};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +24,9 @@ pub struct HealthScore {
     pub outcome: HealthOutcome,
     pub confidence: f64,
     pub provenance: Vec<String>,
+    /// Structured warning causes for UI presentation; absent in older JSON.
+    #[serde(default)]
+    pub warnings: Vec<HealthWarningReason>,
 }
 
 #[derive(Default)]
@@ -36,6 +39,12 @@ fn clamp_score(value: f64) -> u8 {
     value.round().clamp(0.0, 100.0) as u8
 }
 
+fn add_warning(warnings: &mut Vec<HealthWarningReason>, reason: HealthWarningReason) {
+    if !warnings.contains(&reason) {
+        warnings.push(reason);
+    }
+}
+
 /// Return the same result for the same disk kind and telemetry. The disk kind
 /// parameter is retained for the domain API; HDD score is still a snapshot,
 /// never a wear/remaining-life forecast.
@@ -44,6 +53,7 @@ pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
     let mut cap = 100.0_f64;
     let mut confidence = 0.0_f64;
     let mut provenance = Vec::new();
+    let mut warnings = Vec::new();
     let mut evidence = Evidence::default();
 
     if let QueryState::Success(nvme) = &telemetry.nvme {
@@ -56,6 +66,7 @@ pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
             &mut cap,
             &mut evidence.critical_failure,
             &mut provenance,
+            &mut warnings,
         );
     }
     if !matches!(&telemetry.nvme, QueryState::Success(_))
@@ -65,6 +76,9 @@ pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
     {
         let used = used.min(100.0);
         score = score.min(100.0 - used);
+        if used >= 100.0 {
+            add_warning(&mut warnings, HealthWarningReason::EnduranceExhausted);
+        }
         confidence += 0.20;
         evidence.available = true;
         provenance.push(if let Some(profile) = telemetry.ata_profile.as_deref() {
@@ -92,6 +106,7 @@ pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
             &mut confidence,
             &mut evidence,
             &mut provenance,
+            &mut warnings,
         );
         confidence += 0.10;
         provenance.push(format!(
@@ -129,6 +144,7 @@ pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
         outcome,
         confidence,
         provenance,
+        warnings,
     }
 }
 
@@ -139,6 +155,7 @@ fn add_ata_evidence(
     confidence: &mut f64,
     evidence: &mut Evidence,
     provenance: &mut Vec<String>,
+    warnings: &mut Vec<HealthWarningReason>,
 ) {
     let mut threshold_evidence = false;
     let mut threshold_reached = false;
@@ -152,7 +169,11 @@ fn add_ata_evidence(
         if attribute.current <= threshold {
             *cap = cap.min(20.0);
             threshold_reached = true;
-            evidence.critical_failure |= attribute.flags & 1 != 0;
+            if attribute.flags & 1 != 0 {
+                evidence.critical_failure = true;
+            } else {
+                add_warning(warnings, HealthWarningReason::AtaThresholdReached);
+            }
             provenance.push(format!(
                 "ATA SMART attribute {} current {} reached declared threshold {}{}",
                 attribute.id,
@@ -167,6 +188,7 @@ fn add_ata_evidence(
         }
         if attribute.current > threshold && attribute.current <= threshold.saturating_add(10) {
             near_threshold = true;
+            add_warning(warnings, HealthWarningReason::AtaThresholdMargin);
             provenance.push(format!(
                 "ATA SMART attribute {} is within 10 normalized points above threshold {}",
                 attribute.id, threshold
@@ -192,9 +214,13 @@ fn add_nvme_evidence(
     cap: &mut f64,
     critical_failure: &mut bool,
     provenance: &mut Vec<String>,
+    warnings: &mut Vec<HealthWarningReason>,
 ) {
     if let Some(used) = nvme.percentage_used {
         *score = score.min(f64::from(100_u8.saturating_sub(used.min(100))));
+        if used >= 100 {
+            add_warning(warnings, HealthWarningReason::EnduranceExhausted);
+        }
         provenance.push(format!("NVMe endurance used {used}%"));
     }
     if let (Some(spare), Some(threshold)) = (
@@ -218,6 +244,7 @@ fn add_nvme_evidence(
     }
     if warning & 0b0000_0010 != 0 {
         *cap = cap.min(40.0);
+        add_warning(warnings, HealthWarningReason::NvmeTemperatureThreshold);
         provenance.push("NVMe temperature critical warning".into());
     }
     if warning & 0b0000_0100 != 0 {
@@ -232,7 +259,26 @@ fn add_nvme_evidence(
     }
     if warning & 0b0001_0000 != 0 {
         *cap = cap.min(50.0);
+        add_warning(warnings, HealthWarningReason::NvmeVolatileMemoryBackup);
         provenance.push("NVMe volatile-memory backup warning".into());
+    }
+    // Critical Warning bit 5 denotes a Persistent Memory Region that has
+    // become read-only or unreliable (NVMe Base Spec 1.4a+). This optional
+    // region warning is not treated as failure of the NVM media itself.
+    if warning & 0b0010_0000 != 0 {
+        *cap = cap.min(70.0);
+        add_warning(warnings, HealthWarningReason::NvmePersistentMemoryRegion);
+        provenance.push("NVMe persistent memory region read-only or unreliable".into());
+    }
+    if let Some(errors) = nvme.media_errors.filter(|count| *count > 0) {
+        // Treat this historical counter as a warning, not instantaneous
+        // failure: cap at 70, then subtract five points per decimal order,
+        // bounded to a 30-point deduction.
+        let penalty = (5.0 * (errors as f64).log10()).min(30.0);
+        *cap = cap.min(70.0);
+        *score = score.min(70.0) - penalty;
+        add_warning(warnings, HealthWarningReason::NvmeMediaErrors);
+        provenance.push(format!("NVMe media/data integrity errors: {errors}"));
     }
 }
 
@@ -267,7 +313,23 @@ mod tests {
 
     #[test]
     fn nonfailure_nvme_temperature_and_backup_warnings_do_not_mark_fail() {
-        for (warning, expected_cap) in [(0b0000_0010, 40), (0b0001_0000, 50)] {
+        for (warning, expected_cap, reason) in [
+            (
+                0b0000_0010,
+                40,
+                HealthWarningReason::NvmeTemperatureThreshold,
+            ),
+            (
+                0b0001_0000,
+                50,
+                HealthWarningReason::NvmeVolatileMemoryBackup,
+            ),
+            (
+                0b0010_0000,
+                70,
+                HealthWarningReason::NvmePersistentMemoryRegion,
+            ),
+        ] {
             let telemetry = Telemetry {
                 nvme: QueryState::Success(NvmeHealth {
                     critical_warning: warning,
@@ -278,6 +340,31 @@ mod tests {
             let result = score_health(DiskKind::Nvme, &telemetry);
             assert_eq!(result.score, expected_cap);
             assert_eq!(result.outcome, HealthOutcome::Pass);
+            assert_eq!(result.warnings, vec![reason]);
+        }
+    }
+
+    #[test]
+    fn nvme_media_errors_warn_and_reduce_score_without_failing() {
+        for (errors, expected_score) in [(0, 100), (1, 70), (100, 60), (u128::MAX, 40)] {
+            let telemetry = Telemetry {
+                nvme: QueryState::Success(NvmeHealth {
+                    media_errors: Some(errors),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let result = score_health(DiskKind::Nvme, &telemetry);
+            assert_eq!(result.score, expected_score, "{errors} errors");
+            assert_eq!(result.outcome, HealthOutcome::Pass, "{errors} errors");
+            assert_eq!(
+                result.warnings,
+                if errors == 0 {
+                    vec![]
+                } else {
+                    vec![HealthWarningReason::NvmeMediaErrors]
+                }
+            );
         }
     }
 
@@ -354,6 +441,16 @@ mod tests {
         let result = score_health(DiskKind::Ssd, &telemetry);
         assert_eq!(result.score, 0);
         assert_eq!(result.outcome, HealthOutcome::Pass);
+        assert!(
+            result
+                .warnings
+                .contains(&HealthWarningReason::EnduranceExhausted)
+        );
+        assert!(
+            result
+                .warnings
+                .contains(&HealthWarningReason::AtaThresholdReached)
+        );
         assert!(result.provenance.iter().any(|item| {
             item.contains("attribute 202") && item.contains("reached declared threshold")
         }));
@@ -413,6 +510,10 @@ mod tests {
         let result = score_health(DiskKind::Ssd, &telemetry);
         assert_eq!(result.score, 70);
         assert_eq!(result.outcome, HealthOutcome::Pass);
+        assert_eq!(
+            result.warnings,
+            vec![HealthWarningReason::AtaThresholdMargin]
+        );
         assert!(result.confidence < 0.5);
     }
 
@@ -429,6 +530,10 @@ mod tests {
             let result = score_health(DiskKind::Nvme, &telemetry);
             assert_eq!(result.score, 0);
             assert_eq!(result.outcome, HealthOutcome::Pass);
+            assert_eq!(
+                result.warnings,
+                vec![HealthWarningReason::EnduranceExhausted]
+            );
         }
         let telemetry = Telemetry {
             nvme: QueryState::Success(NvmeHealth {
@@ -478,5 +583,14 @@ mod tests {
                 assert_eq!(result.outcome, HealthOutcome::Unknown, "id {id}");
             }
         }
+    }
+
+    #[test]
+    fn old_health_score_json_defaults_structured_warnings() {
+        let score: HealthScore = serde_json::from_str(
+            r#"{"score":100,"outcome":"pass","confidence":0.1,"provenance":[]}"#,
+        )
+        .unwrap();
+        assert!(score.warnings.is_empty());
     }
 }

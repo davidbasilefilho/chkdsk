@@ -27,6 +27,19 @@ pub enum DiskKind {
     Unknown,
 }
 
+/// Machine-readable non-failure health conditions for UI presentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthWarningReason {
+    AtaThresholdMargin,
+    AtaThresholdReached,
+    EnduranceExhausted,
+    NvmeMediaErrors,
+    NvmeTemperatureThreshold,
+    NvmeVolatileMemoryBackup,
+    NvmePersistentMemoryRegion,
+}
+
 /// Query outcome is explicit: an absent value is not confused with a failed,
 /// unsupported, or never-attempted query.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +68,7 @@ pub struct NvmeHealth {
     pub power_cycles: Option<u128>,
     pub power_on_hours: Option<u128>,
     pub unsafe_shutdowns: Option<u128>,
+    /// NVMe SMART count of unrecovered media/data integrity errors.
     pub media_errors: Option<u128>,
     pub error_log_entries: Option<u128>,
 }

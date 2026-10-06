@@ -1047,6 +1047,129 @@ mod windows {
             );
         }
 
+        fn diagnostic_observation(
+            identity: &DiskIdentity,
+            result: &Result<Telemetry, QueryError>,
+        ) -> serde_json::Value {
+            let summary = match result {
+                Ok(telemetry) => {
+                    let health_score = crate::health::score_health(identity.kind, telemetry);
+                    let ata = match &telemetry.ata {
+                        QueryState::Success(health) => {
+                            let attributes: Vec<_> = health
+                                .attributes
+                                .iter()
+                                .map(|attribute| {
+                                    serde_json::json!({
+                                        "id": attribute.id,
+                                        "flags": attribute.flags,
+                                        "current": attribute.current,
+                                        "worst": attribute.worst,
+                                        "threshold": attribute.threshold,
+                                        "raw": attribute.raw,
+                                    })
+                                })
+                                .collect();
+                            serde_json::json!({
+                                "state": "readable",
+                                "attribute_count": attributes.len(),
+                                "attributes": attributes,
+                                "thresholds_available": health.thresholds_available,
+                            })
+                        }
+                        QueryState::Failed { message } => serde_json::json!({
+                            "state": "failed",
+                            "message": message,
+                        }),
+                        QueryState::Unsupported => serde_json::json!({"state": "unsupported"}),
+                        QueryState::NotQueried => serde_json::json!({"state": "not_queried"}),
+                    };
+                    serde_json::json!({
+                        "ata": ata,
+                        "nvme": telemetry.nvme,
+                        "normalized": {
+                            "endurance_percent_used": telemetry.endurance_percent,
+                            "ata_profile": telemetry.ata_profile,
+                            "power_on_hours": telemetry.power_on_hours,
+                            "temperature_c": telemetry.temperature_c,
+                            "overall_failure": telemetry.overall_failure,
+                        },
+                        "health_score": {
+                            "score": health_score.score,
+                            "outcome": health_score.outcome,
+                            "confidence": health_score.confidence,
+                            "provenance": health_score.provenance,
+                            "warnings": health_score.warnings,
+                        },
+                    })
+                }
+                Err(error) => serde_json::json!({
+                    "query_error": format!("{:?}: {}", error.state, error.message),
+                }),
+            };
+            serde_json::json!({
+                "index": identity.index,
+                "model": identity.model,
+                "bus": identity.bus,
+                "kind": format!("{:?}", identity.kind),
+                "query": summary,
+            })
+        }
+
+        #[test]
+        fn diagnostic_report_includes_raw_ata_data_normalized_fields_and_score() {
+            let identity = DiskIdentity {
+                id: "test-disk".into(),
+                index: 0,
+                model: Some("MACROVIP MV240GB".into()),
+                serial: None,
+                firmware: None,
+                capacity_bytes: None,
+                bus: Some("SATA".into()),
+                kind: DiskKind::Ssd,
+            };
+            let telemetry = Telemetry {
+                ata: QueryState::Success(crate::model::AtaHealth {
+                    attributes: vec![crate::model::AtaAttribute {
+                        id: 202,
+                        flags: 0x0018,
+                        current: 100,
+                        worst: 100,
+                        threshold: Some(1),
+                        raw: [0x34, 0x12, 0, 0, 0, 0],
+                    }],
+                    thresholds_available: true,
+                }),
+                overall_failure: QueryState::Success(false),
+                ..Default::default()
+            };
+            let report = diagnostic_observation(&identity, &Ok(telemetry));
+            assert_eq!(report["model"], "MACROVIP MV240GB");
+            assert!(report.get("serial").is_none());
+            assert_eq!(report["query"]["ata"]["attribute_count"], 1);
+            assert_eq!(report["query"]["ata"]["attributes"][0]["raw"][0], 0x34);
+            assert_eq!(report["query"]["ata"]["attributes"][0]["threshold"], 1);
+            assert_eq!(
+                report["query"]["normalized"]["endurance_percent_used"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                report["query"]["normalized"]["overall_failure"]["state"],
+                "success"
+            );
+            assert_eq!(
+                report["query"]["normalized"]["overall_failure"]["value"],
+                false
+            );
+            assert_eq!(report["query"]["health_score"]["score"], 100);
+            assert_eq!(report["query"]["health_score"]["outcome"], "pass");
+            assert!(report["query"]["health_score"]["provenance"].is_array());
+            assert_eq!(
+                report["query"]["health_score"]["warnings"],
+                serde_json::json!([])
+            );
+        }
+
         #[test]
         #[ignore = "requires elevated physical-drive access; set CHKDSK_HARDWARE_REPORT to an absolute report path"]
         fn physical_disk_smart_diagnostic() {
@@ -1057,45 +1180,7 @@ mod windows {
             let disks = discover().expect("native disk discovery");
             let observations: Vec<_> = disks
                 .iter()
-                .map(|identity| {
-                    let result = query(identity);
-                    let summary = match &result {
-                        Ok(telemetry) => {
-                            let ata = match &telemetry.ata {
-                                QueryState::Success(health) => serde_json::json!({
-                                    "state": "readable",
-                                    "attributes": health.attributes.len(),
-                                    "thresholds_available": health.thresholds_available,
-                                }),
-                                QueryState::Failed { message } => serde_json::json!({
-                                    "state": "failed",
-                                    "message": message,
-                                }),
-                                QueryState::Unsupported => {
-                                    serde_json::json!({"state": "unsupported"})
-                                }
-                                QueryState::NotQueried => {
-                                    serde_json::json!({"state": "not_queried"})
-                                }
-                            };
-                            serde_json::json!({
-                                "ata": ata,
-                                "nvme": format!("{:?}", telemetry.nvme),
-                                "overall_failure": format!("{:?}", telemetry.overall_failure),
-                            })
-                        }
-                        Err(error) => serde_json::json!({
-                            "query_error": format!("{:?}: {}", error.state, error.message),
-                        }),
-                    };
-                    serde_json::json!({
-                        "index": identity.index,
-                        "model": identity.model,
-                        "bus": identity.bus,
-                        "kind": format!("{:?}", identity.kind),
-                        "query": summary,
-                    })
-                })
+                .map(|identity| diagnostic_observation(identity, &query(identity)))
                 .collect();
             let report = serde_json::json!({
                 "discovered": disks.len(),
