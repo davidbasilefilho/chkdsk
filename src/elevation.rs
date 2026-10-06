@@ -41,6 +41,10 @@ fn with_virtual_terminal_processing(original: u32) -> u32 {
     original | 0x0004
 }
 
+fn com_initialization_succeeded(result: i32) -> bool {
+    result >= 0
+}
+
 #[cfg(windows)]
 pub struct ConsoleModeGuard {
     originals: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
@@ -169,7 +173,7 @@ impl Drop for TokenHandle {
 fn relaunch_elevated() -> std::io::Result<()> {
     use std::{ffi::OsStr, io, mem::size_of, os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::UI::{
-        Shell::{SEE_MASK_DEFAULT, SHELLEXECUTEINFOW, ShellExecuteExW},
+        Shell::{SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW},
         WindowsAndMessaging::SW_SHOWNORMAL,
     };
 
@@ -190,9 +194,11 @@ fn relaunch_elevated() -> std::io::Result<()> {
     }
     parameters.push(0);
 
+    let _com_apartment = ComApartmentGuard::initialize()?;
+
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_DEFAULT,
+        fMask: SEE_MASK_NOASYNC,
         hwnd: ptr::null_mut(),
         lpVerb: verb.as_ptr(),
         lpFile: executable.as_ptr(),
@@ -213,6 +219,49 @@ fn relaunch_elevated() -> std::io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(windows)]
+struct ComApartmentGuard {
+    uninitialize_on_drop: bool,
+}
+
+#[cfg(windows)]
+impl ComApartmentGuard {
+    fn initialize() -> std::io::Result<Self> {
+        use std::ptr;
+        use windows_sys::Win32::{
+            Foundation::RPC_E_CHANGED_MODE,
+            System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
+        };
+
+        // SAFETY: null is the documented reserved parameter; this thread owns the
+        // resulting COM initialization count until this guard is dropped.
+        let result = unsafe { CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+        if com_initialization_succeeded(result) {
+            Ok(Self {
+                uninitialize_on_drop: true,
+            })
+        } else if result == RPC_E_CHANGED_MODE {
+            // COM is already initialized on this thread with another apartment model.
+            Ok(Self {
+                uninitialize_on_drop: false,
+            })
+        } else {
+            Err(std::io::Error::from_raw_os_error(result))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ComApartmentGuard {
+    fn drop(&mut self) {
+        if self.uninitialize_on_drop {
+            // SAFETY: initialize succeeded (S_OK or S_FALSE) and this balances our
+            // one CoInitializeEx call without affecting any pre-existing COM user.
+            unsafe { windows_sys::Win32::System::Com::CoUninitialize() };
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -240,8 +289,8 @@ fn quote_windows_argument(value: &[u16]) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StartupAction, StartupDecision, TokenStatus, quote_windows_argument, startup_action,
-        token_status, with_virtual_terminal_processing,
+        StartupAction, StartupDecision, TokenStatus, com_initialization_succeeded,
+        quote_windows_argument, startup_action, token_status, with_virtual_terminal_processing,
     };
 
     #[test]
@@ -292,5 +341,12 @@ mod tests {
             startup_action(&StartupDecision::Failed("failure".to_owned())),
             StartupAction::ExitFailure
         );
+    }
+
+    #[test]
+    fn com_uninitialization_is_owned_only_after_successful_initialization() {
+        assert!(com_initialization_succeeded(0)); // S_OK
+        assert!(com_initialization_succeeded(1)); // S_FALSE
+        assert!(!com_initialization_succeeded(-2)); // Includes RPC_E_CHANGED_MODE.
     }
 }

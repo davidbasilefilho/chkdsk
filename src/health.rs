@@ -39,7 +39,7 @@ fn clamp_score(value: f64) -> u8 {
 /// Return the same result for the same disk kind and telemetry. The disk kind
 /// parameter is retained for the domain API; HDD score is still a snapshot,
 /// never a wear/remaining-life forecast.
-pub fn score_health(kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
+pub fn score_health(_kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
     let mut score = 100.0;
     let mut cap = 100.0_f64;
     let mut confidence = 0.0_f64;
@@ -86,7 +86,6 @@ pub fn score_health(kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
     }
     if let QueryState::Success(ata) = &telemetry.ata {
         add_ata_evidence(
-            kind,
             ata,
             &mut score,
             &mut cap,
@@ -134,7 +133,6 @@ pub fn score_health(kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
 }
 
 fn add_ata_evidence(
-    kind: DiskKind,
     ata: &AtaHealth,
     score: &mut f64,
     cap: &mut f64,
@@ -143,6 +141,7 @@ fn add_ata_evidence(
     provenance: &mut Vec<String>,
 ) {
     let mut threshold_evidence = false;
+    let mut threshold_reached = false;
     let mut near_threshold = false;
     for attribute in &ata.attributes {
         let Some(threshold) = attribute.threshold.filter(|value| *value > 0) else {
@@ -152,7 +151,8 @@ fn add_ata_evidence(
         threshold_evidence = true;
         if attribute.current <= threshold {
             *cap = cap.min(20.0);
-            evidence.critical_failure = true;
+            threshold_reached = true;
+            evidence.critical_failure |= attribute.flags & 1 != 0;
             provenance.push(format!(
                 "ATA SMART attribute {} current {} reached declared threshold {}{}",
                 attribute.id,
@@ -175,7 +175,7 @@ fn add_ata_evidence(
     }
     if threshold_evidence {
         *confidence += 0.15;
-        if !near_threshold {
+        if !threshold_reached && !near_threshold {
             provenance
                 .push("ATA normalized currents remain above declared SMART thresholds".into());
         }
@@ -183,27 +183,6 @@ fn add_ata_evidence(
     if near_threshold {
         *score = score.min(70.0);
         *confidence += 0.10;
-    }
-
-    if kind == DiskKind::Hdd {
-        for id in [5, 197, 198] {
-            let Some((label, deduction)) = crate::ata::hdd_sector_signal(id) else {
-                continue;
-            };
-            let count = ata
-                .attributes
-                .iter()
-                .find(|attribute| attribute.id == id)
-                .and_then(|attribute| crate::ata::raw_u48(attribute.raw))
-                .unwrap_or(0);
-            if count > 0 {
-                let penalty = deduction * (1.0 + (count as f64).log10()).min(3.0);
-                *score -= penalty;
-                evidence.available = true;
-                *confidence += 0.10;
-                provenance.push(format!("ATA {label}: {count}"));
-            }
-        }
     }
 }
 
@@ -355,6 +334,38 @@ mod tests {
     }
 
     #[test]
+    fn old_age_endurance_threshold_reaches_zero_without_false_device_failure() {
+        let telemetry = Telemetry {
+            endurance_percent: Some(100.0),
+            overall_failure: QueryState::Success(false),
+            ata: QueryState::Success(AtaHealth {
+                attributes: vec![crate::model::AtaAttribute {
+                    id: 202,
+                    flags: 0,
+                    current: 0,
+                    worst: 0,
+                    threshold: Some(1),
+                    raw: [100, 0, 0, 0, 0, 0],
+                }],
+                thresholds_available: true,
+            }),
+            ..Default::default()
+        };
+        let result = score_health(DiskKind::Ssd, &telemetry);
+        assert_eq!(result.score, 0);
+        assert_eq!(result.outcome, HealthOutcome::Pass);
+        assert!(result.provenance.iter().any(|item| {
+            item.contains("attribute 202") && item.contains("reached declared threshold")
+        }));
+        assert!(
+            !result
+                .provenance
+                .iter()
+                .any(|item| { item.contains("currents remain above declared SMART thresholds") })
+        );
+    }
+
+    #[test]
     fn historical_worst_at_threshold_does_not_trip_a_current_passing_attribute() {
         let telemetry = Telemetry {
             ata: QueryState::Success(AtaHealth {
@@ -445,34 +456,8 @@ mod tests {
     }
 
     #[test]
-    fn standard_hdd_bad_sector_signals_reduce_score_but_not_ssd_vendor_raw() {
-        let telemetry = Telemetry {
-            ata: QueryState::Success(AtaHealth {
-                attributes: vec![crate::model::AtaAttribute {
-                    id: 5,
-                    flags: 0,
-                    current: 100,
-                    worst: 100,
-                    threshold: None,
-                    raw: [1, 0, 0, 0, 0, 0],
-                }],
-                thresholds_available: false,
-            }),
-            ..Default::default()
-        };
-        let hdd = score_health(DiskKind::Hdd, &telemetry);
-        let ssd = score_health(DiskKind::Ssd, &telemetry);
-        let unknown = score_health(DiskKind::Unknown, &telemetry);
-        assert_eq!(hdd.score, 88);
-        assert_eq!(hdd.outcome, HealthOutcome::Pass);
-        assert_eq!(ssd.score, 0);
-        assert_eq!(ssd.outcome, HealthOutcome::Unknown);
-        assert_eq!(unknown.outcome, HealthOutcome::Unknown);
-    }
-
-    #[test]
-    fn pending_and_uncorrectable_hdd_sector_signals_are_scored() {
-        for (id, expected) in [(197, 82), (198, 76)] {
+    fn unprofiled_hdd_raw_sector_ids_do_not_invent_health_semantics() {
+        for id in [5, 197, 198] {
             let telemetry = Telemetry {
                 ata: QueryState::Success(AtaHealth {
                     attributes: vec![crate::model::AtaAttribute {
@@ -487,7 +472,11 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            assert_eq!(score_health(DiskKind::Hdd, &telemetry).score, expected);
+            for kind in [DiskKind::Hdd, DiskKind::Ssd, DiskKind::Unknown] {
+                let result = score_health(kind, &telemetry);
+                assert_eq!(result.score, 0, "id {id}, kind {kind:?}");
+                assert_eq!(result.outcome, HealthOutcome::Unknown, "id {id}");
+            }
         }
     }
 }

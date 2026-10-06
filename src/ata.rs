@@ -12,7 +12,8 @@ pub(crate) struct ModelProfile {
 }
 
 /// Exact Crucial/Micron families from the upstream smartmontools drive DB,
-/// checked against Micron TN-FD-22: SMART 202 raw byte 0 is percent used.
+/// checked against Micron TN-FD-22: SMART 202's full 48-bit raw value is
+/// percent used.
 /// The normalized field is `max(100 - raw, 0)` and is not the used percent.
 pub(crate) fn profile(model: Option<&str>) -> Option<ModelProfile> {
     let model = model?.trim().to_ascii_uppercase();
@@ -96,7 +97,7 @@ fn is_optional_one_letter_suffix(suffix: &str) -> bool {
 
 pub(crate) fn endurance_used_percent(model: Option<&str>, id: u8, raw: [u8; 6]) -> Option<u8> {
     let profile = profile(model)?;
-    (id == profile.lifetime_used_attribute).then_some(raw[0].min(100))
+    (id == profile.lifetime_used_attribute).then(|| raw_u48(raw).min(100) as u8)
 }
 
 /// Short, user-facing Brazilian Portuguese labels for supported attributes.
@@ -104,12 +105,7 @@ pub(crate) fn attribute_name_pt_br(model: Option<&str>, id: u8) -> Option<&'stat
     if id == 202 {
         return profile(model).map(|profile| profile.lifetime_remaining_label_pt_br);
     }
-    match id {
-        5 => Some("Setores realocados"),
-        197 => Some("Setores pendentes"),
-        198 => Some("Setores incorrigíveis"),
-        _ => None,
-    }
+    None
 }
 
 #[allow(dead_code)] // Exposed for the UI's raw-value column when it is rendered.
@@ -120,19 +116,8 @@ pub(crate) fn raw_attribute_name_pt_br(model: Option<&str>, id: u8) -> Option<&'
     attribute_name_pt_br(model, id)
 }
 
-pub(crate) fn raw_u48(raw: [u8; 6]) -> Option<u64> {
-    Some(u64::from_le_bytes([
-        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], 0, 0,
-    ]))
-}
-
-pub(crate) fn hdd_sector_signal(id: u8) -> Option<(&'static str, f64)> {
-    match id {
-        5 => Some(("reallocated sectors", 12.0)),
-        197 => Some(("pending sectors", 18.0)),
-        198 => Some(("offline uncorrectable sectors", 24.0)),
-        _ => None,
-    }
+pub(crate) fn raw_u48(raw: [u8; 6]) -> u64 {
+    u64::from_le_bytes([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], 0, 0])
 }
 
 #[cfg(test)]
@@ -140,15 +125,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_documented_hdd_sector_signals_are_mapped() {
-        assert_eq!(hdd_sector_signal(5), Some(("reallocated sectors", 12.0)));
-        assert_eq!(hdd_sector_signal(197), Some(("pending sectors", 18.0)));
-        assert_eq!(
-            hdd_sector_signal(198),
-            Some(("offline uncorrectable sectors", 24.0))
-        );
-        assert_eq!(hdd_sector_signal(177), None);
-        assert_eq!(hdd_sector_signal(202), None);
+    fn raw_hdd_ids_are_unlabeled_without_a_model_profile() {
+        for id in [5, 9, 177, 194, 197, 198, 202] {
+            assert_eq!(attribute_name_pt_br(Some("MacroVIP MV240GB"), id), None);
+            assert_eq!(raw_attribute_name_pt_br(Some("MacroVIP MV240GB"), id), None);
+        }
     }
 
     #[test]
@@ -197,6 +178,13 @@ mod tests {
         assert_eq!(profile(Some("Samsung SSD 870 EVO")), None);
         assert_eq!(
             endurance_used_percent(Some("CT250MX500SSD1"), 202, [255; 6]),
+            Some(100)
+        );
+        // Raw is a 48-bit little-endian value; using only byte 0 would
+        // misread 256 percent used as zero and report a perfect drive.
+        assert_eq!(raw_u48([0, 1, 0, 0, 0, 0]), 256);
+        assert_eq!(
+            endurance_used_percent(Some("CT250MX500SSD1"), 202, [0, 1, 0, 0, 0, 0]),
             Some(100)
         );
         assert_eq!(
