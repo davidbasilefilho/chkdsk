@@ -787,11 +787,12 @@ mod windows {
         if returned < 16 + 512 || output.len() < 16 + 512 || get_u32(output, 0).unwrap_or(0) < 512 {
             return Err(AtaCommandError::ShortResponse);
         }
+        // DRIVERSTATUS.bDriverError reports command/driver failure. bIDEError
+        // is only the ATA IDE Error register and is not an ATA Status register.
         let driver_error = output[4];
-        let status = output[5];
-        if driver_error != 0 || status & (ATA_STATUS_ERR | ATA_STATUS_DF) != 0 {
+        if driver_error != 0 {
             return Err(AtaCommandError::Device {
-                status,
+                status: 0,
                 error: driver_error,
             });
         }
@@ -1035,9 +1036,12 @@ mod windows {
         }
 
         #[test]
-        fn legacy_smart_response_rejects_partial_and_device_error_status() {
+        fn legacy_smart_response_uses_driver_error_not_ide_error_as_status() {
             let mut output = [0u8; 16 + 512];
             put_u32(&mut output, 0, 512);
+            // These bits overlap ATA status ERR/DF, but here byte 5 is
+            // DRIVERSTATUS.bIDEError, diagnostic data only.
+            output[5] = ATA_STATUS_ERR | ATA_STATUS_DF;
             assert_eq!(
                 legacy_smart_response(&output, output.len()).unwrap().len(),
                 512
@@ -1047,11 +1051,10 @@ mod windows {
                 Err(AtaCommandError::ShortResponse)
             );
             output[4] = 0x04;
-            output[5] = ATA_STATUS_ERR;
             assert_eq!(
                 legacy_smart_response(&output, output.len()),
                 Err(AtaCommandError::Device {
-                    status: ATA_STATUS_ERR,
+                    status: 0,
                     error: 0x04,
                 })
             );
