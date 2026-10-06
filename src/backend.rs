@@ -597,6 +597,7 @@ mod windows {
             error: u8,
         },
         InvalidSmartData(String),
+        InvalidSmartThresholds(String),
         FallbackFailed {
             primary: Box<AtaCommandError>,
             legacy: Box<AtaCommandError>,
@@ -610,6 +611,7 @@ mod windows {
                 Self::ShortResponse => 13,
                 Self::Device { .. } => 31,
                 Self::InvalidSmartData(_) => 13,
+                Self::InvalidSmartThresholds(_) => 13,
                 Self::FallbackFailed { primary, legacy } => {
                     if classify(primary.code()) == QueryErrorState::Permission {
                         primary.code()
@@ -629,6 +631,9 @@ mod windows {
                 }
                 Self::InvalidSmartData(reason) => {
                     format!("ATA SMART READ DATA was malformed: {reason}")
+                }
+                Self::InvalidSmartThresholds(reason) => {
+                    format!("ATA SMART READ THRESHOLDS was malformed: {reason}")
                 }
                 Self::FallbackFailed { primary, legacy } => format!(
                     "ATA pass-through failed: {}; SMART_RCV_DRIVE_DATA fallback failed: {}",
@@ -835,22 +840,6 @@ mod windows {
         Ok(&output[16..16 + 512])
     }
 
-    fn ata_data_sector(
-        pass_through: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
-        legacy: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
-    ) -> Result<Vec<u8>, AtaCommandError> {
-        match pass_through() {
-            Ok(sector) => Ok(sector),
-            Err(primary) => match legacy() {
-                Ok(sector) => Ok(sector),
-                Err(legacy) => Err(AtaCommandError::FallbackFailed {
-                    primary: Box::new(primary),
-                    legacy: Box::new(legacy),
-                }),
-            },
-        }
-    }
-
     fn ata_data_sector_validated(
         pass_through: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
         legacy: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
@@ -887,6 +876,26 @@ mod windows {
         Ok(())
     }
 
+    fn validate_ata_smart_thresholds_sector(sector: &[u8]) -> Result<(), AtaCommandError> {
+        // Parse into a throwaway value before selecting the pass-through
+        // response. Duplicate IDs or a bad checksum must permit the existing
+        // legacy IOCTL to retry, without mutating the valid READ DATA result.
+        let mut scratch = crate::model::AtaHealth::default();
+        parse::apply_ata_smart_thresholds(&mut scratch, sector)
+            .map_err(|error| AtaCommandError::InvalidSmartThresholds(error.to_string()))
+    }
+
+    fn read_ata_smart_thresholds_with(
+        health: &mut crate::model::AtaHealth,
+        pass_through: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
+        legacy: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
+    ) -> Result<(), AtaCommandError> {
+        let sector =
+            ata_data_sector_validated(pass_through, legacy, validate_ata_smart_thresholds_sector)?;
+        parse::apply_ata_smart_thresholds(health, &sector)
+            .map_err(|error| AtaCommandError::InvalidSmartThresholds(error.to_string()))
+    }
+
     fn ata_health(device: &Device) -> Result<crate::model::AtaHealth, AtaCommandError> {
         let sector = ata_data_sector_validated(
             || {
@@ -899,17 +908,14 @@ mod windows {
         let mut health = parse::parse_ata_smart_data(&sector)
             .map_err(|error| AtaCommandError::InvalidSmartData(error.to_string()))?;
 
-        if let Ok(thresholds) = ata_data_sector(
+        let _ = read_ata_smart_thresholds_with(
+            &mut health,
             || {
                 ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_THRESHOLDS, true)
                     .map(|(sector, _)| sector)
             },
             || legacy_smart_sector(device, ATA_SMART_READ_THRESHOLDS),
-        ) {
-            // Thresholds are optional evidence: malformed/unavailable threshold
-            // data must not invalidate a checksummed READ DATA sector.
-            let _ = parse::apply_ata_smart_thresholds(&mut health, &thresholds);
-        }
+        ); // Optional failure must not invalidate a checksummed READ DATA sector.
         Ok(health)
     }
 
@@ -1071,31 +1077,6 @@ mod windows {
             );
         }
 
-        #[test]
-        fn ata_read_data_fallback_is_used_only_after_pass_through_fails() {
-            let fallback = ata_data_sector(
-                || Ok(vec![1]),
-                || panic!("legacy fallback must not run on pass-through success"),
-            )
-            .unwrap();
-            assert_eq!(fallback, [1]);
-
-            let fallback = ata_data_sector(|| Err(AtaCommandError::Io(5)), || Ok(vec![2])).unwrap();
-            assert_eq!(fallback, [2]);
-
-            let error = ata_data_sector(
-                || Err(AtaCommandError::Io(5)),
-                || Err(AtaCommandError::Io(1)),
-            )
-            .unwrap_err();
-            assert_eq!(error.code(), 5, "preserve permission precedence");
-            let message = error.message();
-            assert!(message.contains("pass-through failed"));
-            assert!(message.contains("SMART_RCV_DRIVE_DATA fallback failed"));
-            assert!(message.contains(&io::Error::from_raw_os_error(5).to_string()));
-            assert!(message.contains(&io::Error::from_raw_os_error(1).to_string()));
-        }
-
         fn finish_smart_checksum(sector: &mut [u8; 512]) {
             sector[511] = 0;
             sector[511] = 0u8.wrapping_sub(
@@ -1112,9 +1093,28 @@ mod windows {
             sector.to_vec()
         }
 
+        fn smart_threshold_sector(entries: &[(u8, u8)]) -> Vec<u8> {
+            let mut sector = [0u8; 512];
+            for (slot, (id, threshold)) in entries.iter().copied().enumerate() {
+                let offset = 2 + slot * 12;
+                sector[offset] = id;
+                sector[offset + 1] = threshold;
+            }
+            finish_smart_checksum(&mut sector);
+            sector.to_vec()
+        }
+
         #[test]
         fn malformed_pass_through_sector_retries_legacy_and_preserves_both_errors_if_needed() {
             let valid = valid_smart_data_sector();
+            let io_fallback = ata_data_sector_validated(
+                || Err(AtaCommandError::Io(5)),
+                || Ok(valid.clone()),
+                validate_ata_smart_data_sector,
+            )
+            .unwrap();
+            assert_eq!(io_fallback, valid);
+
             let mut bad_checksum = valid.clone();
             bad_checksum[511] ^= 1;
             let read = ata_data_sector_validated(
@@ -1145,6 +1145,91 @@ mod windows {
             assert!(message.contains("expected 512-byte sector, got 511"));
             assert!(message.contains("valid sector contains no SMART attributes"));
             assert_eq!(error.code(), 13);
+        }
+
+        #[test]
+        fn malformed_pass_through_threshold_page_retries_legacy_and_joins_valid_thresholds() {
+            let valid_legacy = smart_threshold_sector(&[(197, 10)]);
+            let mut bad_pass = valid_legacy.clone();
+            bad_pass[511] ^= 1;
+            let mut legacy_called = false;
+            let mut health = crate::model::AtaHealth {
+                attributes: vec![crate::model::AtaAttribute {
+                    id: 197,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    threshold: None,
+                    raw: [0; 6],
+                }],
+                thresholds_available: false,
+            };
+            read_ata_smart_thresholds_with(
+                &mut health,
+                || Ok(bad_pass),
+                || {
+                    legacy_called = true;
+                    Ok(valid_legacy.clone())
+                },
+            )
+            .unwrap();
+            assert!(legacy_called);
+            assert!(health.thresholds_available);
+            assert_eq!(health.attributes[0].threshold, Some(10));
+        }
+
+        #[test]
+        fn valid_pass_through_threshold_page_skips_legacy_and_both_invalid_leave_read_data_usable()
+        {
+            let valid = smart_threshold_sector(&[(197, 10)]);
+            let mut threshold_health = crate::model::AtaHealth {
+                attributes: vec![crate::model::AtaAttribute {
+                    id: 197,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    threshold: None,
+                    raw: [0; 6],
+                }],
+                thresholds_available: false,
+            };
+            read_ata_smart_thresholds_with(
+                &mut threshold_health,
+                || Ok(valid.clone()),
+                || panic!("valid pass-through threshold page must not use legacy"),
+            )
+            .unwrap();
+            assert_eq!(threshold_health.attributes[0].threshold, Some(10));
+
+            let mut bad_checksum = smart_threshold_sector(&[(197, 10)]);
+            bad_checksum[511] ^= 1;
+            let duplicate = smart_threshold_sector(&[(197, 10), (197, 5)]);
+            let mut read_data = crate::model::AtaHealth {
+                attributes: vec![crate::model::AtaAttribute {
+                    id: 197,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    threshold: None,
+                    raw: [1, 0, 0, 0, 0, 0],
+                }],
+                thresholds_available: false,
+            };
+            let original_read_data = read_data.clone();
+            let error = read_ata_smart_thresholds_with(
+                &mut read_data,
+                || Ok(bad_checksum),
+                || Ok(duplicate),
+            )
+            .unwrap_err();
+            let message = error.message();
+            assert!(message.contains("pass-through failed"));
+            assert!(message.contains("SMART_RCV_DRIVE_DATA fallback failed"));
+            assert!(message.contains("ATA SMART READ THRESHOLDS was malformed"));
+            assert!(message.contains("ATA SMART data checksum is invalid"));
+            assert!(message.contains("duplicate ATA SMART threshold ID"));
+            assert_eq!(read_data, original_read_data);
+            assert!(!read_data.thresholds_available);
         }
 
         #[test]
