@@ -6,7 +6,14 @@ on:
     tags-ignore: ["**"]
 
 jobs:
+  validation:
+    uses: ./.github/workflows/validation.yml
+    permissions:
+      contents: read
+
   build:
+    needs: validation
+    if: ${{ needs.validation.result == 'success' }}
     runs-on: windows-2022
     permissions:
       contents: read
@@ -27,7 +34,8 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [validation, build]
+    if: ${{ needs.validation.result == 'success' && needs.build.result == 'success' }}
     runs-on: windows-2022
     permissions:
       contents: write

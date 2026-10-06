@@ -761,7 +761,9 @@ mod windows {
     }
 
     fn legacy_smart_input(feature: u8) -> [u8; 32] {
-        // SENDCMDINPARAMS ends immediately before its one-byte trailing buffer.
+        // WDK packs SENDCMDINPARAMS to 33 bytes; sizeof - 1 is this 32-byte input.
+        // Its bDriveNumber field is opaque and ignored by Windows; the caller's
+        // handle, opened from this disk's interface path, selects the device.
         let mut input = [0u8; 32];
         put_u32(&mut input, 0, 512);
         input[4] = feature;
@@ -774,13 +776,23 @@ mod windows {
         input
     }
 
-    fn legacy_smart_sector(device: &Device, feature: u8) -> Result<Vec<u8>, AtaCommandError> {
-        // The 16-byte SENDCMDOUTPARAMS fixed header is followed by one sector.
+    fn legacy_smart_sector_with<T>(
+        device: &T,
+        feature: u8,
+        send: impl FnOnce(&T, u32, &[u8], &mut [u8]) -> Result<usize, u32>,
+    ) -> Result<Vec<u8>, AtaCommandError> {
+        // The packed 16-byte SENDCMDOUTPARAMS header is followed by one sector.
         let input = legacy_smart_input(feature);
         let mut output = [0u8; 16 + 512];
-        let returned = ioctl(device, IOCTL_SMART_RCV_DRIVE_DATA, &input, &mut output)
+        let returned = send(device, IOCTL_SMART_RCV_DRIVE_DATA, &input, &mut output)
             .map_err(AtaCommandError::Io)?;
         legacy_smart_response(&output, returned).map(|sector| sector.to_vec())
+    }
+
+    fn legacy_smart_sector(device: &Device, feature: u8) -> Result<Vec<u8>, AtaCommandError> {
+        legacy_smart_sector_with(device, feature, |device, code, input, output| {
+            ioctl(device, code, input, output)
+        })
     }
 
     fn legacy_smart_response(output: &[u8], returned: usize) -> Result<&[u8], AtaCommandError> {
@@ -1032,7 +1044,41 @@ mod windows {
                         0
                     ]
                 );
+                assert_eq!(input[12], 0, "bDriveNumber is opaque and unused");
             }
+        }
+
+        #[test]
+        fn legacy_smart_request_uses_selected_interface_handle_not_disk_ordinal() {
+            let identity = DiskIdentity {
+                id: r"interface:\\?\usbstor#disk&ven_example&prod_drive#physical42".into(),
+                index: 42,
+                model: None,
+                serial: Some("physical42".into()),
+                firmware: None,
+                capacity_bytes: None,
+                bus: None,
+                kind: DiskKind::Unknown,
+            };
+            let selected_interface = interface_path(&identity).unwrap().to_owned();
+
+            let sector = legacy_smart_sector_with(
+                &selected_interface,
+                ATA_SMART_READ_DATA,
+                |handle, code, input, output| {
+                    assert_eq!(handle, &selected_interface);
+                    assert_eq!(code, IOCTL_SMART_RCV_DRIVE_DATA);
+                    assert_eq!(input.len(), 32);
+                    assert_eq!(output.len(), 16 + 512);
+                    assert_eq!(input[12], 0, "the OS selects the target from the handle");
+                    put_u32(output, 0, 512);
+                    output[16..].fill(0x42);
+                    Ok(output.len())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(sector, vec![0x42; 512]);
         }
 
         #[test]
