@@ -607,7 +607,7 @@ impl App for DashboardApp {
                         let kind = effective_disk_kind(&disk.identity, &telemetry);
                         let score = score_health(kind, &telemetry);
                         let (issue_keys, details, severity) =
-                            health_notification_snapshot(&score, &telemetry);
+                            health_notification_snapshot(kind, &score, &telemetry);
                         health_notice = Some((
                             disk.identity.id.clone(),
                             disk_label(&disk.identity),
@@ -2110,15 +2110,12 @@ fn health_detail_messages(
 }
 
 fn health_notification_snapshot(
+    kind: DiskKind,
     health: &crate::health::HealthScore,
     telemetry: &Telemetry,
 ) -> (HashSet<String>, Vec<String>, NotificationSeverity) {
     let basic_smart = is_basic_smart_pass(health);
-    let status = telemetry_status(telemetry);
-    let status_is_warning = !matches!(
-        status,
-        "Dados SMART disponíveis" | "Sem falha geral relatada pelo dispositivo"
-    );
+    let telemetry_issue = relevant_telemetry_issue(kind, telemetry);
     let mut keys = health
         .warnings
         .iter()
@@ -2136,8 +2133,8 @@ fn health_notification_snapshot(
     if basic_smart {
         keys.insert("basic-smart".into());
     }
-    if status_is_warning {
-        keys.insert(format!("telemetry-status:{status}"));
+    if let Some(issue) = telemetry_issue {
+        keys.insert(format!("telemetry-status:{issue}"));
     }
 
     let mut details = health_detail_messages(health, telemetry)
@@ -2147,8 +2144,10 @@ fn health_notification_snapshot(
     if basic_smart {
         details.push("Leitura SMART básica; o escore tem baixa confiança".into());
     }
-    if status_is_warning && !details.iter().any(|message| message == status) {
-        details.push(status.into());
+    if let Some(issue) = telemetry_issue
+        && !details.iter().any(|message| message == issue)
+    {
+        details.push(issue.into());
     }
     if details.is_empty() && health.score <= 50 && health.outcome == HealthOutcome::Pass {
         details.push(format!("Saúde em nível reduzido ({}%)", health.score));
@@ -2179,7 +2178,9 @@ fn ata_threshold_messages(telemetry: &Telemetry, near: bool) -> Option<Vec<Strin
         .attributes
         .iter()
         .filter_map(|attribute| {
-            if !(1..=254).contains(&attribute.current) {
+            if crate::ata::unique_attribute(ata, attribute.id).is_none()
+                || !(1..=254).contains(&attribute.current)
+            {
                 return None;
             }
             let threshold = attribute.threshold.filter(|value| *value > 0)?;
@@ -2204,6 +2205,75 @@ fn ata_threshold_messages(telemetry: &Telemetry, near: bool) -> Option<Vec<Strin
         })
         .collect::<Vec<_>>();
     (!messages.is_empty()).then_some(messages)
+}
+
+fn relevant_telemetry_issue(kind: DiskKind, telemetry: &Telemetry) -> Option<&'static str> {
+    let issue = match kind {
+        DiskKind::Nvme => query_state_issue(&telemetry.nvme),
+        DiskKind::Hdd | DiskKind::Ssd => query_state_issue(&telemetry.ata),
+        DiskKind::Unknown if matches!(&telemetry.nvme, QueryState::Success(_)) => {
+            query_state_issue(&telemetry.nvme)
+        }
+        DiskKind::Unknown if matches!(&telemetry.ata, QueryState::Success(ata) if !ata.attributes.is_empty()) => {
+            query_state_issue(&telemetry.ata)
+        }
+        DiskKind::Unknown => None,
+    };
+
+    if issue.is_some() {
+        return issue;
+    }
+
+    // The overall-failure query is an optional coarse signal. Its unsupported
+    // state is expected on some drivers; actual errors remain visible.
+    let coarse_issue = match &telemetry.overall_failure {
+        QueryState::Failed { message } if is_permission_error(message) => {
+            Some("Permissão insuficiente para consultar o status geral de saúde")
+        }
+        QueryState::Failed { .. } => Some("Falha ao consultar o status geral de saúde"),
+        QueryState::NotQueried | QueryState::Unsupported | QueryState::Success(_) => None,
+    };
+    if coarse_issue.is_some() {
+        return coarse_issue;
+    }
+
+    if kind == DiskKind::Unknown
+        && !matches!(&telemetry.nvme, QueryState::Success(_))
+        && !matches!(&telemetry.ata, QueryState::Success(ata) if !ata.attributes.is_empty())
+    {
+        if failed_permission(&telemetry.nvme) || failed_permission(&telemetry.ata) {
+            return Some("Permissão insuficiente para consultar os dados de saúde");
+        }
+        if matches!(&telemetry.nvme, QueryState::Failed { .. })
+            || matches!(&telemetry.ata, QueryState::Failed { .. })
+        {
+            return Some("Falha ao consultar os dados de saúde do dispositivo");
+        }
+        if matches!(&telemetry.nvme, QueryState::Unsupported)
+            && matches!(&telemetry.ata, QueryState::Unsupported)
+        {
+            return Some("Leitura de saúde não compatível com o dispositivo");
+        }
+        if matches!(&telemetry.nvme, QueryState::NotQueried)
+            || matches!(&telemetry.ata, QueryState::NotQueried)
+        {
+            return Some("Dados de saúde indisponíveis");
+        }
+    }
+
+    None
+}
+
+fn query_state_issue<T>(state: &QueryState<T>) -> Option<&'static str> {
+    match state {
+        QueryState::NotQueried => Some("Dados do protocolo de saúde não consultados"),
+        QueryState::Unsupported => Some("Leitura de saúde não compatível com o protocolo esperado"),
+        QueryState::Failed { message } if is_permission_error(message.as_str()) => {
+            Some("Permissão insuficiente para a consulta de saúde relevante")
+        }
+        QueryState::Failed { .. } => Some("Falha ao consultar a telemetria de saúde relevante"),
+        QueryState::Success(_) => None,
+    }
 }
 
 fn telemetry_has_usable_data(telemetry: &Telemetry) -> bool {
@@ -3083,6 +3153,7 @@ mod tests {
         hdd_identity.bus = Some("SATA".into());
         hdd_identity.kind = DiskKind::Hdd;
         let (_, hdd_details, hdd_severity) = health_notification_snapshot(
+            DiskKind::Hdd,
             &score_health(DiskKind::Hdd, &hdd_telemetry),
             &hdd_telemetry,
         );
@@ -5029,6 +5100,12 @@ mod tests {
             telemetry_status(&telemetry),
             "Dados de saúde parcialmente disponíveis"
         );
+        let health = score_health(DiskKind::Hdd, &telemetry);
+        let (keys, _, _) = health_notification_snapshot(DiskKind::Hdd, &health, &telemetry);
+        assert!(
+            !keys.iter().any(|key| key.starts_with("telemetry-status:")),
+            "expected unsupported sibling protocol must not be a notification: {keys:?}"
+        );
 
         let no_data = Telemetry {
             nvme: QueryState::Unsupported,
@@ -5048,6 +5125,119 @@ mod tests {
             telemetry_status(&empty_success),
             "Leitura SMART não compatível"
         );
+    }
+
+    #[test]
+    fn expected_unsupported_sibling_protocols_do_not_alert_healthy_disks() {
+        let hdd_telemetry = Telemetry {
+            nvme: QueryState::Unsupported,
+            ata: QueryState::Success(crate::model::AtaHealth {
+                attributes: [5, 10, 187, 197, 198]
+                    .into_iter()
+                    .map(|id| crate::model::AtaAttribute {
+                        id,
+                        flags: 0,
+                        current: 100,
+                        worst: 100,
+                        threshold: None,
+                        raw: [0; 6],
+                    })
+                    .collect(),
+                thresholds_available: false,
+            }),
+            ata_profile: Some(crate::ata::WD10EZEX_PROFILE.to_owned()),
+            overall_failure: QueryState::Success(false),
+            ..Default::default()
+        };
+        let nvme_telemetry = Telemetry {
+            nvme: QueryState::Success(crate::model::NvmeHealth {
+                percentage_used: Some(10),
+                ..Default::default()
+            }),
+            ata: QueryState::Unsupported,
+            overall_failure: QueryState::Success(false),
+            ..Default::default()
+        };
+
+        for (kind, telemetry) in [
+            (DiskKind::Hdd, hdd_telemetry),
+            (DiskKind::Nvme, nvme_telemetry),
+        ] {
+            let health = score_health(kind, &telemetry);
+            assert_eq!(health.outcome, HealthOutcome::Pass, "{kind:?}");
+            let (keys, _, severity) = health_notification_snapshot(kind, &health, &telemetry);
+            assert!(keys.is_empty(), "{kind:?}: {keys:?}");
+            assert_eq!(severity, NotificationSeverity::Info, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn failed_relevant_protocol_warns_even_when_another_protocol_succeeds() {
+        let telemetry = Telemetry {
+            ata: QueryState::Failed {
+                message: "device query failed".into(),
+            },
+            nvme: QueryState::Success(crate::model::NvmeHealth {
+                percentage_used: Some(10),
+                ..Default::default()
+            }),
+            overall_failure: QueryState::Success(false),
+            ..Default::default()
+        };
+        let health = score_health(DiskKind::Hdd, &telemetry);
+        let (keys, details, severity) =
+            health_notification_snapshot(DiskKind::Hdd, &health, &telemetry);
+        assert!(
+            keys.contains("telemetry-status:Falha ao consultar a telemetria de saúde relevante")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| { detail == "Falha ao consultar a telemetria de saúde relevante" })
+        );
+        assert_eq!(severity, NotificationSeverity::Warning);
+    }
+
+    #[test]
+    fn threshold_warning_details_ignore_ambiguous_duplicate_attribute_ids() {
+        let telemetry = Telemetry {
+            ata: QueryState::Success(crate::model::AtaHealth {
+                attributes: vec![
+                    crate::model::AtaAttribute {
+                        id: 5,
+                        flags: 0,
+                        current: 105,
+                        worst: 105,
+                        threshold: Some(100),
+                        raw: [0; 6],
+                    },
+                    crate::model::AtaAttribute {
+                        id: 197,
+                        flags: 0,
+                        current: 5,
+                        worst: 5,
+                        threshold: Some(10),
+                        raw: [0; 6],
+                    },
+                    crate::model::AtaAttribute {
+                        id: 197,
+                        flags: 0,
+                        current: 6,
+                        worst: 6,
+                        threshold: Some(10),
+                        raw: [0; 6],
+                    },
+                ],
+                thresholds_available: true,
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ata_threshold_messages(&telemetry, true).unwrap(),
+            vec!["SMART ATA próximo do limite: atributo 5 (105/100)".to_owned()]
+        );
+        assert!(ata_threshold_messages(&telemetry, false).is_none());
     }
 
     #[test]
@@ -5552,7 +5742,8 @@ mod tests {
                 .warnings
                 .contains(&HealthWarningReason::AtaRawEncodingAmbiguous)
         );
-        let (_, details, severity) = health_notification_snapshot(&health, &telemetry);
+        let (_, details, severity) =
+            health_notification_snapshot(DiskKind::Hdd, &health, &telemetry);
         assert_eq!(severity, NotificationSeverity::Warning);
         assert!(
             details
