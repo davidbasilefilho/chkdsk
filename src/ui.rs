@@ -1948,11 +1948,16 @@ fn render_disk(
     let _ = frame;
 }
 
-/// A verified ATA SSD profile with measured wear can fill a missing media kind.
-/// Never override an explicit HDD classification or infer SSD from an opaque ID.
+/// A valid NVMe log or verified ATA SSD wear profile can fill a missing kind.
+/// Preserve explicit discovery classifications; failed probes are not evidence.
 fn effective_disk_kind(identity: &DiskIdentity, telemetry: &Telemetry) -> DiskKind {
-    if identity.kind == DiskKind::Unknown
-        && telemetry.endurance_percent.is_some()
+    if identity.kind != DiskKind::Unknown {
+        return identity.kind;
+    }
+    if matches!(telemetry.nvme, QueryState::Success(_)) {
+        return DiskKind::Nvme;
+    }
+    if telemetry.endurance_percent.is_some()
         && matches!(telemetry.ata, QueryState::Success(_))
         && crate::ata::profile(identity.model.as_deref())
             .is_some_and(|profile| telemetry.ata_profile.as_deref() == Some(profile.family))
@@ -3840,6 +3845,123 @@ mod tests {
             health_detail_messages(&health, &telemetry),
             vec![("Falha geral reportada pelo dispositivo".into(), TOKYO_RED)]
         );
+    }
+
+    #[test]
+    fn nvme_log_restores_unknown_kind_without_requiring_optional_wear() {
+        let mut disk_identity = identity("nvme-partial", 0);
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_nvme(crate::model::NvmeHealth::default());
+        assert_eq!(telemetry.endurance_percent, None);
+        assert_eq!(
+            effective_disk_kind(&disk_identity, &telemetry),
+            DiskKind::Nvme
+        );
+        let mut history = History::default();
+        history
+            .record(HealthSample {
+                disk_id: disk_identity.id.clone(),
+                timestamp_unix_secs: 1_000,
+                kind: effective_disk_kind(&disk_identity, &telemetry),
+                endurance_percent: telemetry.endurance_percent,
+                power_on_hours: telemetry.power_on_hours,
+                score: None,
+            })
+            .unwrap();
+        assert_eq!(history.samples[0].endurance_percent, None);
+        assert_eq!(history.estimate_endurance(&disk_identity.id), None);
+
+        for kind in [DiskKind::Hdd, DiskKind::Ssd, DiskKind::Nvme] {
+            disk_identity.kind = kind;
+            assert_eq!(effective_disk_kind(&disk_identity, &telemetry), kind);
+        }
+        disk_identity.kind = DiskKind::Unknown;
+        for state in [
+            QueryState::NotQueried,
+            QueryState::Unsupported,
+            QueryState::Failed {
+                message: "invalid NVMe log".into(),
+            },
+        ] {
+            telemetry.nvme = state;
+            // Common wear alone does not establish the protocol or media kind.
+            telemetry.endurance_percent = Some(12.0);
+            assert_eq!(
+                effective_disk_kind(&disk_identity, &telemetry),
+                DiskKind::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn nvme_query_restores_unknown_kind_history_and_rendered_eta() {
+        let disk_identity = identity("nvme-fallback", 0);
+        assert_eq!(disk_identity.kind, DiskKind::Unknown);
+        assert_eq!(disk_identity.bus, None);
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_nvme(crate::model::NvmeHealth {
+            percentage_used: Some(12),
+            ..Default::default()
+        });
+        let mut app = DashboardApp {
+            started: true,
+            ..Default::default()
+        };
+        let mut global = test_global_data(
+            Dashboard {
+                disks: vec![DiskView {
+                    identity: disk_identity.clone(),
+                    telemetry: None,
+                    querying: false,
+                    computing: true,
+                    pending_telemetry: Some(telemetry),
+                    error_message: None,
+                }],
+                ..Default::default()
+            },
+            100,
+            28,
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        global
+            .state
+            .history
+            .record(HealthSample {
+                disk_id: disk_identity.id.clone(),
+                timestamp_unix_secs: now - 86_400,
+                kind: DiskKind::Nvme,
+                endurance_percent: Some(11.0),
+                power_on_hours: None,
+                score: Some(89),
+            })
+            .unwrap();
+        dispatch_signal(
+            &mut app,
+            &mut global,
+            AppSignal::ComputeFinished {
+                generation: 0,
+                disk_id: disk_identity.id.clone(),
+            },
+        );
+        let sample = global.state.history.samples.last().unwrap();
+        assert_eq!(sample.kind, DiskKind::Nvme);
+        assert_eq!(sample.score, Some(88));
+        assert_eq!(sample.endurance_percent, Some(12.0));
+        assert!(
+            global
+                .state
+                .history
+                .estimate_endurance(&disk_identity.id)
+                .is_some()
+        );
+        let rendered = rendered_text(&mut app, &mut global);
+        assert!(rendered.contains("88%"), "{rendered}");
+        assert!(rendered.contains("ETA restante"), "{rendered}");
+        // Discovery identity stays stable for scheduler/hotplug comparisons.
+        assert_eq!(global.state.disks[0].identity, disk_identity);
     }
 
     #[test]
