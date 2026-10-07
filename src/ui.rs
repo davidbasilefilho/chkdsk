@@ -26,6 +26,9 @@ use tokio::{
     time::{Duration, MissedTickBehavior},
 };
 
+mod presentation;
+use presentation::{disk_detail_lines, render_disk_summary, render_panel};
+
 const TOKYO_BG: RgbValue = RgbValue {
     red: 34,
     green: 36,
@@ -119,6 +122,7 @@ enum NotificationSeverity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Notification {
     generation: u64,
+    owner: Option<String>,
     disk_id: Option<String>,
     title: String,
     details: Vec<String>,
@@ -136,12 +140,14 @@ pub struct Dashboard {
     pub notice: Option<String>,
     notifications: VecDeque<Notification>,
     notifications_open: bool,
+    details_open: bool,
     notification_scroll: usize,
     last_issue_keys: HashMap<String, HashSet<String>>,
     inventory_initialized: bool,
     toast_was_active: bool,
     pub history: History,
     pub generation: u64,
+    collection_generation: u64,
     pub frame: usize,
 }
 
@@ -153,7 +159,7 @@ fn active_notification(state: &Dashboard, now: Instant) -> Option<&Notification>
         .notifications
         .iter()
         .rev()
-        .find(|notice| notice.generation == state.generation && notice.expires_at > now)
+        .find(|notice| notice.generation == state.collection_generation && notice.expires_at > now)
 }
 
 fn push_notification(
@@ -165,7 +171,8 @@ fn push_notification(
     now: Instant,
 ) {
     state.notifications.push_back(Notification {
-        generation: state.generation,
+        generation: state.collection_generation,
+        owner: None,
         disk_id,
         title,
         details,
@@ -180,9 +187,43 @@ fn push_notification(
 
 fn reset_notifications_for_generation(state: &mut Dashboard) {
     state.notifications.clear();
-    state.last_issue_keys.clear();
     state.notification_scroll = 0;
-    state.notifications_open = false;
+    state.toast_was_active = false;
+}
+
+/// Notification collection epochs are independent of topology epochs: a slow
+/// query for an unchanged device must not be starved by the 15-second poll.
+fn begin_notification_collection(state: &mut Dashboard) {
+    state.collection_generation = state.collection_generation.saturating_add(1);
+    reset_notifications_for_generation(state);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_current_notice(
+    state: &mut Dashboard,
+    owner: &str,
+    disk_id: Option<String>,
+    title: String,
+    details: Vec<String>,
+    severity: NotificationSeverity,
+    changed: bool,
+) {
+    let previous_expiry = state
+        .notifications
+        .iter()
+        .find(|n| n.owner.as_deref() == Some(owner))
+        .map(|n| n.expires_at);
+    state
+        .notifications
+        .retain(|n| n.owner.as_deref() != Some(owner));
+    let now = Instant::now();
+    push_notification(state, disk_id, title, details, severity, now);
+    if let Some(notice) = state.notifications.back_mut() {
+        notice.owner = Some(owner.to_owned());
+        if !changed {
+            notice.expires_at = previous_expiry.unwrap_or(now);
+        }
+    }
 }
 
 fn disk_label(identity: &DiskIdentity) -> String {
@@ -278,8 +319,11 @@ impl App for DashboardApp {
                 Key::Character('q') => {
                     return Ok(EventPropagation::ExitMainEventLoop);
                 }
-                Key::SpecialKey(SpecialKey::Esc) if state.notifications_open => {
+                Key::SpecialKey(SpecialKey::Esc)
+                    if state.notifications_open || state.details_open =>
+                {
                     state.notifications_open = false;
+                    state.details_open = false;
                     return Ok(EventPropagation::ConsumedRender);
                 }
                 Key::SpecialKey(SpecialKey::Esc) => {
@@ -287,6 +331,11 @@ impl App for DashboardApp {
                 }
                 Key::Character('n') => {
                     toggle_notification_center(state);
+                }
+                Key::Character('d') => {
+                    state.details_open = !state.details_open;
+                    state.notifications_open = false;
+                    state.content_scroll = 0;
                 }
                 Key::SpecialKey(SpecialKey::Left) | Key::SpecialKey(SpecialKey::BackTab) => {
                     apply_footer_action(state, FooterAction::PreviousDisk);
@@ -328,6 +377,28 @@ impl App for DashboardApp {
                 let x: usize = (*mouse.pos.col_index).into();
                 let y: usize = (*mouse.pos.row_index).into();
                 let layout = layout_for_state(width, height, state);
+                // The opaque overlay owns every input in its rectangle,
+                // including blank cells above underlying footer/tab controls.
+                if layout.panel.contains(x, y) {
+                    match mouse.kind {
+                        MouseInputKind::MouseDown(Button::Left) => {
+                            if let Some(action) = layout.control_at(x, y) {
+                                apply_footer_action(state, action);
+                            }
+                        }
+                        MouseInputKind::ScrollUp => {
+                            apply_footer_action(state, FooterAction::ScrollUp)
+                        }
+                        MouseInputKind::ScrollDown => {
+                            apply_footer_action(state, FooterAction::ScrollDown)
+                        }
+                        MouseInputKind::MouseMove => state.hovered_tab = None,
+                        _ => {}
+                    }
+                    clamp_content_scroll(state, width, height);
+                    clamp_notification_scroll(state, width, height);
+                    return Ok(EventPropagation::ConsumedRender);
+                }
                 if mouse.kind == MouseInputKind::MouseMove {
                     let hovered_tab = layout.tab_at(x, y);
                     if state.hovered_tab != hovered_tab {
@@ -341,13 +412,18 @@ impl App for DashboardApp {
                         if layout.quit.contains(x, y) {
                             return Ok(EventPropagation::ExitMainEventLoop);
                         }
-                        if layout.notification_button.contains(x, y) {
+                        if layout.detail_button.contains(x, y) {
+                            state.details_open = !state.details_open;
+                            state.notifications_open = false;
+                            state.content_scroll = 0;
+                        } else if layout.notification_button.contains(x, y) {
                             toggle_notification_center(state);
                         } else if !state.notifications_open
                             && layout.toast.contains(x, y)
                             && active_notification(state, Instant::now()).is_some()
                         {
                             state.notifications_open = true;
+                            state.details_open = false;
                             state.notification_scroll = 0;
                         } else if let Some(action) = layout.control_at(x, y) {
                             apply_footer_action(state, action);
@@ -372,18 +448,7 @@ impl App for DashboardApp {
                     {
                         move_selection(state, true, 1);
                     }
-                    MouseInputKind::ScrollUp if state.notifications_open => {
-                        state.notification_scroll = state.notification_scroll.saturating_sub(1)
-                    }
-                    MouseInputKind::ScrollDown if state.notifications_open => {
-                        state.notification_scroll = state.notification_scroll.saturating_add(1)
-                    }
-                    MouseInputKind::ScrollUp => {
-                        state.content_scroll = state.content_scroll.saturating_sub(1)
-                    }
-                    MouseInputKind::ScrollDown => {
-                        state.content_scroll = state.content_scroll.saturating_add(1)
-                    }
+                    MouseInputKind::ScrollUp | MouseInputKind::ScrollDown => {}
                     _ => return Ok(EventPropagation::Propagate),
                 }
             }
@@ -391,6 +456,7 @@ impl App for DashboardApp {
         }
         ensure_selected_visible(state, width, height);
         clamp_content_scroll(state, width, height);
+        clamp_notification_scroll(state, width, height);
         Ok(EventPropagation::ConsumedRender)
     }
 
@@ -414,11 +480,7 @@ impl App for DashboardApp {
                 }
                 let topology_changed =
                     state.inventory_initialized && *generation != state.generation;
-                if topology_changed {
-                    // Retire old-generation toasts before the new inventory
-                    // starts issuing SMART work; new results can notify afresh.
-                    reset_notifications_for_generation(state);
-                }
+                begin_notification_collection(state);
                 state.generation = *generation;
                 let old_id = state
                     .disks
@@ -447,18 +509,23 @@ impl App for DashboardApp {
                             .filter(|disk| !next_ids.contains(disk.identity.id.as_str()))
                             .map(|disk| format!("Removido: {}", disk_label(&disk.identity))),
                     );
-                    if changes.is_empty() {
-                        changes.push(format!("{} discos detectados", disks.len()));
+                    if !changes.is_empty() {
+                        push_notification(
+                            state,
+                            None,
+                            "Inventário de discos atualizado".into(),
+                            changes,
+                            NotificationSeverity::Info,
+                            Instant::now(),
+                        );
                     }
-                    push_notification(
-                        state,
-                        None,
-                        "Inventário de discos atualizado".into(),
-                        changes,
-                        NotificationSeverity::Info,
-                        Instant::now(),
-                    );
                 }
+                state.last_issue_keys.retain(|owner, _| {
+                    owner == "@inventory"
+                        || disks
+                            .iter()
+                            .any(|d| owner == &d.id || owner == &format!("query:{}", d.id))
+                });
                 state.disks = disks
                     .iter()
                     .cloned()
@@ -502,18 +569,22 @@ impl App for DashboardApp {
                 if *generation < state.generation {
                     return Ok(EventPropagation::Consumed);
                 }
+                begin_notification_collection(state);
                 state.notice = Some("Não foi possível localizar os discos".into());
-                let keys = HashSet::from(["enumeration-failed".to_owned()]);
-                if record_issue_transition(state, "@inventory", keys) {
-                    push_notification(
-                        state,
-                        None,
-                        "Não foi possível atualizar o inventário".into(),
-                        vec!["A lista atual de discos foi mantida.".into()],
-                        NotificationSeverity::Warning,
-                        Instant::now(),
-                    );
-                }
+                let changed = record_issue_transition(
+                    state,
+                    "@inventory",
+                    HashSet::from(["enumeration-failed".to_owned()]),
+                );
+                replace_current_notice(
+                    state,
+                    "@inventory",
+                    None,
+                    "Não foi possível atualizar o inventário".into(),
+                    vec!["A lista atual de discos foi mantida.".into()],
+                    NotificationSeverity::Warning,
+                    changed,
+                );
             }
             AppSignal::QueryFinished {
                 generation,
@@ -574,18 +645,28 @@ impl App for DashboardApp {
                 if let Some(disk_name) = disk_name {
                     let issue_owner = format!("query:{disk_id}");
                     if let Some((key, message)) = query_error {
-                        if record_issue_transition(state, &issue_owner, HashSet::from([key])) {
-                            push_notification(
-                                state,
-                                Some(disk_id.clone()),
-                                format!("Falha na consulta · {disk_name}"),
-                                vec![message],
-                                NotificationSeverity::Warning,
-                                Instant::now(),
-                            );
-                        }
+                        let changed =
+                            record_issue_transition(state, &issue_owner, HashSet::from([key]));
+                        // The current query supersedes prior health/error text
+                        // for this disk, including a recovery within this poll.
+                        state.notifications.retain(|n| {
+                            n.disk_id.as_deref() != Some(disk_id)
+                                || n.owner.as_deref() == Some(issue_owner.as_str())
+                        });
+                        replace_current_notice(
+                            state,
+                            &issue_owner,
+                            Some(disk_id.clone()),
+                            format!("Falha na consulta · {disk_name}"),
+                            vec![message],
+                            NotificationSeverity::Warning,
+                            changed,
+                        );
                     } else {
                         record_issue_transition(state, &issue_owner, HashSet::new());
+                        state
+                            .notifications
+                            .retain(|n| n.owner.as_deref() != Some(issue_owner.as_str()));
                     }
                 }
             }
@@ -634,21 +715,29 @@ impl App for DashboardApp {
                         disk.telemetry = Some(telemetry);
                     }
                 }
-                if let Some((disk_id, label, issue_keys, details, severity)) = health_notice
-                    && record_issue_transition(state, &disk_id, issue_keys)
-                {
+                if let Some((disk_id, label, issue_keys, details, severity)) = health_notice {
+                    let has_issues = !issue_keys.is_empty();
+                    let changed = record_issue_transition(state, &disk_id, issue_keys);
+                    state.notifications.retain(|n| {
+                        n.disk_id.as_deref() != Some(disk_id.as_str())
+                            || (has_issues && n.owner.as_deref() == Some(disk_id.as_str()))
+                    });
+                    if !has_issues {
+                        return Ok(EventPropagation::ConsumedRender);
+                    }
                     let title = match severity {
                         NotificationSeverity::Info => "Informação de saúde",
                         NotificationSeverity::Warning => "Atenção à saúde",
                         NotificationSeverity::Critical => "Falha de saúde",
                     };
-                    push_notification(
+                    replace_current_notice(
                         state,
-                        Some(disk_id),
+                        &disk_id,
+                        Some(disk_id.clone()),
                         format!("{title} · {label}"),
                         details,
                         severity,
-                        Instant::now(),
+                        changed,
                     );
                 }
             }
@@ -719,7 +808,9 @@ impl App for DashboardApp {
         }
         let title_x = usize::from(width >= 24);
         let full_title = format!("chkdsk v{}", env!("CARGO_PKG_VERSION"));
-        let title_right = if layout.notification_button.visible() {
+        let title_right = if layout.detail_button.visible() {
+            layout.detail_button.x
+        } else if layout.notification_button.visible() {
             layout.notification_button.x
         } else {
             layout.quit.x
@@ -757,9 +848,9 @@ impl App for DashboardApp {
         if layout.notification_button.visible() {
             let label = if layout.notification_button.width >= 11 {
                 if state.notifications_open {
-                    "Fechar".to_owned()
+                    "Fechar [N]".to_owned()
                 } else {
-                    format!("Avisos {}", state.notifications.len().min(99))
+                    format!("Avisos {} [N]", state.notifications.len().min(99))
                 }
             } else {
                 if state.notifications_open { "×" } else { "!" }.to_owned()
@@ -774,12 +865,31 @@ impl App for DashboardApp {
             };
             paint_button(&mut ops, layout.notification_button, &label, fg, bg, true);
         }
+        if layout.detail_button.visible() {
+            let label = if state.details_open {
+                if layout.detail_button.width >= 8 {
+                    "Fechar [D]"
+                } else {
+                    "×"
+                }
+            } else if layout.detail_button.width >= 10 {
+                "Detalhes [D]"
+            } else {
+                "D"
+            };
+            paint_button(
+                &mut ops,
+                layout.detail_button,
+                label,
+                TOKYO_FG,
+                TOKYO_BG_DARK1,
+                true,
+            );
+        }
         for (position, area) in layout.tabs.iter().enumerate() {
             let index = layout.tab_indices[position];
             let disk = &state.disks[index];
-            let mark = if index == state.selected { "> " } else { "  " };
-            // Disk identity belongs in the permanent tab; the model appears once below.
-            let label = format!("{mark}Disco #{}", disk.identity.index);
+            let label = tab_label(&disk.identity);
             let (fg, bg) = if index == state.selected {
                 (TOKYO_FG, TOKYO_BG_VISUAL)
             } else if state.hovered_tab == Some(index) {
@@ -787,33 +897,37 @@ impl App for DashboardApp {
             } else {
                 (TOKYO_FG_DARK, TOKYO_BG_DARK1)
             };
-            paint_button(&mut ops, *area, &label, fg, bg, index == state.selected);
+            paint_button(&mut ops, *area, &label, fg, bg, true);
         }
         let body_height = body_view_height(&layout, height);
         if height > layout.body_y && body_height > 0 {
-            if state.notifications_open {
-                render_notification_center(&mut ops, state, layout.body_y, width, body_height);
-            } else if let Some(disk) = state.disks.get(state.selected) {
-                render_disk(
+            if let Some(disk) = state.disks.get(state.selected) {
+                let main_width = if layout.panel.visible() && layout.panel.x > 0 {
+                    layout.panel.x
+                } else {
+                    width
+                };
+                render_disk_summary(
                     &mut ops,
                     disk,
                     &state.history,
-                    layout.body_y,
-                    width,
-                    body_height,
-                    state.content_scroll,
-                    state.frame,
+                    HitArea {
+                        x: 0,
+                        y: layout.body_y,
+                        width: main_width,
+                        height: body_height,
+                    },
                 );
             } else {
                 paint_background(
                     &mut ops,
-                    width.min(2).saturating_sub(1),
+                    1.min(width.saturating_sub(1)),
                     layout.body_y,
                     state.notice.as_deref().unwrap_or("Procurando discos…"),
                     TOKYO_FG_DARK,
                     false,
                     width.saturating_sub(2),
-                    Some(TOKYO_BG_DARK1),
+                    Some(TOKYO_BG),
                 );
             }
         }
@@ -827,17 +941,12 @@ impl App for DashboardApp {
                     NotificationSeverity::Warning => TOKYO_YELLOW,
                     NotificationSeverity::Critical => TOKYO_RED,
                 };
-                let detail = notice.details.first().map_or("", String::as_str);
-                let toast_text = if detail.is_empty() {
-                    notice.title.clone()
-                } else {
-                    format!("{} · {}", notice.title, detail)
-                };
+                let toast_text = "Novo aviso · N ou clique para abrir";
                 paint_background(
                     &mut ops,
                     layout.toast.x,
                     layout.toast.y,
-                    &toast_text,
+                    toast_text,
                     color,
                     true,
                     layout.toast.width,
@@ -859,6 +968,7 @@ impl App for DashboardApp {
                 true,
             );
         }
+        render_panel(&mut ops, state, &layout);
         pipeline.push(ZOrder::Normal, ops);
         Ok(pipeline)
     }
@@ -889,58 +999,44 @@ fn apply_footer_action(state: &mut Dashboard, action: FooterAction) {
         FooterAction::ScrollDown if state.notifications_open => {
             state.notification_scroll = state.notification_scroll.saturating_add(1);
         }
-        FooterAction::ScrollUp => state.content_scroll = state.content_scroll.saturating_sub(1),
-        FooterAction::ScrollDown => state.content_scroll = state.content_scroll.saturating_add(1),
+        FooterAction::ScrollUp if state.details_open => {
+            state.content_scroll = state.content_scroll.saturating_sub(1)
+        }
+        FooterAction::ScrollDown if state.details_open => {
+            state.content_scroll = state.content_scroll.saturating_add(1)
+        }
+        FooterAction::ScrollUp | FooterAction::ScrollDown => {}
     }
 }
 
 fn toggle_notification_center(state: &mut Dashboard) {
     state.notifications_open = !state.notifications_open;
+    state.details_open = false;
     if state.notifications_open {
         state.notification_scroll = 0;
     }
 }
 
-fn ensure_selected_visible(state: &mut Dashboard, width: usize, height: usize) {
-    let layout = Layout::for_state(width, height, state);
-    if layout.tab_indices.contains(&state.selected) {
-        return;
-    }
-    if let Some(last) = layout.tab_indices.last().copied() {
-        if state.selected > last {
-            state.scroll = state
-                .selected
-                .saturating_sub(layout.tab_indices.len().saturating_sub(1));
-        } else {
-            state.scroll = state.selected;
-        }
-    } else {
-        state.scroll = state.selected;
+fn tab_label(identity: &DiskIdentity) -> String {
+    match identity
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty())
+    {
+        Some(model) => format!("#{} {model}", identity.index),
+        None => format!("Disco #{}", identity.index),
     }
 }
 
-fn clamp_tab_scroll(state: &mut Dashboard, width: usize, height: usize) {
-    let disk_count = state.disks.len();
-    if disk_count == 0 {
-        state.scroll = 0;
-        return;
+fn ensure_selected_visible(state: &mut Dashboard, width: usize, height: usize) {
+    let layout = Layout::for_state(width, height, state);
+    if !layout.tab_indices.contains(&state.selected) {
+        state.scroll = state.selected.min(state.disks.len().saturating_sub(1));
     }
-    let index_digits = state
-        .disks
-        .iter()
-        .map(|disk| disk.identity.index.to_string().len())
-        .max()
-        .unwrap_or(1);
-    let visible_count =
-        Layout::new_with_index_digits(width, height, disk_count, 0, index_digits, false)
-            .tab_indices
-            .len();
-    let max_scroll = if visible_count == 0 {
-        disk_count - 1
-    } else {
-        disk_count.saturating_sub(visible_count)
-    };
-    state.scroll = state.scroll.min(max_scroll);
+}
+
+fn clamp_tab_scroll(state: &mut Dashboard, _width: usize, _height: usize) {
+    state.scroll = state.scroll.min(state.disks.len().saturating_sub(1));
 }
 
 const MAX_CONCURRENT_DISK_QUERIES: usize = 4;
@@ -1126,6 +1222,8 @@ pub struct Layout {
     pub tab_indices: Vec<usize>,
     pub quit: HitArea,
     pub notification_button: HitArea,
+    pub detail_button: HitArea,
+    pub panel: HitArea,
     pub toast: HitArea,
     toast_reserved: bool,
     controls: Vec<FooterControl>,
@@ -1161,20 +1259,126 @@ impl Layout {
     }
 
     fn for_state(width: usize, height: usize, state: &Dashboard) -> Self {
-        let index_digits = state
-            .disks
-            .iter()
-            .map(|disk| disk.identity.index.to_string().len())
-            .max()
-            .unwrap_or(1);
-        Self::new_with_index_digits(
+        let mut layout = Self::new_with_index_digits(
             width,
             height,
             state.disks.len(),
             state.scroll,
-            index_digits,
+            1,
             state.notifications_open,
-        )
+        );
+        if width == 0 || height == 0 {
+            return layout;
+        }
+        let button_height = layout.quit.height;
+        let toggles_wide = width >= 50;
+        let toggle_width = if toggles_wide {
+            14
+        } else if width >= 12 {
+            3
+        } else {
+            1
+        };
+        layout.notification_button = if !state.details_open && width >= 4 {
+            HitArea {
+                x: layout.quit.x.saturating_sub(toggle_width + 1),
+                y: 0,
+                width: toggle_width.min(layout.quit.x),
+                height: button_height,
+            }
+        } else {
+            HitArea::default()
+        };
+        layout.detail_button = if !state.notifications_open && width >= 8 {
+            let right = if layout.notification_button.visible() {
+                layout.notification_button.x
+            } else {
+                layout.quit.x
+            };
+            HitArea {
+                x: right.saturating_sub(toggle_width + 1),
+                y: 0,
+                width: toggle_width.min(right.saturating_sub(1)),
+                height: button_height,
+            }
+        } else {
+            HitArea::default()
+        };
+        // Names stay on permanent, horizontally navigable tabs. Each tab has
+        // one cell of padding and clips graphemes without breaking identities.
+        layout.tabs.clear();
+        layout.tab_indices.clear();
+        let margin = usize::from(width >= 24);
+        let mut x = margin;
+        if width >= 3 && height > 2 * button_height {
+            for (index, disk) in state.disks.iter().enumerate().skip(state.scroll) {
+                let remaining = width.saturating_sub(x + margin);
+                let wanted = (display_width(&tab_label(&disk.identity)) + 2).min(34);
+                if remaining < wanted && !layout.tabs.is_empty() {
+                    break;
+                }
+                let tab_width = wanted.min(remaining);
+                if tab_width == 0 {
+                    break;
+                }
+                layout.tabs.push(HitArea {
+                    x,
+                    y: button_height,
+                    width: tab_width,
+                    height: button_height,
+                });
+                layout.tab_indices.push(index);
+                x += tab_width + 1;
+            }
+        }
+        layout.controls = footer_controls(width, height, false);
+        layout.controls.retain(|c| {
+            matches!(
+                c.action,
+                FooterAction::PreviousDisk | FooterAction::NextDisk
+            )
+        });
+        center_controls(&mut layout.controls, width);
+        if state.notifications_open || state.details_open {
+            let panel_width = if width >= 72 {
+                45.min(width / 2)
+            } else {
+                width
+            };
+            layout.panel = HitArea {
+                x: width - panel_width,
+                y: layout.body_y,
+                width: panel_width,
+                height: height.saturating_sub(layout.body_y),
+            };
+            // Keep both disk buttons reachable on the uncovered main side.
+            layout.controls = footer_controls(layout.panel.x, height, false);
+            layout.controls.retain(|c| {
+                matches!(
+                    c.action,
+                    FooterAction::PreviousDisk | FooterAction::NextDisk
+                )
+            });
+            center_controls(&mut layout.controls, layout.panel.x);
+            if panel_width >= 13 && layout.panel.height >= 10 {
+                for (offset, label, action) in [
+                    (0, "↑", FooterAction::ScrollUp),
+                    (6, "↓", FooterAction::ScrollDown),
+                ] {
+                    layout.controls.push(FooterControl {
+                        area: HitArea {
+                            x: layout.panel.x + (panel_width - 11) / 2 + offset,
+                            y: height - 4,
+                            width: 5,
+                            height: 3,
+                        },
+                        label,
+                        action,
+                    });
+                }
+            }
+        }
+        layout
     }
 
     fn new_with_index_digits(
@@ -1288,6 +1492,8 @@ impl Layout {
             tab_indices,
             quit,
             notification_button,
+            detail_button: HitArea::default(),
+            panel: HitArea::default(),
             toast,
             toast_reserved: false,
             controls,
@@ -1306,6 +1512,17 @@ impl Layout {
             .iter()
             .find(|control| control.area.contains(x, y))
             .map(|control| control.action)
+    }
+}
+
+fn center_controls(controls: &mut [FooterControl], width: usize) {
+    if let (Some(first), Some(last)) = (controls.first(), controls.last()) {
+        let old_x = first.area.x;
+        let occupied = last.area.x + last.area.width - old_x;
+        let centered = width.saturating_sub(occupied) / 2;
+        for control in controls {
+            control.area.x = control.area.x - old_x + centered;
+        }
     }
 }
 
@@ -1410,34 +1627,43 @@ fn body_view_height(layout: &Layout, height: usize) -> usize {
 fn layout_for_state(width: usize, height: usize, state: &Dashboard) -> Layout {
     let mut layout = Layout::for_state(width, height, state);
     layout.toast_reserved = !state.notifications_open
+        && !state.details_open
         && active_notification(state, Instant::now()).is_some()
         && layout.toast.visible();
     layout
 }
 
-fn disk_content_line_count(disk: &DiskView, width: usize, body_height: usize) -> usize {
-    let Some(telemetry) = disk.telemetry.as_ref() else {
-        return 6;
-    };
-
-    let large_score = body_height >= 9 && width >= 26;
-    let unknown_health = score_health(effective_disk_kind(&disk.identity, telemetry), telemetry)
-        .outcome
-        == HealthOutcome::Unknown;
-    // Model, health label, ETA, confidence/status, details heading and six
-    // essential metrics. Detailed warning explanations live in notifications.
-    11 + usize::from(unknown_health && !large_score)
+fn panel_visible_lines(layout: &Layout) -> usize {
+    let controls_height = usize::from(
+        layout
+            .controls
+            .iter()
+            .any(|c| layout.panel.contains(c.area.x, c.area.y)),
+    ) * 4;
+    layout.panel.height.saturating_sub(4 + controls_height)
 }
 
 fn clamp_content_scroll(state: &mut Dashboard, width: usize, height: usize) {
+    if !state.details_open {
+        state.content_scroll = 0;
+        return;
+    }
     let layout = layout_for_state(width, height, state);
-    let body_height = body_view_height(&layout, height);
-    let max_scroll = state
+    let count = state
         .disks
         .get(state.selected)
-        .map(|disk| disk_content_line_count(disk, width, body_height).saturating_sub(body_height))
+        .map(|d| {
+            disk_detail_lines(
+                d,
+                &state.history,
+                layout.panel.width.saturating_sub(2).max(1),
+            )
+            .len()
+        })
         .unwrap_or_default();
-    state.content_scroll = state.content_scroll.min(max_scroll);
+    state.content_scroll = state
+        .content_scroll
+        .min(count.saturating_sub(panel_visible_lines(&layout)));
 }
 
 #[derive(Clone, Debug)]
@@ -1495,7 +1721,7 @@ fn notification_center_lines(state: &Dashboard, max_width: usize) -> Vec<Notific
     }
     if lines.is_empty() {
         lines.extend(
-            wrap_text("Nenhum aviso nesta atualização de hardware", max_width)
+            wrap_text("Nenhum aviso nesta coleta", max_width)
                 .into_iter()
                 .map(|text| NotificationLine {
                     text,
@@ -1513,71 +1739,11 @@ fn clamp_notification_scroll(state: &mut Dashboard, width: usize, height: usize)
         return;
     }
     let layout = layout_for_state(width, height, state);
-    let body_height = body_view_height(&layout, height);
-    let visible_lines = body_height.saturating_sub(2);
     state.notification_scroll = state.notification_scroll.min(
-        notification_center_lines(state, width.saturating_sub(2))
+        notification_center_lines(state, layout.panel.width.saturating_sub(2).max(1))
             .len()
-            .saturating_sub(visible_lines),
+            .saturating_sub(panel_visible_lines(&layout)),
     );
-}
-
-fn render_notification_center(
-    ops: &mut RenderOpIRVec,
-    state: &Dashboard,
-    top: usize,
-    width: usize,
-    height: usize,
-) {
-    fill_row(ops, top, width, TOKYO_BG_DARK1);
-    paint_background(
-        ops,
-        1.min(width.saturating_sub(1)),
-        top,
-        &format!("CENTRAL DE NOTIFICAÇÕES · {}", state.notifications.len()),
-        TOKYO_BLUE,
-        true,
-        width.saturating_sub(1),
-        Some(TOKYO_BG_DARK1),
-    );
-    if height < 2 {
-        return;
-    }
-    fill_row(ops, top + 1, width, TOKYO_BG_DARK);
-    let navigation_help = if width >= 44 {
-        "N/Esc fecha · roda, ↑/↓, j/k ou PgUp/PgDn percorrem"
-    } else {
-        "N/Esc fecha · roda/↑/↓"
-    };
-    paint_background(
-        ops,
-        1.min(width.saturating_sub(1)),
-        top + 1,
-        navigation_help,
-        TOKYO_FG_DARK,
-        false,
-        width.saturating_sub(1),
-        Some(TOKYO_BG_DARK),
-    );
-    for (offset, line) in notification_center_lines(state, width.saturating_sub(2))
-        .iter()
-        .skip(state.notification_scroll)
-        .take(height.saturating_sub(2))
-        .enumerate()
-    {
-        let y = top + 2 + offset;
-        fill_row(ops, y, width, line.background);
-        paint_background(
-            ops,
-            1.min(width.saturating_sub(1)),
-            y,
-            &line.text,
-            line.foreground,
-            line.bold,
-            width.saturating_sub(1),
-            Some(line.background),
-        );
-    }
 }
 
 fn centered_button_text(area: HitArea, label: &str) -> Option<(usize, usize, String)> {
@@ -1642,310 +1808,6 @@ fn fill_row(ops: &mut RenderOpIRVec, y: usize, width: usize, color: RgbValue) {
             Some(color),
         );
     }
-}
-
-fn paint_table_text(
-    ops: &mut RenderOpIRVec,
-    y: usize,
-    label: &str,
-    value: &str,
-    width: usize,
-    background: RgbValue,
-) {
-    const LABEL_WIDTH: usize = 12;
-    const VALUE_X: usize = 15;
-    paint_background(
-        ops,
-        1.min(width.saturating_sub(1)),
-        y,
-        &pad_to_columns(label, LABEL_WIDTH),
-        TOKYO_FG_DARK,
-        false,
-        LABEL_WIDTH.min(width.saturating_sub(1)),
-        Some(background),
-    );
-    if VALUE_X < width {
-        paint_background(
-            ops,
-            VALUE_X,
-            y,
-            value,
-            TOKYO_FG,
-            false,
-            width.saturating_sub(VALUE_X),
-            Some(background),
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_disk(
-    ops: &mut RenderOpIRVec,
-    disk: &DiskView,
-    history: &History,
-    top: usize,
-    width: usize,
-    available_height: usize,
-    scroll: usize,
-    frame: usize,
-) {
-    if available_height == 0 || width == 0 {
-        return;
-    }
-    let mut line = 0usize;
-    let mut row = |ops: &mut RenderOpIRVec, text: &str, fg: RgbValue, bg: RgbValue, bold: bool| {
-        if line >= scroll && line - scroll < available_height {
-            let y = top + line - scroll;
-            fill_row(ops, y, width, bg);
-            let italic = !bold && (text.starts_with("ETA") || text.starts_with("Sem ETA"));
-            paint_background_with_attributes(
-                ops,
-                1.min(width.saturating_sub(1)),
-                y,
-                text,
-                fg,
-                bold,
-                italic,
-                width.saturating_sub(1),
-                Some(bg),
-            );
-            line += 1;
-            Some(y)
-        } else {
-            line += 1;
-            None
-        }
-    };
-    let model = disk
-        .identity
-        .model
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("Modelo desconhecido");
-    row(ops, model, TOKYO_FG, TOKYO_BG_HIGHLIGHT, true);
-
-    let Some(telemetry) = disk.telemetry.as_ref() else {
-        let message = if disk.querying || disk.computing {
-            if disk.computing {
-                "Calculando saúde…"
-            } else {
-                "Consultando dados de saúde…"
-            }
-        } else {
-            disk.error_message
-                .as_deref()
-                .unwrap_or("Dados de saúde indisponíveis")
-        };
-        let color = if disk.querying || disk.computing {
-            TOKYO_CYAN
-        } else {
-            TOKYO_RED
-        };
-        row(ops, message, color, TOKYO_BG_DARK1, true);
-        let spacer = available_height.saturating_sub(6);
-        for _ in 0..spacer {
-            row(ops, "", TOKYO_FG_DARK, TOKYO_BG, false);
-        }
-        row(ops, "DETALHES DO DISCO", TOKYO_BLUE, TOKYO_BG_DARK1, true);
-        let kind = match disk.identity.kind {
-            DiskKind::Hdd => "HDD",
-            DiskKind::Ssd => "SSD",
-            DiskKind::Nvme => "NVMe",
-            DiskKind::Unknown => "Desconhecido",
-        };
-        let mut stripe = false;
-        for (label, value) in [
-            ("TIPO", kind.to_owned()),
-            (
-                "INTERFACE",
-                disk.identity
-                    .bus
-                    .clone()
-                    .unwrap_or_else(|| "indisponível".into()),
-            ),
-            (
-                "CAPACIDADE",
-                disk.identity
-                    .capacity_bytes
-                    .map(format_bytes)
-                    .unwrap_or_else(|| "indisponível".into()),
-            ),
-        ] {
-            let background = if stripe { TOKYO_BG } else { TOKYO_BG_DARK1 };
-            if let Some(y) = row(ops, "", TOKYO_FG, background, false) {
-                paint_table_text(ops, y, label, &value, width, background);
-            }
-            stripe = !stripe;
-        }
-        return;
-    };
-    let kind = effective_disk_kind(&disk.identity, telemetry);
-    let health = score_health(kind, telemetry);
-    let (label, color) = health_presentation(&health);
-    let nominal_attention = health.outcome == HealthOutcome::Pass
-        && health
-            .warnings
-            .contains(&HealthWarningReason::EnduranceExhausted);
-    let basic_smart = is_basic_smart_pass(&health);
-    let large_score = available_height >= 9 && width >= 26;
-    let headline = if health.outcome == HealthOutcome::Unknown {
-        if large_score {
-            "SAÚDE INDETERMINADA · N/A".to_owned()
-        } else {
-            "SAÚDE INDETERMINADA".to_owned()
-        }
-    } else if large_score {
-        format!("{label} · {}%", health.score)
-    } else if nominal_attention {
-        format!("NOMINAL · {}%", health.score)
-    } else if basic_smart {
-        format!("SAÚDE · SMART BÁSICO · {}%", health.score)
-    } else {
-        format!("{label} · {}%", health.score)
-    };
-    row(ops, &headline, color, TOKYO_BG_DARK1, true);
-
-    if health.outcome == HealthOutcome::Unknown && !large_score {
-        // Keep N/A explicit in short terminals where the health/state pair
-        // cannot fit on a single dominant line.
-        let score_text = "N/A";
-        let score_width = r3bl_tui::GCStringOwned::new(score_text)
-            .display_width()
-            .as_usize();
-        let score_x = 1 + width.saturating_sub(score_width + 2) / 2;
-        if let Some(y) = row(ops, "", color, TOKYO_BG, false) {
-            paint_background_with_attributes(
-                ops,
-                score_x,
-                y,
-                score_text,
-                color,
-                true,
-                false,
-                score_width,
-                Some(TOKYO_BG),
-            );
-        }
-    }
-    let eta = if kind == DiskKind::Hdd {
-        if width < 40 {
-            "ETA não aplicável a HDD".to_owned()
-        } else {
-            "ETA não aplicável · vida útil de HDD".to_owned()
-        }
-    } else if kind == DiskKind::Unknown {
-        if width < 40 {
-            "Sem ETA: tipo desconhecido".to_owned()
-        } else {
-            "ETA indisponível · tipo sem previsão".to_owned()
-        }
-    } else if width < 40 && history.estimate_endurance(&disk.identity.id).is_none() {
-        "ETA: requer histórico".to_owned()
-    } else {
-        history
-            .estimate_endurance(&disk.identity.id)
-            .map(|estimate| {
-                format!(
-                    "ETA restante  {}",
-                    format_endurance_days(estimate.remaining_seconds)
-                )
-            })
-            .unwrap_or_else(|| "ETA indisponível · requer histórico de desgaste".into())
-    };
-    // Health status and score are the focus; keep the long-range forecast useful
-    // but visually secondary.
-    row(ops, &eta, TOKYO_FG_DARK, TOKYO_BG_DARK, false);
-
-    let full_status = telemetry_status(telemetry);
-    let status = if disk.querying || disk.computing {
-        if width >= 40 {
-            "Atualizando telemetria · última leitura mantida"
-        } else {
-            "Atualizando telemetria"
-        }
-    } else if basic_smart {
-        "SMART básico · baixa confiança"
-    } else if health.outcome == HealthOutcome::Unknown {
-        if width >= 40 {
-            "Saúde indeterminada · índice indisponível"
-        } else {
-            "Saúde indeterminada"
-        }
-    } else if width >= 40 {
-        full_status
-    } else if full_status.contains("permissão") {
-        "Permissão insuficiente"
-    } else if health.outcome == HealthOutcome::Fail {
-        "Falha reportada"
-    } else if full_status.contains("parcial") {
-        "Dados parciais"
-    } else {
-        "Sem falha reportada"
-    };
-    let status_color = if disk.querying || disk.computing {
-        TOKYO_CYAN
-    } else if full_status.contains("permissão") || matches!(health.outcome, HealthOutcome::Fail) {
-        TOKYO_RED
-    } else if health.outcome == HealthOutcome::Unknown
-        || full_status.contains("parcial")
-        || basic_smart
-        || !health.warnings.is_empty()
-    {
-        TOKYO_YELLOW
-    } else {
-        TOKYO_GREEN
-    };
-    row(ops, status, status_color, TOKYO_BG_DARK1, false);
-    let spacer =
-        available_height.saturating_sub(disk_content_line_count(disk, width, available_height));
-    for _ in 0..spacer {
-        row(ops, "", TOKYO_FG_DARK, TOKYO_BG, false);
-    }
-    row(ops, "DETALHES DO DISCO", TOKYO_BLUE, TOKYO_BG_DARK1, true);
-    let kind = match kind {
-        DiskKind::Hdd => "HDD",
-        DiskKind::Ssd => "SSD",
-        DiskKind::Nvme => "NVMe",
-        DiskKind::Unknown => "Desconhecido",
-    };
-    let bus = disk
-        .identity
-        .bus
-        .as_deref()
-        .unwrap_or("interface indisponível");
-    let capacity = disk
-        .identity
-        .capacity_bytes
-        .map(format_bytes)
-        .unwrap_or_else(|| "indisponível".into());
-    let wear = telemetry
-        .endurance_percent
-        .map(|v| format!("{v:.0}%"))
-        .unwrap_or_else(|| "—".into());
-    let temperature = telemetry
-        .temperature_c
-        .map(|v| format!("{v} °C"))
-        .unwrap_or_else(|| "—".into());
-    let hours = telemetry
-        .power_on_hours
-        .map(compact_number)
-        .unwrap_or_else(|| "—".into());
-    let mut stripe = false;
-    for (label, value) in [
-        ("TIPO", kind.to_owned()),
-        ("INTERFACE", bus.to_owned()),
-        ("CAPACIDADE", capacity),
-        ("DESGASTE", wear),
-        ("TEMPERATURA", temperature),
-        ("LIGADO", hours),
-    ] {
-        let background = if stripe { TOKYO_BG } else { TOKYO_BG_DARK1 };
-        if let Some(y) = row(ops, "", TOKYO_FG, background, false) {
-            paint_table_text(ops, y, label, &value, width, background);
-        }
-        stripe = !stripe;
-    }
-    let _ = frame;
 }
 
 /// A valid NVMe log or verified ATA SSD wear profile can fill a missing kind.
@@ -3257,7 +3119,7 @@ mod tests {
                     .lines()
                     .nth(layout.tabs[0].y + layout.tabs[0].height / 2)
                     .unwrap()
-                    .contains("> Disco #8"),
+                    .contains("Disco #8"),
                 "{width}x{height}: {rendered}"
             );
         }
@@ -3304,7 +3166,7 @@ mod tests {
         ensure_selected_visible(&mut state, 100, 28);
         let shifted = Layout::for_state(100, 28, &state);
         assert_eq!(shifted.tab_indices.last(), Some(&8));
-        assert_eq!(shifted.tab_indices.len(), visible.tab_indices.len());
+        assert!(shifted.tab_indices.contains(&8));
         let first_shifted = shifted.tabs[0];
         assert_eq!(
             shifted.tab_at(first_shifted.x, first_shifted.y),
@@ -3395,7 +3257,10 @@ mod tests {
             10,
         );
 
-        assert_eq!(Layout::new(100, 10, 9, 4).tab_at(20, 1), Some(5));
+        assert_eq!(
+            layout_for_state(100, 10, &global.state).tab_at(20, 1),
+            Some(5)
+        );
         dispatch_input(
             &mut app,
             &mut global,
@@ -3404,6 +3269,13 @@ mod tests {
         assert_eq!(
             global.state.disks[global.state.selected].identity.id,
             "disk-5"
+        );
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::Character('d'),
+            }),
         );
         for _ in 0..2 {
             dispatch_input(
@@ -3445,18 +3317,18 @@ mod tests {
         assert_eq!(global.state.scroll, 0);
         assert_eq!(global.state.content_scroll, 2);
         assert!(
-            Layout::new(100, 10, 9, global.state.scroll)
+            layout_for_state(100, 10, &global.state)
                 .tab_indices
                 .contains(&global.state.selected)
         );
         let rendered = rendered_text(&mut app, &mut global);
-        let layout = Layout::new(100, 10, global.state.disks.len(), global.state.scroll);
+        let layout = layout_for_state(100, 10, &global.state);
         assert!(
             rendered
                 .lines()
                 .nth(layout.tabs[0].y + layout.tabs[0].height / 2)
                 .unwrap()
-                .contains("> Disco #5")
+                .contains("Disco #5")
         );
 
         dispatch_input(
@@ -3514,7 +3386,7 @@ mod tests {
         assert_eq!(global.state.scroll, 1);
         assert_eq!(global.state.content_scroll, 0);
         assert!(
-            Layout::new(100, 10, 8, global.state.scroll)
+            layout_for_state(100, 10, &global.state)
                 .tab_indices
                 .contains(&global.state.selected)
         );
@@ -4225,7 +4097,12 @@ mod tests {
         let mut global = test_global_data(state, 100, 17);
 
         // The active toast is a full-row mouse target and opens the center.
-        let layout = Layout::for_state(100, 17, &global.state);
+        let layout = layout_for_state(100, 17, &global.state);
+        let toast = rendered_text(&mut app, &mut global);
+        assert!(
+            toast.contains("Novo aviso · N ou clique para abrir"),
+            "{toast}"
+        );
         dispatch_input(
             &mut app,
             &mut global,
@@ -4237,18 +4114,22 @@ mod tests {
         );
         assert!(global.state.notifications_open);
         let center = rendered_text(&mut app, &mut global);
-        assert!(center.contains("CENTRAL DE NOTIFICAÇÕES"), "{center}");
+        assert!(center.contains("AVISOS"), "{center}");
         assert!(center.contains("Fechar"), "{center}");
-        assert!(center.contains("↑ Avisos"), "{center}");
-        assert!(center.contains("↓ Avisos"), "{center}");
-        assert!(!center.contains("↑ Detalhes"), "{center}");
+        assert!(center.contains("↑"), "{center}");
+        assert!(center.contains("↓"), "{center}");
         assert!(center.contains("Detalhe SMART 0"), "{center}");
+        let center_layout = layout_for_state(100, 17, &global.state);
 
         // Mouse scrolling and keyboard scrolling operate on the same history.
         dispatch_input(
             &mut app,
             &mut global,
-            mouse_event(MouseInputKind::ScrollDown, 50, layout.body_y + 3),
+            mouse_event(
+                MouseInputKind::ScrollDown,
+                center_layout.panel.x + 1,
+                center_layout.panel.y + 3,
+            ),
         );
         assert_eq!(global.state.notification_scroll, 1);
         dispatch_input(
@@ -4260,13 +4141,13 @@ mod tests {
         );
         let _ = rendered_text(&mut app, &mut global);
         assert!(global.state.notification_scroll > 1);
-        let center_layout = Layout::for_state(100, 17, &global.state);
+        let center_layout = layout_for_state(100, 17, &global.state);
         let scroll_button = center_layout
             .controls
             .iter()
             .find(|control| control.action == FooterAction::ScrollDown)
             .unwrap();
-        assert_eq!(scroll_button.label, "↓ Avisos");
+        assert_eq!(scroll_button.label, "↓");
         let scroll_before_button = global.state.notification_scroll;
         dispatch_input(
             &mut app,
@@ -4281,17 +4162,17 @@ mod tests {
 
         // A body click is consumed by the open center and cannot scroll the
         // dashboard content hidden underneath it.
-        global.state.content_scroll = 2;
+        global.state.content_scroll = 0;
         dispatch_input(
             &mut app,
             &mut global,
             mouse_event(
                 MouseInputKind::MouseDown(Button::Left),
-                50,
-                layout.body_y + 4,
+                center_layout.panel.x + 1,
+                center_layout.panel.y + 4,
             ),
         );
-        assert_eq!(global.state.content_scroll, 2);
+        assert_eq!(global.state.content_scroll, 0);
 
         // The header's full notification hitbox closes it, and Escape is
         // intercepted here rather than by the global terminal exit keys.
@@ -4392,9 +4273,9 @@ mod tests {
             started: true,
             ..Default::default()
         };
-        let mut global = test_global_data(state, 30, 10);
-        let layout = Layout::for_state(30, 10, &global.state);
-        assert_eq!(layout.notification_button.width, 1);
+        let mut global = test_global_data(state, 30, 17);
+        let layout = layout_for_state(30, 17, &global.state);
+        assert!(layout.notification_button.visible());
         dispatch_input(
             &mut app,
             &mut global,
@@ -4405,9 +4286,10 @@ mod tests {
             ),
         );
         assert!(global.state.notifications_open);
+        let panel_layout = layout_for_state(30, 17, &global.state);
         let first_page = rendered_text(&mut app, &mut global);
         let first_page_words = first_page.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(first_page.contains("roda/↑/↓"), "{first_page}");
+        assert!(first_page.contains("AVISOS"), "{first_page}");
         assert!(
             first_page_words.contains("Setores pendentes aguardando remapeamento"),
             "a frase deve ser refluída sem truncamento: {first_page}"
@@ -4416,7 +4298,11 @@ mod tests {
             dispatch_input(
                 &mut app,
                 &mut global,
-                mouse_event(MouseInputKind::ScrollDown, 10, layout.body_y + 2),
+                mouse_event(
+                    MouseInputKind::ScrollDown,
+                    panel_layout.panel.x + 1,
+                    panel_layout.panel.y + 3,
+                ),
             );
         }
         let last_page = rendered_text(&mut app, &mut global);
@@ -4434,7 +4320,8 @@ mod tests {
     }
 
     #[test]
-    fn hardware_generation_resets_notices_preserves_selection_and_rejects_late_results() {
+    fn hardware_generation_replaces_collection_notices_preserves_selection_and_rejects_late_results()
+     {
         let keep = identity("stable-drive-id", 0);
         let remove = identity("removed-drive-id", 1);
         let mut state = Dashboard {
@@ -4486,7 +4373,7 @@ mod tests {
             global.state.disks[global.state.selected].identity.id,
             keep.id
         );
-        assert!(!global.state.notifications_open);
+        assert!(global.state.notifications_open);
         assert!(
             global
                 .state
@@ -4495,7 +4382,10 @@ mod tests {
                 .all(|notice| notice.title != "Aviso antigo")
         );
         assert_eq!(global.state.notifications.len(), 1);
-        assert_eq!(global.state.notifications[0].generation, 6);
+        assert_eq!(
+            global.state.notifications[0].generation,
+            global.state.collection_generation
+        );
         assert!(
             global.state.notifications[0]
                 .details
@@ -4550,18 +4440,36 @@ mod tests {
             },
         );
         assert_eq!(global.state.notifications.len(), 2);
-        assert!(global.state.notifications[1].generation == 6);
+        assert_eq!(
+            global.state.notifications[1].generation,
+            global.state.collection_generation
+        );
         assert_eq!(
             global.state.notifications[1].severity,
             NotificationSeverity::Critical
         );
         assert!(active_notification(&global.state, Instant::now()).is_some());
 
-        global.state.notifications[1].expires_at = Instant::now() - Duration::from_millis(1);
+        let center_view = rendered_text(&mut app, &mut global);
+        assert!(
+            center_view.contains("Reserva NVMe em nível crítico"),
+            "{center_view}"
+        );
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::Character('n'),
+            }),
+        );
+        assert!(!global.state.notifications_open);
+        for notice in &mut global.state.notifications {
+            notice.expires_at = Instant::now() - Duration::from_millis(1);
+        }
         global.state.toast_was_active = true;
         let _ = dispatch_signal(&mut app, &mut global, AppSignal::Frame);
         let main_view = rendered_text(&mut app, &mut global);
-        assert!(main_view.contains("FALHA DETECTADA"), "{main_view}");
+        assert!(main_view.contains("25%"), "{main_view}");
         assert!(
             !main_view.contains("Reserva NVMe em nível crítico"),
             "detalhe deve ficar fora do resumo: {main_view}"
@@ -4593,7 +4501,7 @@ mod tests {
                 disk_id: keep.id.clone(),
             },
         );
-        assert_eq!(global.state.notifications.len(), 2);
+        assert_eq!(global.state.notifications.len(), 1);
         global.state.disks[0].pending_telemetry = Some(Telemetry {
             nvme: QueryState::Success(crate::model::NvmeHealth {
                 critical_warning: 1,
@@ -4609,7 +4517,7 @@ mod tests {
                 disk_id: keep.id,
             },
         );
-        assert_eq!(global.state.notifications.len(), 3);
+        assert_eq!(global.state.notifications.len(), 2);
     }
 
     #[test]
@@ -4716,11 +4624,14 @@ mod tests {
             pending_telemetry: None,
             error_message: None,
         };
-        let mut ops = RenderOpIRVec::new();
-        render_disk(&mut ops, &disk, &History::default(), 0, 64, 12, 0, 0);
-        let shown = format!("{ops:?}");
-        assert!(shown.contains("Modelo desconhecido"));
-        assert!(shown.contains("CAPACIDADE"));
+        let lines = disk_detail_lines(&disk, &History::default(), 64);
+        let shown = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("Tipo: Desconhecido"));
+        assert!(shown.contains("Capacidade: indisponível"));
         assert!(shown.contains("indisponível"));
         assert!(shown.contains("Dados de saúde indisponíveis"));
 
@@ -4728,22 +4639,14 @@ mod tests {
             telemetry: Some(Telemetry::default()),
             ..disk
         };
-        let mut unknown_ops = RenderOpIRVec::new();
-        render_disk(
-            &mut unknown_ops,
-            &unknown,
-            &History::default(),
-            0,
-            80,
-            18,
-            0,
-            0,
-        );
-        let unknown_screen = format!("{unknown_ops:?}");
-        assert!(unknown_screen.contains("INDETERMINADA"));
-        assert!(unknown_screen.contains("N/A"));
-        assert!(!unknown_screen.contains("% saúde"));
-        assert!(!unknown_screen.contains("0 / 100"));
+        let unknown_lines = disk_detail_lines(&unknown, &History::default(), 80);
+        let unknown_details = unknown_lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(unknown_details.contains("SAÚDE INDISPONÍVEL"));
+        assert!(!unknown_details.contains("0 / 100"));
     }
 
     #[test]
@@ -4798,7 +4701,7 @@ mod tests {
         assert_eq!(global.state.selected, 1);
         assert_eq!(global.state.content_scroll, 0);
 
-        let layout = Layout::new(80, 24, global.state.disks.len(), global.state.scroll);
+        let layout = layout_for_state(80, 24, &global.state);
         let next_tab = layout.tabs[2];
         assert_eq!(layout.tab_at(next_tab.x, next_tab.y), Some(2));
         assert!(matches!(
@@ -4818,7 +4721,7 @@ mod tests {
 
         let compact_state = global.state.clone();
         let mut compact = test_global_data(compact_state, 12, 2);
-        let compact_layout = Layout::new(12, 2, compact.state.disks.len(), compact.state.scroll);
+        let compact_layout = layout_for_state(12, 2, &compact.state);
         assert!(compact_layout.tabs.is_empty());
         assert!(matches!(
             dispatch_input(
@@ -4836,7 +4739,7 @@ mod tests {
         assert_eq!(compact.state.scroll, 0);
 
         let mut tiny = test_global_data(compact.state.clone(), 1, 1);
-        let tiny_layout = Layout::new(1, 1, tiny.state.disks.len(), tiny.state.scroll);
+        let tiny_layout = layout_for_state(1, 1, &tiny.state);
         assert_eq!(
             tiny_layout.quit,
             HitArea {
@@ -4890,30 +4793,32 @@ mod tests {
             ..Default::default()
         };
         let mut global = test_global_data(state, 80, 17);
-        let layout = Layout::new(80, 17, global.state.disks.len(), 0);
-        let click =
-            |app: &mut DashboardApp, global: &mut GlobalData<Dashboard, AppSignal>, action| {
-                let button = layout
-                    .controls
-                    .iter()
-                    .find(|button| button.action == action)
-                    .unwrap();
-                assert_eq!(
-                    layout.control_at(button.area.x, button.area.y),
-                    Some(action)
-                );
-                dispatch_input(
-                    app,
-                    global,
-                    mouse_event(
-                        MouseInputKind::MouseDown(Button::Left),
-                        button.area.x,
-                        button.area.y,
-                    ),
-                )
-            };
+        let mut layout = layout_for_state(80, 17, &global.state);
+        let click = |app: &mut DashboardApp,
+                     global: &mut GlobalData<Dashboard, AppSignal>,
+                     layout: &Layout,
+                     action| {
+            let button = layout
+                .controls
+                .iter()
+                .find(|button| button.action == action)
+                .unwrap();
+            assert_eq!(
+                layout.control_at(button.area.x, button.area.y),
+                Some(action)
+            );
+            dispatch_input(
+                app,
+                global,
+                mouse_event(
+                    MouseInputKind::MouseDown(Button::Left),
+                    button.area.x,
+                    button.area.y,
+                ),
+            )
+        };
 
-        click(&mut app, &mut global, FooterAction::NextDisk);
+        click(&mut app, &mut global, &layout, FooterAction::NextDisk);
         assert_eq!(global.state.selected, 1);
         dispatch_input(
             &mut app,
@@ -4924,7 +4829,15 @@ mod tests {
         );
         assert_eq!(global.state.selected, 0);
 
-        click(&mut app, &mut global, FooterAction::ScrollDown);
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::Character('d'),
+            }),
+        );
+        layout = layout_for_state(80, 17, &global.state);
+        click(&mut app, &mut global, &layout, FooterAction::ScrollDown);
         assert_eq!(global.state.content_scroll, 1);
         dispatch_input(
             &mut app,
@@ -4942,12 +4855,12 @@ mod tests {
             }),
         );
         assert_eq!(global.state.content_scroll, 1);
-        click(&mut app, &mut global, FooterAction::ScrollUp);
+        click(&mut app, &mut global, &layout, FooterAction::ScrollUp);
         assert_eq!(global.state.content_scroll, 0);
     }
 
     #[test]
-    fn compact_mouse_controls_cover_disk_selection_detail_scroll_and_exit() {
+    fn compact_mouse_controls_cover_disk_selection_summary_scroll_and_exit() {
         let state = Dashboard {
             disks: (0..4)
                 .map(|index| DiskView {
@@ -4963,7 +4876,7 @@ mod tests {
         };
         let mut app = DashboardApp::default();
         let mut global = test_global_data(state, 30, 6);
-        let layout = Layout::new(30, 6, 4, 0);
+        let layout = layout_for_state(30, 6, &global.state);
         assert!(layout.controls.is_empty());
 
         dispatch_input(
@@ -4978,7 +4891,7 @@ mod tests {
         assert_eq!(global.state.selected, 1);
         assert_eq!(global.state.scroll, 0);
 
-        let selected_layout = Layout::for_state(30, 6, &global.state);
+        let selected_layout = layout_for_state(30, 6, &global.state);
         let selected_position = selected_layout
             .tab_indices
             .iter()
@@ -5001,7 +4914,7 @@ mod tests {
             &mut global,
             mouse_event(MouseInputKind::ScrollDown, 15, layout.body_y),
         );
-        assert_eq!(global.state.content_scroll, 1);
+        assert_eq!(global.state.content_scroll, 0);
 
         assert!(matches!(
             dispatch_input(
@@ -5034,7 +4947,7 @@ mod tests {
             error_message: None,
         };
 
-        for (width, height) in [(80, 17), (30, 10)] {
+        for (width, height) in [(80, 17), (30, 17)] {
             let mut app = DashboardApp {
                 started: true,
                 ..Default::default()
@@ -5047,12 +4960,24 @@ mod tests {
                 width,
                 height,
             );
-            let layout = Layout::new(width, height, 1, 0);
-            let body_height = body_view_height(&layout, height);
-            let expected_max =
-                disk_content_line_count(&disk, width, body_height).saturating_sub(body_height);
+            dispatch_input(
+                &mut app,
+                &mut global,
+                InputEvent::Keyboard(KeyPress::Plain {
+                    key: Key::Character('d'),
+                }),
+            );
+            let layout = layout_for_state(width, height, &global.state);
+            let details = disk_detail_lines(
+                &disk,
+                &global.state.history,
+                layout.panel.width.saturating_sub(2).max(1),
+            );
+            let visible_lines = panel_visible_lines(&layout);
+            assert!(visible_lines > 0, "{width}x{height}: {layout:?}");
+            let expected_max = details.len().saturating_sub(visible_lines);
 
-            for _ in 0..20 {
+            for _ in 0..30 {
                 dispatch_input(
                     &mut app,
                     &mut global,
@@ -5062,8 +4987,10 @@ mod tests {
                 );
             }
             assert_eq!(
-                global.state.content_scroll, expected_max,
-                "{width}x{height}"
+                global.state.content_scroll,
+                expected_max,
+                "{width}x{height} {layout:?}; detail_lines={} visible_lines={visible_lines}",
+                details.len()
             );
             dispatch_input(
                 &mut app,
@@ -5086,20 +5013,20 @@ mod tests {
                 dispatch_input(
                     &mut app,
                     &mut global,
-                    mouse_event(MouseInputKind::ScrollDown, 0, layout.body_y),
+                    mouse_event(MouseInputKind::ScrollDown, layout.panel.x, layout.panel.y),
                 );
             }
             assert_eq!(global.state.content_scroll, expected_max);
             dispatch_input(
                 &mut app,
                 &mut global,
-                mouse_event(MouseInputKind::ScrollDown, 0, layout.body_y),
+                mouse_event(MouseInputKind::ScrollDown, layout.panel.x, layout.panel.y),
             );
             assert_eq!(global.state.content_scroll, expected_max);
             dispatch_input(
                 &mut app,
                 &mut global,
-                mouse_event(MouseInputKind::ScrollUp, 0, layout.body_y),
+                mouse_event(MouseInputKind::ScrollUp, layout.panel.x, layout.panel.y),
             );
             assert_eq!(global.state.content_scroll, expected_max - 1);
 
@@ -5107,68 +5034,119 @@ mod tests {
                 dispatch_input(
                     &mut app,
                     &mut global,
-                    mouse_event(MouseInputKind::ScrollDown, 0, layout.body_y),
+                    mouse_event(MouseInputKind::ScrollDown, layout.panel.x, layout.panel.y),
                 );
             }
             assert_eq!(global.state.content_scroll, expected_max);
             let rendered = rendered_text(&mut app, &mut global);
             assert!(rendered.contains("Sair"), "{rendered}");
-            if height >= 17 {
-                assert!(rendered.contains("↑ Detalhes"), "{rendered}");
-            } else {
-                assert!(Layout::new(width, height, 1, 0).controls.is_empty());
-            }
-            let last_visible_row = rendered
-                .lines()
-                .nth(layout.body_y + body_height - 1)
-                .unwrap()
-                .trim();
-            assert!(last_visible_row.contains("LIGADO"), "{rendered}");
-
+            assert!(rendered.contains("DETALHES DO DISCO"), "{rendered}");
             assert!(
                 !rendered.contains("Backup da memória volátil"),
-                "detalhes do aviso não devem poluir o painel: {rendered}"
+                "{rendered}"
+            );
+            for _ in 0..expected_max {
+                dispatch_input(
+                    &mut app,
+                    &mut global,
+                    InputEvent::Keyboard(KeyPress::Plain {
+                        key: Key::SpecialKey(SpecialKey::Up),
+                    }),
+                );
+            }
+            let beginning_render = rendered_text(&mut app, &mut global);
+            assert_eq!(global.state.content_scroll, 0);
+            assert!(
+                beginning_render.contains("DETALHES DO DISCO"),
+                "{beginning_render}"
+            );
+            let backup_row = details
+                .iter()
+                .position(|line| line.text.contains("Backup da memória volátil"))
+                .expect("critical-warning backup explanation should be in detail data");
+            assert!(backup_row <= expected_max);
+            for _ in 0..backup_row {
+                dispatch_input(
+                    &mut app,
+                    &mut global,
+                    InputEvent::Keyboard(KeyPress::Plain {
+                        key: Key::SpecialKey(SpecialKey::Down),
+                    }),
+                );
+            }
+            let backup_render = rendered_text(&mut app, &mut global);
+            assert_eq!(global.state.content_scroll, backup_row);
+            assert!(
+                backup_render.contains("Backup da memória volátil"),
+                "{backup_render}"
+            );
+            for _ in backup_row..expected_max {
+                dispatch_input(
+                    &mut app,
+                    &mut global,
+                    InputEvent::Keyboard(KeyPress::Plain {
+                        key: Key::SpecialKey(SpecialKey::Down),
+                    }),
+                );
+            }
+            let rendered = rendered_text(&mut app, &mut global);
+            assert_eq!(global.state.content_scroll, expected_max);
+            let last_panel_row = layout.panel.y + 3 + visible_lines - 1;
+            assert!(
+                rendered
+                    .lines()
+                    .nth(last_panel_row)
+                    .unwrap()
+                    .contains("útil."),
+                "{rendered}"
             );
 
             if width == 80 {
                 let scroll_before_compacting = global.state.content_scroll;
-                let previous_first_visible_row =
-                    rendered.lines().nth(layout.body_y).unwrap().trim();
                 global.window_size = r3bl_tui::Size::new((
                     r3bl_tui::ColWidth::new(width),
-                    r3bl_tui::RowHeight::new(9),
+                    r3bl_tui::RowHeight::new(15),
                 ));
-                let compact_layout = Layout::new(width, 9, 1, global.state.scroll);
-                let compact_body_height = body_view_height(&compact_layout, 9);
-                let compact_max = disk_content_line_count(&disk, width, compact_body_height)
-                    .saturating_sub(compact_body_height);
+                let compact_layout = layout_for_state(width, 15, &global.state);
+                let compact_visible = panel_visible_lines(&compact_layout);
+                let compact_max = details.len().saturating_sub(compact_visible);
                 let compact_scroll = scroll_before_compacting.min(compact_max);
                 let compact_resize_render = rendered_text(&mut app, &mut global);
                 assert_eq!(global.state.content_scroll, compact_scroll);
-                let compact_first_visible_row = compact_resize_render
-                    .lines()
-                    .nth(compact_layout.body_y)
-                    .unwrap()
-                    .trim();
-                assert_eq!(compact_first_visible_row, previous_first_visible_row);
+                assert!(
+                    compact_resize_render
+                        .lines()
+                        .any(|line| line.contains("DETALHES DO DISCO"))
+                );
 
                 global.state.content_scroll = compact_max;
                 let compact_render = rendered_text(&mut app, &mut global);
                 assert_eq!(global.state.content_scroll, compact_max);
-                assert!(compact_render.contains("LIGADO"), "{compact_render}");
+                assert!(compact_render.contains("útil."), "{compact_render}");
 
                 global.window_size = r3bl_tui::Size::new((
                     r3bl_tui::ColWidth::new(width),
                     r3bl_tui::RowHeight::new(height),
                 ));
-                let expanded_layout = Layout::new(width, height, 1, global.state.scroll);
-                let expanded_body_height = body_view_height(&expanded_layout, height);
-                let expanded_max = disk_content_line_count(&disk, width, expanded_body_height)
-                    .saturating_sub(expanded_body_height);
-                assert!(compact_max > expanded_max);
-                let expanded_render = rendered_text(&mut app, &mut global);
+                let expanded_layout = layout_for_state(width, height, &global.state);
+                let expanded_max = details
+                    .len()
+                    .saturating_sub(panel_visible_lines(&expanded_layout));
+                // Removing compact scroll buttons can increase readable rows.
+                // Verify the actual viewport clamp rather than assuming a
+                // monotonic relationship between terminal and content height.
+                let _ = rendered_text(&mut app, &mut global);
                 assert_eq!(global.state.content_scroll, compact_max.min(expanded_max));
-                assert!(expanded_render.contains("LIGADO"), "{expanded_render}");
+                dispatch_input(
+                    &mut app,
+                    &mut global,
+                    InputEvent::Keyboard(KeyPress::Plain {
+                        key: Key::SpecialKey(SpecialKey::PageDown),
+                    }),
+                );
+                assert_eq!(global.state.content_scroll, expanded_max);
+                let expanded_end = rendered_text(&mut app, &mut global);
+                assert!(expanded_end.contains("útil."), "{expanded_end}");
                 global.state.disks.clear();
                 let _ = rendered_text(&mut app, &mut global);
                 assert_eq!(global.state.content_scroll, 0);
@@ -5442,9 +5420,11 @@ mod tests {
         }
 
         for (width, height, querying) in [(12, 8, false), (12, 8, true), (64, 20, false)] {
+            let mut disk_identity = identity("test", 0);
+            disk_identity.kind = DiskKind::Nvme;
             let state = Dashboard {
                 disks: vec![DiskView {
-                    identity: identity("test", 0),
+                    identity: disk_identity,
                     telemetry: Some(Telemetry::default()),
                     querying,
                     computing: false,
@@ -5488,6 +5468,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            assert!(rendered.contains("N/A"), "{width}x{height}: {rendered}");
             assert!(rendered.contains("ETA"), "{width}x{height}: {rendered}");
         }
 
@@ -5511,30 +5492,25 @@ mod tests {
                 disks: vec![unknown_type],
                 ..Default::default()
             },
-            30,
-            10,
+            80,
+            17,
         );
         let rendered = rendered_text(&mut app, &mut global);
-        assert!(
-            rendered.contains("Sem ETA: tipo desconhecido"),
-            "{rendered}"
+        assert!(rendered.contains("ETA —"), "{rendered}");
+        assert!(!rendered.contains("Tipo: Desconhecido"), "{rendered}");
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::Character('d'),
+            }),
         );
-        assert!(
-            rendered
-                .lines()
-                .any(|line| { line.contains("TIPO") && line.contains("Desconhecido") }),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("Tipo desconheci"), "{rendered}");
+        let details = rendered_text(&mut app, &mut global);
+        assert!(details.contains("Tipo: Desconhecido"), "{details}");
 
         global.state.disks[0].telemetry = None;
-        let rendered = rendered_text(&mut app, &mut global);
-        assert!(
-            rendered
-                .lines()
-                .any(|line| { line.contains("TIPO") && line.contains("Desconhecido") }),
-            "{rendered}"
-        );
+        let details = rendered_text(&mut app, &mut global);
+        assert!(details.contains("Tipo: Desconhecido"), "{details}");
     }
 
     #[test]
@@ -5661,36 +5637,34 @@ mod tests {
                         };
                     for y in tab.y..tab.y + tab.height {
                         for x in tab.x..tab.x + tab.width {
-                            assert!(cell_has_colors(&buffer[y][x], foreground, background));
+                            if layout.tab_indices[position] != global.state.selected
+                                && matches!(buffer[y][x], r3bl_tui::PixelChar::PlainText { .. })
+                            {
+                                assert!(
+                                    cell_has_colors(&buffer[y][x], foreground, background),
+                                    "tab idx={} expected fg/bg={foreground:?}/{background:?} at ({x},{y}) pixel={:?}",
+                                    layout.tab_indices[position],
+                                    buffer[y][x]
+                                );
+                            }
                         }
                     }
                 }
                 let tab_row = rendered.lines().nth(layout.tabs[0].y + 1).unwrap();
-                assert!(tab_row.contains("> Disco #4"), "{tab_row}");
-                assert!(!tab_row.contains("MODELO-UNICO"), "{tab_row}");
-                assert!(
-                    rendered
-                        .lines()
-                        .nth(layout.body_y)
-                        .unwrap()
-                        .contains("MODELO-UNICO"),
-                    "{rendered}"
-                );
-                let health_row = layout.body_y + 1;
-                assert!(cell_has_colors(
-                    &buffer[health_row][1],
-                    TOKYO_GREEN,
-                    TOKYO_BG_DARK1
-                ));
+                assert!(tab_row.contains("#4 MODELO-UNICO"), "{tab_row}");
+                let hero_has_green_score =
+                    (layout.body_y..layout.body_y + body_view_height(&layout, height)).any(|y| {
+                        (0..width).any(|x| cell_has_colors(&buffer[y][x], TOKYO_GREEN, TOKYO_BG))
+                    });
+                assert!(hero_has_green_score, "{rendered}");
                 let eta_row = rendered
                     .lines()
                     .position(|line| line.contains("ETA"))
                     .unwrap();
-                assert!(cell_has_colors(
-                    &buffer[eta_row][1],
-                    TOKYO_FG_DARK,
-                    TOKYO_BG_DARK
-                ));
+                assert!((0..width).any(|x| {
+                    cell_has_colors(&buffer[eta_row][x], TOKYO_FG_DARK, TOKYO_BG)
+                        || cell_has_colors(&buffer[eta_row][x], TOKYO_FG_DARK, TOKYO_BG_DARK)
+                }));
                 for y in layout.quit.y..layout.quit.y + layout.quit.height {
                     for x in layout.quit.x..layout.quit.x + layout.quit.width {
                         assert!(cell_has_colors(&buffer[y][x], TOKYO_BG_DARK1, TOKYO_RED));
@@ -5711,15 +5685,15 @@ mod tests {
                     rendered.contains("#4") && rendered.contains("#8") && rendered.contains("#12"),
                     "{rendered}"
                 );
-                assert!(rendered.contains("SAUDÁVEL · 88%"));
                 assert!(rendered.contains("88%"), "{rendered}");
+                assert!(rendered.contains("ETA —"), "{rendered}");
                 assert!(
                     !rendered.contains("██"),
                     "score compacto esperado: {rendered}"
                 );
             }
             if width == 30 {
-                let layout = Layout::new(width, height, state.disks.len(), state.scroll);
+                let layout = layout_for_state(width, height, &global.state);
                 assert!(layout.controls.is_empty());
                 for y in layout.quit.y..layout.quit.y + layout.quit.height {
                     for x in layout.quit.x..layout.quit.x + layout.quit.width {
@@ -5803,21 +5777,25 @@ mod tests {
         for (width, height) in [(100, 28), (70, 20), (30, 10)] {
             let mut global = test_global_data(state.clone(), width, height);
             let rendered = rendered_text(&mut app, &mut global);
-            assert!(
-                rendered.contains("SAÚDE INDETERMINADA"),
-                "{width}x{height}: {rendered}"
-            );
             assert!(rendered.contains("N/A"), "{width}x{height}: {rendered}");
             assert!(!rendered.contains("100%"), "{width}x{height}: {rendered}");
-            assert!(
-                rendered.contains("ETA não aplicável"),
-                "{width}x{height}: {rendered}"
-            );
             assert!(
                 !rendered.contains("SAUDÁVEL"),
                 "{width}x{height}: {rendered}"
             );
+            assert!(rendered.contains("ETA —"), "{width}x{height}: {rendered}");
         }
+        let mut global = test_global_data(state, 100, 28);
+        dispatch_input(
+            &mut app,
+            &mut global,
+            InputEvent::Keyboard(KeyPress::Plain {
+                key: Key::Character('d'),
+            }),
+        );
+        let details = rendered_text(&mut app, &mut global);
+        assert!(details.contains("SAÚDE INDISPONÍVEL"), "{details}");
+        assert!(details.contains("HDD"), "{details}");
     }
 
     #[test]
@@ -5903,7 +5881,6 @@ mod tests {
         };
         let mut global = test_global_data(state, 100, 28);
         let main_view = rendered_text(&mut app, &mut global);
-        assert!(main_view.contains("SAÚDE INDETERMINADA"), "{main_view}");
         assert!(main_view.contains("N/A"), "{main_view}");
         assert!(!main_view.contains("0%"), "{main_view}");
         assert!(!main_view.contains("pendentes aguardando"), "{main_view}");
@@ -6006,4 +5983,6 @@ mod tests {
         assert!(!temporary.exists(), "arquivo temporário remanescente");
         std::fs::remove_file(path).unwrap();
     }
+
+    include!("ui/redesign_tests.rs");
 }

@@ -31,17 +31,19 @@ Requer Windows 10/11 e um terminal compatível com TUI. Releases incluem execut�
 - O histórico fica em `%APPDATA%\chkdsk\historico.json` (ou na pasta temporária do usuário quando `%APPDATA%` não está definido). Mantém até 35 dias por disco: amostras por hora nos sete dias mais recentes e por dia antes disso. Uma regressão do contador de desgaste descarta o histórico anterior daquele disco para iniciar uma nova linha de base.
 - Na inicialização normal, a partir da versão 0.0.2, o aplicativo solicita elevação pelo UAC nativo do Windows e se reinicia com privilégios de administrador após a confirmação. `chkdsk.exe --version` apenas imprime a versão e não solicita elevação. Windows, driver, controlador ou adaptador USB ainda podem bloquear consultas SMART; elevar privilégios não torna disponível uma telemetria que o dispositivo ou controlador não fornece.
 
-## Controles
+## Interface e controles
 
-- `←` / `→` ou `Tab` / `Shift+Tab`: alternar entre discos.
-- `↑` / `↓` ou `j` / `k`: rolar o conteúdo do painel ou a central de notificações quando aberta; `PageUp` / `PageDown` percorrem cinco linhas.
-- Clique em uma aba para selecionar o disco; a roda do mouse rola o painel ou, sobre as abas, alterna discos. Os botões auxiliares aparecem quando há espaço vertical suficiente.
-- `n` ou o botão `Avisos`/`!`: abrir e fechar a central. Os avisos também aparecem como notificações temporárias e somem após alguns segundos; o histórico da geração atual fica acessível na central (até 64 eventos).
-- Clique no aviso temporário para abrir a central. Com ela aberta, clique em `Fechar`/`×`, pressione `n` ou `Esc` para voltar; a roda do mouse também percorre o histórico.
-- Clique no botão de saída para encerrar; em larguras estreitas, ele aparece como `×`.
-- `q`: sair. `Esc` fecha a central quando aberta; com a central fechada, sai.
-- O inventário é atualizado automaticamente. Quando discos são conectados ou removidos, os avisos da geração anterior são descartados, a seleção tenta permanecer no mesmo disco e a nova telemetria pode gerar avisos atualizados.
-- Abaixo de 17 linhas de altura, o rodapé de botões fica oculto; use a roda do mouse no painel/abas ou o teclado. Abaixo de 11 linhas, cabeçalho e abas usam uma linha compacta.
+A tela principal destaca o percentual de saúde em ASCII e a ETA, visualmente secundária. Os nomes dos discos ficam nas abas permanentes. `N/A` indica que não há evidência suficiente para uma nota; `ETA —` indica ausência de previsão. Confiança da leitura, motivos de indisponibilidade, limites da heurística e demais métricas ficam nos painéis.
+
+- `←` / `→` ou `Tab` / `Shift+Tab`: alternar entre discos; também é possível clicar nas abas ou nos botões de navegação. A roda sobre as abas alterna discos.
+- `d` ou o botão `Detalhes`/`D`: abrir e fechar os detalhes do disco selecionado.
+- `n` ou o botão `Avisos`/`!`: abrir e fechar a central de notificações. O aviso temporário também pode ser clicado para abrir a central.
+- Os painéis direitos começam fechados, são opacos e mutuamente exclusivos. Ao abrir um, o botão do outro fica oculto; as teclas `d` e `n` permitem trocar entre eles. Em terminais estreitos, o painel cobre toda a área abaixo das abas.
+- `↑` / `↓` ou `j` / `k`: rolar o painel aberto; `PageUp` / `PageDown` percorrem cinco linhas. A roda dentro do painel e seus botões `↑` / `↓` oferecem o mesmo controle com mouse. Cliques e rolagem dentro dele não atingem controles cobertos.
+- `Esc`: fechar o painel aberto; com ambos fechados, sair. `q` ou o botão `Sair`/`×`: sair.
+- O inventário e a telemetria são atualizados automaticamente a cada 15 segundos. A seleção e o histórico permanecem vinculados à identidade do disco. Discos com dados parciais continuam visíveis.
+- A central mostra os avisos da coleta atual, sem acumular mensagens resolvidas de coletas anteriores. Um problema persistente continua acessível após a nova leitura, sem repetir a notificação temporária a cada atualização. O painel aberto permanece aberto durante a atualização.
+- Botões e abas têm texto negrito centralizado e padding de uma célula. Abaixo de 11 linhas usam uma linha compacta; abaixo de 17 linhas o rodapé fica oculto. A nota usa texto compacto quando o ASCII grande não cabe.
 
 ## Desenvolvimento
 
