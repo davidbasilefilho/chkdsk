@@ -1,6 +1,38 @@
 // Behavioral acceptance of the reconstructed interface, using real app input
 // and renderer cells. Native Windows terminal/hardware acceptance is separate.
 
+#[test]
+fn panel_toggles_keep_their_hitboxes_for_repeated_mouse_clicks() {
+    for width in [8, 12, 30, 49, 50, 70, 100, 160] {
+        for height in [1, 2, 6, 10, 20, 28, 40] {
+            for details in [true, false] {
+                let state = redesigned_fixture();
+                let initial = layout_for_state(width, height, &state);
+                let button = if details { initial.detail_button } else { initial.notification_button };
+                assert!(button.visible(), "missing toggle at {width}x{height}");
+                for y in button.y..button.y + button.height {
+                    for x in button.x..button.x + button.width {
+                        let mut app = DashboardApp { started: true, ..Default::default() };
+                        let mut global = test_global_data(state.clone(), width, height);
+                        for opened in [true, false, true, false] {
+                            dispatch_input(&mut app, &mut global, mouse_event(MouseInputKind::MouseDown(Button::Left), x, y));
+                            assert_eq!(global.state.details_open, details && opened, "details at {width}x{height}, ({x},{y})");
+                            assert_eq!(global.state.notifications_open, !details && opened, "notices at {width}x{height}, ({x},{y})");
+                            let layout = layout_for_state(width, height, &global.state);
+                            let active = if details { layout.detail_button } else { layout.notification_button };
+                            assert_eq!((active.x, active.y, active.width, active.height), (button.x, button.y, button.width, button.height), "toggle moved at {width}x{height}");
+                            if opened {
+                                let other = if details { layout.notification_button } else { layout.detail_button };
+                                assert!(!other.visible());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn redesigned_fixture() -> Dashboard {
     let mut nvme = Telemetry::default();
     nvme.apply_nvme(crate::model::NvmeHealth { percentage_used: Some(12), ..Default::default() });

@@ -1279,9 +1279,12 @@ impl Layout {
         } else {
             1
         };
+        // Reserve both toggle slots even when the other panel's button is
+        // hidden, so repeated clicks use the same open/close hitbox.
+        let notification_x = layout.quit.x.saturating_sub(toggle_width + 1);
         layout.notification_button = if !state.details_open && width >= 4 {
             HitArea {
-                x: layout.quit.x.saturating_sub(toggle_width + 1),
+                x: notification_x,
                 y: 0,
                 width: toggle_width.min(layout.quit.x),
                 height: button_height,
@@ -1290,11 +1293,7 @@ impl Layout {
             HitArea::default()
         };
         layout.detail_button = if !state.notifications_open && width >= 8 {
-            let right = if layout.notification_button.visible() {
-                layout.notification_button.x
-            } else {
-                layout.quit.x
-            };
+            let right = notification_x;
             HitArea {
                 x: right.saturating_sub(toggle_width + 1),
                 y: 0,
