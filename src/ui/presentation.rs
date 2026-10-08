@@ -273,7 +273,6 @@ pub(super) fn disk_detail_lines(
                 .map(move |text| NotificationLine {
                     text,
                     foreground: color,
-                    background: TOKYO_BG_DARK1,
                     bold,
                 })
         })
