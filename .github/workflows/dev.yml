@@ -2,7 +2,7 @@ name: development release
 
 on:
   push:
-    branches: ["**"]
+    branches-ignore: ["codex/checkpoint/**"]
     tags-ignore: ["**"]
 
 jobs:
