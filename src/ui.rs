@@ -1670,7 +1670,6 @@ fn clamp_content_scroll(state: &mut Dashboard, width: usize, height: usize) {
 struct NotificationLine {
     text: String,
     foreground: RgbValue,
-    background: RgbValue,
     bold: bool,
 }
 
@@ -1686,7 +1685,6 @@ fn notification_center_lines(state: &Dashboard, max_width: usize) -> Vec<Notific
             NotificationLine {
                 text,
                 foreground: color,
-                background: TOKYO_BG_DARK1,
                 bold: true,
             }
         }));
@@ -1707,7 +1705,6 @@ fn notification_center_lines(state: &Dashboard, max_width: usize) -> Vec<Notific
                     .map(|(index, text)| NotificationLine {
                         text: format!("{}{}", if index == 0 { prefix } else { &indent }, text),
                         foreground: TOKYO_FG,
-                        background: TOKYO_BG_DARK,
                         bold: false,
                     }),
             );
@@ -1715,7 +1712,6 @@ fn notification_center_lines(state: &Dashboard, max_width: usize) -> Vec<Notific
         lines.push(NotificationLine {
             text: String::new(),
             foreground: TOKYO_FG_DARK,
-            background: TOKYO_BG,
             bold: false,
         });
     }
@@ -1726,7 +1722,6 @@ fn notification_center_lines(state: &Dashboard, max_width: usize) -> Vec<Notific
                 .map(|text| NotificationLine {
                     text,
                     foreground: TOKYO_FG_DARK,
-                    background: TOKYO_BG_DARK,
                     bold: false,
                 }),
         );
@@ -2333,6 +2328,7 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     lines
 }
 
+#[cfg(test)]
 fn pad_to_columns(text: &str, width: usize) -> String {
     let text = clipped(text, width);
     let display_width = r3bl_tui::GCStringOwned::new(&text)
