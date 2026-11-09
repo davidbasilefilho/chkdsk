@@ -1,0 +1,64 @@
+{
+  "id": "assignment-0mw9kg9vv-gm7f",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 3,
+  "roleTask": "Worker.visual",
+  "slug": "repair-round-1-of-3-for-the-rune-rewrite",
+  "objective": "Repair round 1 of 3 for the rune rewrite of chkdsk: fix the visual review's material findings and the code review's non-blocking findings, then re-capture.",
+  "state": "Running",
+  "scope": [
+    "Worktree /home/user/chkdsk-rune, branch rune-rewrite at 0f3878d (rewrite 97e2d6a + x86 removal 0f3878d). Your earlier work: src/ui.rs, src/ui/tests.rs, src/present.rs, src/collector.rs, src/fixtures.rs, src/main.rs, README.md; capture helper /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/capture.sh; captures in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/captures/"
+  ],
+  "constraints": [
+    "Visual findings to fix (from review of /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/captures/): V1 status pill text in sentence case: Saudável, Atenção, Indisponível (present.rs Health::new; update README.md where it names the states). V2 indisponivel hero shows English 'N/A' at 72px, duplicating the pill in warning amber: show no numeric hero (or a muted em dash) for unknown health, keep only the pill. V3 atencao: the sentence explaining the failure verdict ('O dispositivo relatou uma falha') is grey secondary text while the milder permission message is red: give the verdict explanation the attention/critical color and weight consistent with its severity. V4 sidebar status dots differ only by hue: add a non-color cue (e.g. short status text such as the status word or score next to each disk, or distinct shapes) so color is never the only signal. V5 error copy must say how to recover: 'Não foi possível consultar os dados de saúde' and 'Permissão insuficiente…' get a short remedy (e.g. that it retries automatically in 15 s, or to run as administrator / check the controller), in pt_BR, concise. V6 permanent shortcut footer is unnecessary text and 'Tab' duplicates arrows: drop the footer (README documents controls) or reduce it to at most one short muted line; keep all key bindings themselves working (q/Esc quit stays, user requirement). V7 the pill is the only non-color verdict: ensure its text/background contrast is at least 4.5:1 in light and dark; measure from the theme colors and report the ratios. V8 loading copy 'Consultando e interpretando dados...' becomes 'Consultando o disco…' with a real ellipsis; use … consistently",
+    "Optional, fix only if trivial: put the percent with the score or label it clearly ('96' with 'saúde' caption instead of a detached '% saúde'); do not bold placeholder values such as 'aguardando histórico'; right-align numeric ATA columns",
+    "Code findings to fix: C1 src/collector.rs:266 backend::discover() runs inline without catch_unwind; a panic kills the collector forever; wrap it so a panic becomes the discovery-failed notice and collection continues, with a test. C2 src/main.rs: with windows_subsystem=windows a failed rune start (no GPU / DX12) gives no feedback; on Windows show a MessageBoxW with a short pt_BR message when App::try_run (or equivalent) fails, using windows-sys (add only the needed feature); keep non-Windows printing to stderr. C3 src/ui.rs:85 when apply() moves selection because the selected disk vanished, reset detail scroll like select() does, with a test. C4 src/ui.rs:143 Left/Right/Tab must ignore presses with Ctrl/Alt/Super modifiers (Shift+Tab still goes back), with a test. C5 src/ui.rs:221 key sidebar rows by disk id, not index",
+    "Keep everything else unchanged; health/history/model/parse untouched",
+    "Re-run: cargo fmt --check, cargo test, cargo test --all-features, cargo clippy --all-targets --all-features -- -D warnings, cargo xwin check/clippy for x86_64-pc-windows-msvc and aarch64-pc-windows-msvc; report exit codes and test counts",
+    "Re-render all 26 captures (same names) into /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/captures/ overwriting the old ones, and also add searching (Notice::Searching) and discovery-failed (Notice::DiscoveryFailed) scenes at 1100x720 dark and light; inspect every changed capture yourself; read /root/.claude/plugins/synced/03eb801d-6ff6-4373-b5b1-f94edf359a3e_0f3e6ee9-af2e-4c2c-8d3c-9be25ca27713/holyagent/skills/desktop-design/SKILL.md again for the checklist",
+    "Make no git writes",
+    "Report in under 400 words; each finding id (V1-V8, C1-C5) with what changed and its evidence; put logs in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/logs/"
+  ],
+  "criteria": [
+    {
+      "text": "V1-V8 each fixed and visible in the re-rendered captures, with the pill contrast ratios reported",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "C1-C5 each fixed; C1, C3, C4 each have a test that fails without the fix",
+      "blocking": true,
+      "dimension": "tests"
+    },
+    {
+      "text": "fmt, test, clippy (Linux, all features) and xwin check/clippy for x86_64 and aarch64 msvc pass, with exit codes and counts",
+      "blocking": true,
+      "dimension": "tests"
+    },
+    {
+      "text": "Changes limited to the owned paths and to the findings listed",
+      "blocking": true,
+      "dimension": "scope"
+    }
+  ],
+  "evidence": [
+    "checks-run",
+    "changed-paths",
+    "captures"
+  ],
+  "ownershipPaths": [
+    "src",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md"
+  ],
+  "dependencies": [],
+  "independentFrom": [],
+  "followUpOf": "assignment-0mw9j8z6v-kg5g",
+  "specialist": {
+    "model": "sonnet",
+    "effort": "high",
+    "startedAt": "2026-11-09T17:59:52.075Z"
+  },
+  "createdAt": "2026-11-09T17:59:52.075Z"
+}
