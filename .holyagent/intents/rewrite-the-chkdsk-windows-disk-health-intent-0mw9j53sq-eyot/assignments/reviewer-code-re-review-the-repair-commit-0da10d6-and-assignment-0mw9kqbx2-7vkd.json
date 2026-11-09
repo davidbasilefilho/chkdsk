@@ -1,0 +1,54 @@
+{
+  "id": "assignment-0mw9kqbx2-7vkd",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 3,
+  "roleTask": "Reviewer.code",
+  "slug": "re-review-the-repair-commit-0da10d6-and",
+  "objective": "Re-review the repair commit 0da10d6 and the x86-removal commit 0f3878d on branch rune-rewrite (worktree /home/user/chkdsk-rune) of the chkdsk rune rewrite.",
+  "state": "Running",
+  "scope": [
+    "git -C /home/user/chkdsk-rune diff 0f3878d..0da10d6 (repair) and git -C /home/user/chkdsk-rune show 0f3878d (drops i686 target from mise.toml, scripts/release.py, README.md)"
+  ],
+  "constraints": [
+    "Previous findings the repair claims to fix: C1 collector.rs discover() panic killed collector (now catch_unwind -> DiscoveryFailed); C2 main.rs no feedback when rune start fails under windows_subsystem (now try_run + stderr + MessageBoxW on Windows); C3 ui.rs selection moved by update kept old scroll (now reset in Dashboard::deliver); C4 Left/Right/Tab acted with Ctrl/Alt/Super; C5 sidebar rows keyed by index (now disco-<id>). Also visual copy/contrast changes in present.rs",
+    "Verify each fix and look for regressions the repair introduced only; do not re-review unchanged code",
+    "For 0f3878d check release.py stays consistent (targets, asset names, checksum manifest count, self-check) and python3 scripts/release.py self-check passes",
+    "Run cargo fmt --check, cargo test, cargo clippy --all-targets --all-features -- -D warnings in the worktree (or a git archive copy)",
+    "Make no edits and no git writes",
+    "Report in under 350 words: per finding C1-C5 closed/open with evidence, any new finding with file:line, severity and scenario, gate commands with exit codes and counts"
+  ],
+  "criteria": [
+    {
+      "text": "States for each of C1-C5 whether it is closed, with file:line evidence",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "Any new blocking finding names file:line and a concrete failure scenario",
+      "blocking": true,
+      "dimension": "regressions"
+    },
+    {
+      "text": "Reports the gate commands with exit codes and test counts",
+      "blocking": true,
+      "dimension": "tests"
+    }
+  ],
+  "evidence": [
+    "checks-run",
+    "findings"
+  ],
+  "ownershipPaths": [],
+  "dependencies": [],
+  "independentFrom": [
+    "assignment-0mw9kg9vv-gm7f",
+    "assignment-0mw9k6muh-81hs"
+  ],
+  "followUpOf": "assignment-0mw9k5a5j-vh84",
+  "specialist": {
+    "model": "sonnet",
+    "effort": "high",
+    "startedAt": "2026-11-09T18:07:41.271Z"
+  },
+  "createdAt": "2026-11-09T18:07:41.271Z"
+}
