@@ -1,0 +1,52 @@
+{
+  "id": "assignment-0mw9ky4nj-y2se",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 3,
+  "roleTask": "Reviewer.code",
+  "slug": "review-the-final-cleanup-commit-on",
+  "objective": "Review the final cleanup commit on branch rune-rewrite (worktree /home/user/chkdsk-rune), range 0da10d6..HEAD, of the chkdsk rune rewrite.",
+  "state": "Running",
+  "scope": [
+    "git -C /home/user/chkdsk-rune diff 0da10d6..HEAD (src/main.rs, src/ui.rs, src/ui/tests.rs, src/present.rs)"
+  ],
+  "constraints": [
+    "Findings it claims to fix: N1 start-failure dialog shown for headless --snap runs (now early return on rune::is_headless(), error text on stderr); N2 selection moved by an update not scrolled into view in the sidebar, stale DiscoveryFailed notice persisting after disks are listed; N3 '15 segundos' hard-coded in present.rs (now retry_message(DISCOVERY_INTERVAL)). Known leftover: Notice::hint in src/ui.rs still hard-codes '15 segundos' (non-blocking)",
+    "Verify each fix and look only for regressions this diff introduced",
+    "Run cargo fmt --check, cargo test, cargo clippy --all-targets --all-features -- -D warnings",
+    "Make no edits and no git writes",
+    "Report in under 250 words: N1-N3 closed/open with file:line, new findings with severity, gate exit codes and counts"
+  ],
+  "criteria": [
+    {
+      "text": "States for each of N1-N3 whether it is closed, with file:line evidence",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "Any new blocking finding names file:line and a concrete failure scenario",
+      "blocking": true,
+      "dimension": "regressions"
+    },
+    {
+      "text": "Reports the gate commands with exit codes and test counts",
+      "blocking": true,
+      "dimension": "tests"
+    }
+  ],
+  "evidence": [
+    "checks-run",
+    "findings"
+  ],
+  "ownershipPaths": [],
+  "dependencies": [],
+  "independentFrom": [
+    "assignment-0mw9ku2w5-2zri"
+  ],
+  "followUpOf": "assignment-0mw9kqbx2-7vkd",
+  "specialist": {
+    "model": "sonnet",
+    "effort": "high",
+    "startedAt": "2026-11-09T18:13:45.103Z"
+  },
+  "createdAt": "2026-11-09T18:13:45.103Z"
+}
