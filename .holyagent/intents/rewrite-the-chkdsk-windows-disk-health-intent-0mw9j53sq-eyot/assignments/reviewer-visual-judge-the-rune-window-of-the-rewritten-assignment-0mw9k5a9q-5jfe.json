@@ -43,6 +43,7 @@
     "assignment-0mw9j8z6v-kg5g"
   ],
   "specialist": {
+    "agentId": "workflow:wf_0482e0b0-4e3/assignment-0mw9k5a9q-5jfe",
     "model": "sonnet",
     "effort": "high",
     "startedAt": "2026-11-09T17:51:25.646Z"
