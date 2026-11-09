@@ -42,14 +42,15 @@ pub enum Body {
 pub struct Health {
     pub tone: Tone,
     pub label: &'static str,
-    /// `93`, or `N/A` when there is no usable evidence.
-    pub score: String,
-    pub scored: bool,
+    /// `93`; none when there is no usable evidence.
+    pub score: Option<String>,
     /// `412 dias` or `aguardando histórico`.
     pub lifetime: String,
+    /// The lifetime is an estimate, not the waiting placeholder.
+    pub lifetime_known: bool,
     pub status: &'static str,
-    /// The status line is about missing permission.
-    pub status_alert: bool,
+    /// How loudly the status line speaks; none for a plain remark.
+    pub status_tone: Option<Tone>,
     pub wear: String,
     pub temperature: String,
     pub power_on: String,
@@ -99,6 +100,15 @@ impl Card {
         }
     }
 
+    /// The word next to the disk in the list, so color is never the only signal.
+    pub fn status_label(&self) -> &'static str {
+        match &self.body {
+            Body::Loading => "Lendo…",
+            Body::Message(_) => "Indisponível",
+            Body::Health(health) => health.label,
+        }
+    }
+
     /// Color of the disk's dot in the list; none until there is a reading.
     pub fn tone(&self) -> Option<Tone> {
         match &self.body {
@@ -114,11 +124,11 @@ impl Health {
         let telemetry = &ready.telemetry;
         let health = score_health(kind, telemetry);
         let (label, tone) = match health.outcome {
-            HealthOutcome::Pass => ("SAUDÁVEL", Tone::Healthy),
-            HealthOutcome::Fail => ("ATENÇÃO", Tone::Attention),
-            HealthOutcome::Unknown => ("INDISPONÍVEL", Tone::Unknown),
+            HealthOutcome::Pass => ("Saudável", Tone::Healthy),
+            HealthOutcome::Fail => ("Atenção", Tone::Attention),
+            HealthOutcome::Unknown => ("Indisponível", Tone::Unknown),
         };
-        let scored = health.outcome != HealthOutcome::Unknown;
+        let score = (health.outcome != HealthOutcome::Unknown).then(|| health.score.to_string());
         let warnings = match &telemetry.nvme {
             QueryState::Success(nvme) => [
                 (1, "Reserva NVMe crítica"),
@@ -136,18 +146,14 @@ impl Health {
         Health {
             tone,
             label,
-            score: if scored {
-                health.score.to_string()
-            } else {
-                "N/A".into()
-            },
-            scored,
+            score,
             lifetime: ready
                 .remaining_seconds
                 .map(format_endurance_days)
                 .unwrap_or_else(|| "aguardando histórico".into()),
+            lifetime_known: ready.remaining_seconds.is_some(),
             status: telemetry_status(telemetry),
-            status_alert: any_permission_failure(telemetry),
+            status_tone: status_tone(telemetry),
             wear: telemetry
                 .endurance_percent
                 .map(|wear| format!("{wear:.0}%"))
@@ -189,12 +195,15 @@ fn attribute_row(attribute: &AtaAttribute) -> AttributeRow {
     }
 }
 
+const PERMISSION_MESSAGE: &str =
+    "Permissão insuficiente para consultar o dispositivo. Tente executar como administrador.";
+
 pub fn query_error_message(state: QueryErrorState) -> &'static str {
     match state {
-        QueryErrorState::Permission => "Permissão insuficiente para consultar o dispositivo",
+        QueryErrorState::Permission => PERMISSION_MESSAGE,
         QueryErrorState::Unsupported => "Leitura de saúde não compatível com o dispositivo",
         QueryErrorState::Transient | QueryErrorState::Partial => {
-            "Não foi possível consultar os dados de saúde"
+            "Não foi possível consultar os dados de saúde. Uma nova tentativa acontece em até 15 segundos."
         }
     }
 }
@@ -211,7 +220,7 @@ fn telemetry_has_usable_data(telemetry: &Telemetry) -> bool {
 fn telemetry_status(telemetry: &Telemetry) -> &'static str {
     if !telemetry_has_usable_data(telemetry) {
         if any_permission_failure(telemetry) {
-            return "Permissão insuficiente para consultar o dispositivo";
+            return PERMISSION_MESSAGE;
         }
         if matches!(&telemetry.nvme, QueryState::Unsupported)
             || matches!(&telemetry.ata, QueryState::Unsupported)
@@ -250,6 +259,17 @@ fn telemetry_status(telemetry: &Telemetry) -> &'static str {
         return "Dados de saúde parcialmente disponíveis";
     }
     "Dados SMART disponíveis"
+}
+
+/// A device-reported failure is as loud as the pill; a permission gap only warns.
+fn status_tone(telemetry: &Telemetry) -> Option<Tone> {
+    if any_permission_failure(telemetry) {
+        Some(Tone::Unknown)
+    } else if matches!(&telemetry.overall_failure, QueryState::Success(true)) {
+        Some(Tone::Attention)
+    } else {
+        None
+    }
 }
 
 fn any_permission_failure(telemetry: &Telemetry) -> bool {
@@ -397,17 +417,17 @@ mod tests {
         );
         assert_eq!(
             bare.body,
-            Body::Message("Não foi possível consultar os dados de saúde".into())
+            Body::Message(query_error_message(QueryErrorState::Transient).into())
         );
 
         let unknown = card(identity("id"), ready(Telemetry::default()));
         let Body::Health(health) = unknown.body else {
             panic!("a reading must produce a health body");
         };
-        assert_eq!(health.label, "INDISPONÍVEL");
+        assert_eq!(health.label, "Indisponível");
         assert_eq!(health.tone, Tone::Unknown);
-        assert_eq!(health.score, "N/A");
-        assert!(!health.scored);
+        assert_eq!(health.score, None);
+        assert!(!health.lifetime_known);
         assert_eq!(health.status, "Dados de saúde indisponíveis");
         assert_eq!(health.lifetime, "aguardando histórico");
         assert_eq!(health.wear, "indisponível");
@@ -434,9 +454,9 @@ mod tests {
             ..Default::default()
         };
         for (telemetry, label, tone) in [
-            (healthy, "SAUDÁVEL", Tone::Healthy),
-            (worn, "ATENÇÃO", Tone::Attention),
-            (Telemetry::default(), "INDISPONÍVEL", Tone::Unknown),
+            (healthy, "Saudável", Tone::Healthy),
+            (worn, "Atenção", Tone::Attention),
+            (Telemetry::default(), "Indisponível", Tone::Unknown),
         ] {
             let expected = score_health(DiskKind::Nvme, &telemetry);
             let mut disk = identity("nvme");
@@ -447,8 +467,10 @@ mod tests {
                 panic!("a reading must produce a health body");
             };
             assert_eq!((health.label, health.tone), (label, tone));
-            if health.scored {
-                assert_eq!(health.score, expected.score.to_string());
+            if tone != Tone::Unknown {
+                assert_eq!(health.score, Some(expected.score.to_string()));
+            } else {
+                assert_eq!(health.score, None);
             }
         }
     }
@@ -459,21 +481,18 @@ mod tests {
         assert_eq!(card(disk.clone(), Reading::Pending).body, Body::Loading);
         assert_eq!(card(disk.clone(), Reading::Pending).tone(), None);
         for (state, message) in [
-            (
-                QueryErrorState::Permission,
-                "Permissão insuficiente para consultar o dispositivo",
-            ),
+            (QueryErrorState::Permission, PERMISSION_MESSAGE),
             (
                 QueryErrorState::Unsupported,
                 "Leitura de saúde não compatível com o dispositivo",
             ),
             (
                 QueryErrorState::Transient,
-                "Não foi possível consultar os dados de saúde",
+                "Não foi possível consultar os dados de saúde. Uma nova tentativa acontece em até 15 segundos.",
             ),
             (
                 QueryErrorState::Partial,
-                "Não foi possível consultar os dados de saúde",
+                "Não foi possível consultar os dados de saúde. Uma nova tentativa acontece em até 15 segundos.",
             ),
         ] {
             let failed = card(disk.clone(), Reading::Failed(state));
@@ -542,8 +561,8 @@ mod tests {
         let Body::Health(health) = card(identity("ssd"), ready(telemetry)).body else {
             panic!("a reading must produce a health body");
         };
-        assert_eq!(health.label, "SAUDÁVEL");
-        assert!(health.status_alert);
+        assert_eq!(health.label, "Saudável");
+        assert_eq!(health.status_tone, Some(Tone::Unknown));
 
         let no_data = Telemetry {
             nvme: QueryState::Failed {
@@ -551,14 +570,35 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(
-            telemetry_status(&no_data),
-            "Permissão insuficiente para consultar o dispositivo"
-        );
+        assert_eq!(telemetry_status(&no_data), PERMISSION_MESSAGE);
         let Body::Health(health) = card(identity("ssd"), ready(no_data)).body else {
             panic!("a reading must produce a health body");
         };
-        assert!(health.status_alert);
+        assert_eq!(health.status_tone, Some(Tone::Unknown));
+    }
+
+    #[test]
+    fn a_device_reported_failure_speaks_as_loud_as_the_pill() {
+        let failing = Telemetry {
+            overall_failure: QueryState::Success(true),
+            temperature_c: Some(30),
+            ..Default::default()
+        };
+        let Body::Health(health) = card(identity("hdd"), ready(failing)).body else {
+            panic!("a reading must produce a health body");
+        };
+        assert_eq!(health.status, "O dispositivo relatou uma falha");
+        assert_eq!(health.status_tone, Some(Tone::Attention));
+
+        let calm = Telemetry {
+            overall_failure: QueryState::Success(false),
+            temperature_c: Some(30),
+            ..Default::default()
+        };
+        let Body::Health(health) = card(identity("hdd"), ready(calm)).body else {
+            panic!("a reading must produce a health body");
+        };
+        assert_eq!(health.status_tone, None);
     }
 
     #[test]
@@ -594,6 +634,7 @@ mod tests {
             panic!("a reading must produce a health body");
         };
         assert_eq!(health.lifetime, "412 dias");
+        assert!(health.lifetime_known);
         assert_eq!(health.last_reading, "há 3 dias");
         assert_eq!(health.wear, "7%");
         assert_eq!(health.temperature, "38 °C");

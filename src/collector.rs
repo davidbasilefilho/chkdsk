@@ -263,14 +263,22 @@ fn run(path: PathBuf, deliver: impl Fn(Update)) {
                 if next_discovery <= Instant::now() {
                     next_discovery = Instant::now() + DISCOVERY_INTERVAL;
                 }
-                deliver(match backend::discover() {
-                    Ok(disks) => collector.discovered(disks),
-                    Err(_) => Update::DiscoveryFailed,
-                });
+                deliver(discovery(&mut collector, backend::discover));
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
         start_queries(&mut collector.scheduler, &sender);
+    }
+}
+
+/// A discovery that fails or panics is a notice; collection carries on.
+fn discovery<E>(
+    collector: &mut Collector,
+    discover: impl FnOnce() -> Result<Vec<DiskIdentity>, E> + std::panic::UnwindSafe,
+) -> Update {
+    match std::panic::catch_unwind(discover) {
+        Ok(Ok(disks)) => collector.discovered(disks),
+        Ok(Err(_)) | Err(_) => Update::DiscoveryFailed,
     }
 }
 
@@ -555,6 +563,28 @@ mod tests {
             panic!("discovery must produce disks");
         };
         assert_eq!(changed[0].reading, Reading::Pending);
+    }
+
+    #[test]
+    fn a_panicking_discovery_becomes_the_failure_notice_and_collection_continues() {
+        let mut collector = Collector::new(History::default(), None);
+        assert_eq!(
+            discovery(&mut collector, || -> Result<Vec<DiskIdentity>, String> {
+                panic!("driver exploded")
+            }),
+            Update::DiscoveryFailed
+        );
+        assert_eq!(
+            discovery(&mut collector, || Err::<Vec<DiskIdentity>, _>("falhou")),
+            Update::DiscoveryFailed
+        );
+        // The collector is intact: the next discovery works.
+        let Update::Disks(disks) = discovery(&mut collector, || {
+            Ok::<_, String>(vec![identity("disk-a", 0)])
+        }) else {
+            panic!("a later discovery must produce disks");
+        };
+        assert_eq!(disks.len(), 1);
     }
 
     #[test]

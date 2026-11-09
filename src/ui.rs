@@ -7,7 +7,7 @@ use crate::{
     present::{AttributeRow, Body, Card, Health, Tone},
 };
 use rune::{
-    Color, Cursor, Cx, El, Key, KeyEvent, Live, ScrollSpec, Tx, col, oklch, row, text,
+    Align, Color, Cursor, Cx, El, Key, KeyEvent, Live, ScrollSpec, Tx, col, oklch, row, text,
     tok::{self, TextStyle},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SIDEBAR_WIDTH: f32 = 272.0;
 const SCROLL_STEP: f32 = 56.0;
 const DETAIL_KEY: &str = "detalhe";
+/// The pill's tint of its own color; low enough for 4.5:1 text whatever the blend mode.
+const PILL_TINT: f32 = 0.08;
 
 // Windows type ramp: Caption 12/16, Body 14/20, Subtitle 20/28, Display 72 (semibold, never bold).
 const CAPTION: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0);
@@ -106,6 +108,21 @@ impl Dashboard {
         }
     }
 
+    /// `apply` for the window: when the selection moves to another disk because
+    /// the selected one vanished, the panel opens at its top, as `select` does.
+    pub fn deliver(&mut self, update: Update, now: u64, tx: &mut Tx) -> bool {
+        let before = self.selected_id().map(str::to_owned);
+        let changed = self.apply(update, now);
+        if self.selected_id() != before.as_deref() {
+            tx.scroll_to_instant(DETAIL_KEY, 0.0, 0.0);
+        }
+        changed
+    }
+
+    fn selected_id(&self) -> Option<&str> {
+        self.cards.get(self.selected).map(|card| card.id.as_str())
+    }
+
     pub fn select(&mut self, index: usize, tx: &mut Tx) {
         if self.cards.is_empty() {
             return;
@@ -115,7 +132,7 @@ impl Dashboard {
             self.selected = index;
             tx.scroll_to_instant(DETAIL_KEY, 0.0, 0.0);
         }
-        tx.scroll_into_view(row_key(index));
+        tx.scroll_into_view(row_key(&self.cards[index].id));
     }
 
     fn step(&mut self, forward: bool, tx: &mut Tx) {
@@ -132,17 +149,18 @@ impl Dashboard {
     }
 }
 
-/// The keys of the window: arrows and Tab switch disks, Up and Down scroll the
-/// panel, `q` and Esc quit. Page keys are left to rune, which scrolls the panel.
+/// The keys of the window: arrows and Tab switch disks (not with Ctrl, Alt or
+/// Super held, which belong to the system), Up and Down scroll the panel, `q`
+/// and Esc quit. Page keys are left to rune, which scrolls the panel.
 pub fn on_key(state: &mut Dashboard, event: &KeyEvent, tx: &mut Tx) -> bool {
     let mods = event.mods;
     let plain = !(mods.cmd || mods.ctrl || mods.alt || mods.logo);
     match &event.key {
         Key::Escape => tx.quit(),
         Key::Text(text) if plain && text == "q" => tx.quit(),
-        Key::Left => state.step(false, tx),
-        Key::Right => state.step(true, tx),
-        Key::Tab => state.step(!mods.shift, tx),
+        Key::Left if plain => state.step(false, tx),
+        Key::Right if plain => state.step(true, tx),
+        Key::Tab if plain => state.step(!mods.shift, tx),
         Key::Up => state.scroll_by(-SCROLL_STEP, tx),
         Key::Down => state.scroll_by(SCROLL_STEP, tx),
         Key::Text(text) if plain && text == "k" => state.scroll_by(-SCROLL_STEP, tx),
@@ -177,9 +195,9 @@ impl Palette {
             )
         } else {
             (
-                oklch(0.48, 0.13, 152.0),
-                oklch(0.50, 0.19, 27.0),
-                oklch(0.50, 0.11, 72.0),
+                oklch(0.45, 0.13, 152.0),
+                oklch(0.47, 0.19, 27.0),
+                oklch(0.46, 0.11, 72.0),
             )
         };
         Self {
@@ -218,8 +236,8 @@ pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
         .child(content)
 }
 
-fn row_key(index: usize) -> String {
-    format!("disco-{index}")
+fn row_key(id: &str) -> String {
+    format!("disco-{id}")
 }
 
 fn sidebar(state: &Dashboard, palette: &Palette) -> El {
@@ -242,6 +260,7 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
             } else {
                 Color::TRANSPARENT
             });
+        let status = card.status_label();
         let names = col()
             .grow(1.0)
             .min_w(0.0)
@@ -253,16 +272,23 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
                     .truncate(),
             )
             .child(
-                text(card.subtitle.clone())
-                    .font(CAPTION)
-                    .color(t.text_secondary)
-                    .truncate(),
+                row()
+                    .gap(8.0)
+                    .child(
+                        text(card.subtitle.clone())
+                            .font(CAPTION)
+                            .color(t.text_secondary)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .child(text(status).font(CAPTION_STRONG).color(t.text_secondary)),
             );
         list = list.child(
             row()
-                .key(row_key(index))
+                .key(row_key(&card.id))
                 .role("tab")
-                .label(format!("{}, {}", card.list_name, card.subtitle))
+                .label(format!("{}, {}, {status}", card.list_name, card.subtitle))
                 .checked(selected)
                 .h(56.0)
                 .px(8.0)
@@ -282,19 +308,6 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
                 .child(names),
         );
     }
-    let hint = col()
-        .key("atalhos")
-        .gap(2.0)
-        .child(
-            text("←/→ disco  ·  ↑/↓ rolar")
-                .font(CAPTION)
-                .color(t.text_secondary),
-        )
-        .child(
-            text("Tab próximo  ·  q sair")
-                .font(CAPTION)
-                .color(t.text_secondary),
-        );
     let panel = col()
         .key("discos")
         .w(SIDEBAR_WIDTH)
@@ -306,9 +319,7 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
             })
             .grow(1.0)
             .min_h(0.0),
-        )
-        .child(rune::el().w_full().h(1.0).fill(t.separator))
-        .child(col().padding(16.0).child(hint));
+        );
     row()
         .h_full()
         .child(panel)
@@ -350,7 +361,7 @@ fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
         );
     page = match &card.body {
         Body::Loading => page.child(
-            text("Consultando e interpretando dados…")
+            text("Consultando o disco…")
                 .key("estado")
                 .font(BODY)
                 .color(t.text_secondary)
@@ -389,23 +400,22 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
         .px(12.0)
         .py(4.0)
         .radius(12.0)
-        .fill(tone.alpha(0.16))
+        .fill(tone.alpha(PILL_TINT))
         .child(text(health.label).font(CAPTION_STRONG).color(tone));
-    let mut verdict = col().gap(8.0).ml(20.0).child(pill);
-    if health.scored {
-        verdict = verdict.child(text("% saúde").font(CAPTION).color(t.text_secondary));
-    }
-    let hero = row()
-        .mt(32.0)
-        .center_y()
-        .flex_wrap()
-        .child(
-            text(health.score.clone())
-                .key("nota")
-                .font(SCORE)
-                .color(tone),
-        )
-        .child(verdict);
+    // With no usable evidence there is no number to show, only the pill.
+    let hero = row().mt(32.0).center_y().flex_wrap();
+    let hero = match &health.score {
+        Some(score) => hero
+            .child(text(score.clone()).key("nota").font(SCORE).color(tone))
+            .child(
+                col()
+                    .gap(8.0)
+                    .ml(20.0)
+                    .child(pill)
+                    .child(text("saúde").font(CAPTION).color(t.text_secondary)),
+            ),
+        None => hero.child(pill),
+    };
 
     let fact = |key: &'static str, label: &'static str, value: &str, style: TextStyle| {
         row()
@@ -417,7 +427,16 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
     let facts = col()
         .mt(32.0)
         .gap(12.0)
-        .child(fact("vida", "Vida estimada", &health.lifetime, BODY_STRONG))
+        .child(fact(
+            "vida",
+            "Vida estimada",
+            &health.lifetime,
+            if health.lifetime_known {
+                BODY_STRONG
+            } else {
+                BODY
+            },
+        ))
         .child(fact("desgaste", "Desgaste", &health.wear, BODY))
         .child(fact(
             "temperatura",
@@ -433,18 +452,13 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
             BODY,
         ));
 
-    let mut page = page.child(hero).child(facts).child(
-        text(health.status)
-            .key("situacao")
-            .font(BODY)
-            .color(if health.status_alert {
-                palette.attention
-            } else {
-                t.text_secondary
-            })
-            .wrap()
-            .mt(24.0),
-    );
+    let status = text(health.status).key("situacao").wrap().mt(24.0);
+    let status = match health.status_tone {
+        Some(Tone::Attention) => status.font(BODY_STRONG).color(palette.attention),
+        Some(tone) => status.font(BODY).color(palette.tone(tone)),
+        None => status.font(BODY).color(t.text_secondary),
+    };
+    let mut page = page.child(hero).child(facts).child(status);
     for warning in &health.warnings {
         page = page.child(
             text(*warning)
@@ -463,13 +477,18 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
 fn attributes(rows: &[AttributeRow], palette: &Palette) -> El {
     let t = palette.theme;
     let line = |cells: [&str; 4], style: TextStyle, color: Color| {
-        let cell =
-            |content: &str, width: f32| text(content.to_owned()).font(style).color(color).w(width);
+        let cell = |content: &str, width: f32, align: Align| {
+            text(content.to_owned())
+                .font(style)
+                .color(color)
+                .w(width)
+                .align(align)
+        };
         row()
             .gap(16.0)
-            .child(cell(cells[0], 40.0))
-            .child(cell(cells[1], 56.0))
-            .child(cell(cells[2], 56.0))
+            .child(cell(cells[0], 40.0, Align::Start))
+            .child(cell(cells[1], 56.0, Align::End))
+            .child(cell(cells[2], 56.0, Align::End))
             .child(text(cells[3].to_owned()).font(style).color(color).grow(1.0))
     };
     let mut table = col()

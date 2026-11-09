@@ -44,17 +44,44 @@ fn main() {
     let handle = app.handle();
     // Collection starts after the first frame; headless captures never start it.
     let mut started = false;
-    app.on_ready(move |_| {
+    let app = app.on_ready(move |_| {
         if !std::mem::replace(&mut started, true) {
             let handle = handle.clone();
             collector::spawn(move |update| {
                 let now = ui::now_unix();
                 handle.update_if(move |state, tx| {
                     tx.instant();
-                    state.apply(update, now)
+                    state.deliver(update, now, tx)
                 });
             });
         }
-    })
-    .run();
+    });
+    if let Err(error) = app.try_run() {
+        report_start_failure(&error);
+        std::process::exit(1);
+    }
+}
+
+/// The window could not open (no GPU or DirectX 12). A Windows GUI process has
+/// no console, so say it in a message box; elsewhere stderr is enough.
+fn report_start_failure(error: &str) {
+    eprintln!("chkdsk: {error}");
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+        let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(Some(0)).collect() };
+        let message = wide(
+            "Não foi possível abrir a janela do chkdsk. Verifique se o driver de vídeo está atualizado e se a placa de vídeo é compatível com DirectX 12.",
+        );
+        let title = wide("chkdsk");
+        // SAFETY: both buffers are NUL-terminated and outlive the call; no owner window.
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
 }

@@ -22,6 +22,11 @@ pub const SCENES: &[Scene] = &[
     ("indisponivel", |s| *s = dashboard(2)),
     ("carregando", |s| *s = dashboard(3)),
     ("falha", |s| *s = dashboard(4)),
+    ("procurando", |s| *s = Dashboard::default()),
+    ("descoberta", |s| {
+        *s = Dashboard::default();
+        s.apply(Update::DiscoveryFailed, NOW);
+    }),
     ("vazio", |s| {
         *s = Dashboard::default();
         s.apply(Update::Disks(Vec::new()), NOW);
