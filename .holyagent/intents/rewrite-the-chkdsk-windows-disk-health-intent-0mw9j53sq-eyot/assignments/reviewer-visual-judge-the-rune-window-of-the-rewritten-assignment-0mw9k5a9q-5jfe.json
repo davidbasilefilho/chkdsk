@@ -1,0 +1,46 @@
+{
+  "id": "assignment-0mw9k5a9q-5jfe",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 2,
+  "roleTask": "Reviewer.visual",
+  "slug": "judge-the-rune-window-of-the-rewritten",
+  "objective": "Judge the rune window of the rewritten chkdsk disk-health app from its headless captures for elegance, simplicity, legibility and correctness of content.",
+  "state": "Ready",
+  "scope": [
+    "Captures in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/captures/ named <scene>-<size>-<theme>.png: scenes saudavel, atencao, indisponivel, vazio, carregando, falha at 1100x720 and 760x560, dark and light, plus indisponivel-640x420-light.png and atencao-640x420-dark.png; rendered at scale 2 headless with lavapipe and Inter font (on Windows Segoe UI Variable is preferred; no native window chrome in captures)",
+    "Source for content: /home/user/chkdsk-rune/src/ui.rs, src/present.rs, src/fixtures.rs; README /home/user/chkdsk-rune/README.md"
+  ],
+  "constraints": [
+    "Render target record: captures were produced by /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/capture.sh in worktree /home/user/chkdsk-rune; judge from these files; start nothing",
+    "Read /root/.claude/plugins/synced/03eb801d-6ff6-4373-b5b1-f94edf359a3e_0f3e6ee9-af2e-4c2c-8d3c-9be25ca27713/holyagent/skills/desktop-design/SKILL.md and judge against its shared core, Windows section, refuse list and capture checklist; the user asked for elegant, simple, performant; pt_BR copy",
+    "Report each discrepancy with the capture file, what is wrong, and whether it is material (hierarchy, legibility, clipping, overlap, contrast, wrong content, unnecessary text/cards/badges) or preference",
+    "Report in under 500 words and list every capture you judged"
+  ],
+  "criteria": [
+    {
+      "text": "Read /root/.claude/plugins/synced/03eb801d-6ff6-4373-b5b1-f94edf359a3e_0f3e6ee9-af2e-4c2c-8d3c-9be25ca27713/holyagent/skills/desktop-design/SKILL.md and judge against its checklist and capture list",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "Every capture listed in scope is opened and judged, and each finding names its file",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "Material findings are separated from preferences",
+      "blocking": true,
+      "dimension": "behavior"
+    }
+  ],
+  "evidence": [
+    "captures-judged",
+    "findings"
+  ],
+  "ownershipPaths": [],
+  "dependencies": [],
+  "independentFrom": [
+    "assignment-0mw9j8z6v-kg5g"
+  ],
+  "createdAt": "2026-11-09T17:51:19.359Z"
+}
