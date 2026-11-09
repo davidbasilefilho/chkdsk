@@ -1,0 +1,48 @@
+{
+  "id": "assignment-0mw9k5a5j-vh84",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 2,
+  "roleTask": "Reviewer.code",
+  "slug": "review-commit-97e2d6a-range-eb1d698",
+  "objective": "Review commit 97e2d6a (range eb1d698..97e2d6a, branch rune-rewrite, worktree /home/user/chkdsk-rune) that rewrites the chkdsk Windows disk-health app front end from r3bl_tui to rune, for correctness, regressions, simplicity and performance.",
+  "state": "Ready",
+  "scope": [
+    "git -C /home/user/chkdsk-rune diff eb1d698..97e2d6a; the new src/ui.rs, src/ui/tests.rs, src/collector.rs, src/present.rs, src/fixtures.rs, src/main.rs, the backend.rs stub, Cargo.toml (rune pinned to rev 757bcb1d1da1b3f80484f36ef610b83ddbcc6003)",
+    "Compare against the old behavior in eb1d698 (src/ui.rs, src/main.rs): 15 s discovery, max 4 concurrent queries, history writing, selection/scroll/quit bindings, status mapping, pt_BR text"
+  ],
+  "constraints": [
+    "Requirements: user asked to \"rewrite the app in rune https://github.com/anomalyco/rune\" and \"make it elegant, simple, performant\"; rune is a GPU GUI so a window replacing the TUI is the accepted decision; health/history/model/parse behavior must stay unchanged",
+    "Known and out of scope: i686-pc-windows-msvc fails inside rune upstream (a separate user decision); backend.rs:824-846 possible NVMe overall_failure overwrite predates this change",
+    "Check concurrency in collector.rs (thread lifetimes, shutdown on quit, panics, history write races, unbounded growth), that view does no IO or heavy allocation per frame, and that updates trigger redraw only on visible change",
+    "Run cargo test, cargo clippy --all-targets --all-features -- -D warnings and cargo fmt --check in the worktree; build artifacts may go to the default target dir",
+    "Make no edits and no git writes",
+    "Report in under 500 words: each finding with file:line, severity (blocking/non-blocking) and a concrete failure scenario"
+  ],
+  "criteria": [
+    {
+      "text": "Every blocking finding names file:line and a concrete failure scenario; non-blocking findings are marked as such",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "States whether old behaviors (discovery cadence, concurrency cap, history persistence, bindings, status mapping) are preserved, with evidence",
+      "blocking": true,
+      "dimension": "regressions"
+    },
+    {
+      "text": "Reports the gate commands run with exit codes and test counts",
+      "blocking": true,
+      "dimension": "tests"
+    }
+  ],
+  "evidence": [
+    "checks-run",
+    "findings"
+  ],
+  "ownershipPaths": [],
+  "dependencies": [],
+  "independentFrom": [
+    "assignment-0mw9j8z6v-kg5g"
+  ],
+  "createdAt": "2026-11-09T17:51:19.208Z"
+}
