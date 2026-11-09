@@ -1,0 +1,43 @@
+{
+  "id": "assignment-0mw9j53wk-4wuu",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 1,
+  "roleTask": "Librarian.research",
+  "slug": "establish-what-rune-https-github-com",
+  "objective": "Establish what rune (https://github.com/anomalyco/rune) is and how to build an application like a Windows disk-health terminal dashboard with it.",
+  "state": "Ready",
+  "scope": [
+    "The repository https://github.com/anomalyco/rune: README, docs, examples, source layout, language/runtime, package name and latest version or commit, license, platform support (Windows especially), how input (keyboard, mouse), layout, styling, state/reactivity, async/timers and rendering work",
+    "Whether rune is a TUI framework, a language, or something else; and how an existing Rust app (Windows IOCTL/SMART backend via windows-sys, serde_json history) could be rewritten on it: can the Windows backend stay in Rust, must it move to another language, or does rune offer FFI/native access",
+    "How to install/build/test a rune project, and whether it can run/build on Linux CI and produce Windows binaries"
+  ],
+  "constraints": [
+    "Read-only research; cite URLs and file paths for every fact and separate sourced facts from inference",
+    "Report in under 700 words; put longer notes (API cheat sheet with code snippets of a minimal app: layout, keyboard+mouse handling, timers, list/tabs, scrolling) in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/rune-notes.md and give its path"
+  ],
+  "criteria": [
+    {
+      "text": "States precisely what rune is (kind, language, version/commit) with source citations",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "Gives a concrete, cited API cheat sheet sufficient to write a TUI app with tabs, scrolling panes, keyboard and mouse input, and periodic refresh, or states which of these rune lacks",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "States Windows support and native-code/FFI options with citations, and a recommended architecture for porting a Rust Windows SMART backend",
+      "blocking": true,
+      "dimension": "behavior"
+    }
+  ],
+  "evidence": [
+    "sources",
+    "notes-file"
+  ],
+  "ownershipPaths": [],
+  "dependencies": [],
+  "independentFrom": [],
+  "createdAt": "2026-11-09T17:23:11.493Z"
+}
