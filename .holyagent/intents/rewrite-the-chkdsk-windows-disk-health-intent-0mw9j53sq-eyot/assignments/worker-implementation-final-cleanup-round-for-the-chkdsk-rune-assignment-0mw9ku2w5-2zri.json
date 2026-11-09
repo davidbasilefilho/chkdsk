@@ -5,7 +5,7 @@
   "roleTask": "Worker.implementation",
   "slug": "final-cleanup-round-for-the-chkdsk-rune",
   "objective": "Final cleanup round for the chkdsk rune rewrite: fix the remaining non-blocking code-review findings.",
-  "state": "Running",
+  "state": "Succeeded",
   "scope": [
     "Worktree /home/user/chkdsk-rune, branch rune-rewrite at 0da10d6; files src/main.rs, src/ui.rs, src/ui/tests.rs, src/present.rs, src/collector.rs"
   ],
@@ -49,7 +49,37 @@
     "agentId": "workflow:wf_a4963730-313/assignment-0mw9ku2w5-2zri",
     "model": "sonnet",
     "effort": "high",
-    "startedAt": "2026-11-09T18:10:36.197Z"
+    "startedAt": "2026-11-09T18:10:36.197Z",
+    "finishedAt": "2026-11-09T18:13:44.678Z"
+  },
+  "result": "result: N1, N2 and N3 are fixed, and every gate passes in /home/user/chkdsk-rune (branch rune-rewrite, base 0da10d6). I made no git writes.\n\nchanged: /home/user/chkdsk-rune/src/main.rs, /home/user/chkdsk-rune/src/ui.rs, /home/user/chkdsk-rune/src/ui/tests.rs, /home/user/chkdsk-rune/src/present.rs\nchecks: all logs are in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/logs/\n- `cargo fmt --check` -> 0\n- `cargo test` -> 0, 52 passed\n- `cargo test --all-features` -> 0, 52 passed\n- `cargo clippy --all-targets --all-features -- -D warnings` -> 0\n- `cargo xwin clippy --all-targets --all-features -- -D warnings` -> 0 for x86_64-pc-windows-msvc, 0 for aarch64-pc-windows-msvc\n\nblockers: none\nquestions: none\nnotes:\n- N1: `report_start_failure` returns early on `rune::is_headless()`, so a headless failure goes to stderr only. A windowed failure prints \"chkdsk: could not open the window: {error}\" and, on Windows, still shows the pt_BR dialog.\n- N2: `deliver` now calls `scroll_into_view` on the selected row whenever the selected index or id changes. A non-empty `Disks` update turns a stale `DiscoveryFailed` into `Searching`. `DiscoveryFailed` no longer changes the notice or reports a change while disks are listed.\n- N3: `query_error_message` now returns `String`, built by `retry_message(DISCOVERY_INTERVAL)`.\n- Not touched: `Notice::hint` in `src/ui.rs` (lines 52-53) hard-codes \"15 segundos\" too, and `src/ui/tests.rs` hard-codes it as well. The brief named only `src/present.rs`, so the same drift fix there is left for you to decide.\n- Test limit: `the_retry_message_states_the_discovery_interval` fails without the fix only because `retry_message` takes a different interval (40 s). With the constant at 15 it could not fail.\n\nDiff: /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/logs/cleanup.diff\n\nevidence:\n- N1, N2, N3 each fixed; N2 and N3 have tests that fail without the fix: Tests added are `an_update_that_moves_the_selection_keeps_its_row_in_the_list` and `a_later_successful_discovery_clears_the_failure_notice` in `src/ui/tests.rs`, and `the_retry_message_states_the_discovery_interval` in `src/present.rs`. I temporarily removed each N2 fix and confirmed its test failed: the selected row was at y=696 in a 560-pixel window, and the notice stayed `DiscoveryFailed`. I restored both fixes afterwards. N3 is covered by the 40 s `retry_message` check above.\n- fmt, test (both feature sets), clippy, and xwin clippy x86_64/aarch64 pass with exit codes and counts: all exit 0, see checks above.\n- Changes limited to N1-N3: `git diff --stat` shows only the 4 files above, 96 insertions and 20 deletions.\n- checks-run: see checks.\n- changed-paths: the four files listed under changed.\n",
+  "acceptance": {
+    "revision": 3,
+    "rationale": "N1-N3 fixed; 52 tests, clippy, xwin clippy x64/arm64 exit 0; N2 tests shown failing without fix",
+    "criteria": [
+      {
+        "criterion": "N1, N2, N3 each fixed; N2 and N3 have tests that fail without the fix",
+        "support": "Tests added are `an_update_that_moves_the_selection_keeps_its_row_in_the_list` and `a_later_successful_discovery_clears_the_failure_notice` in `src/ui/tests.rs`, and `the_retry_message_states_the_discovery_interval` in `src/present.rs`. I temporarily removed each N2 fix and confirmed its test failed: the selected row was at y=696 in a 560-pixel window, and the notice stayed `DiscoveryFailed`. I restored both fixes afterwards. N3 is covered by the 40 s `retry_message` check above."
+      },
+      {
+        "criterion": "fmt, test (both feature sets), clippy, and xwin clippy x86_64/aarch64 pass with exit codes and counts",
+        "support": "all exit 0, see checks above."
+      },
+      {
+        "criterion": "Changes limited to N1-N3",
+        "support": "`git diff --stat` shows only the 4 files above, 96 insertions and 20 deletions."
+      }
+    ],
+    "evidence": [
+      {
+        "label": "checks-run",
+        "support": "see checks."
+      },
+      {
+        "label": "changed-paths",
+        "support": "the four files listed under changed."
+      }
+    ]
   },
   "createdAt": "2026-11-09T18:10:36.197Z"
 }
