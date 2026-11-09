@@ -3,10 +3,13 @@
 //! The platform-specific unsafe code is limited to the Win32 boundary below;
 //! device buffers are owned byte vectors and decoded with checked offsets.
 
+// The Win32 half below uses most of these; other platforms only get the stubs.
+#[cfg_attr(not(windows), allow(unused_imports))]
 use crate::{
     model::{DiskIdentity, DiskKind, QueryState, Telemetry},
     parse,
 };
+#[cfg_attr(not(windows), allow(unused_imports))]
 use std::{fmt, io};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +51,8 @@ fn interface_path(identity: &DiskIdentity) -> Option<&str> {
 
 #[cfg(not(windows))]
 pub fn discover() -> Result<Vec<DiskIdentity>, String> {
-    Err("native disk discovery is only available on Windows".into())
+    // Native discovery is Windows-only: elsewhere there is nothing to list.
+    Ok(Vec::new())
 }
 
 #[cfg(not(windows))]

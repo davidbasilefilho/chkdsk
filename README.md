@@ -1,16 +1,16 @@
 # chkdsk
 
-Painel de saúde de discos para Windows, escrito em Rust, com interface de terminal em português brasileiro (pt_BR). Consulta telemetria SMART/Health, apresenta uma nota heurística conservadora e mantém histórico local para tendências de desgaste. O aplicativo não depende de serviços externos durante a execução.
+Painel de saúde de discos para Windows, escrito em Rust, com uma janela nativa em português brasileiro (pt_BR), desenhada com [rune](https://github.com/anomalyco/rune). Consulta telemetria SMART/Health, apresenta uma nota heurística conservadora e mantém histórico local para tendências de desgaste. O aplicativo não depende de serviços externos durante a execução.
 
 > Este projeto não é o `chkdsk` do Windows. Não verifica nem repara sistemas de arquivos, não agenda reparos e não substitui `chkdsk.exe`; também não executa varredura de superfície. Para evitar conflito com a ferramenta do sistema, inicie o executável deste projeto pelo caminho completo.
 
 ## Executar
 
-Requer Windows 10/11 e um terminal compatível com TUI. Releases incluem executáveis para Windows x64-baseline, ARM64 e x86. O runtime não requer Rust, mise ou acesso à rede.
+Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a nota em destaque, vida estimada, desgaste, temperatura, tempo ligado, última leitura e, em discos ATA, os atributos SMART brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. Releases incluem executáveis para Windows x64-baseline, ARM64 e x86. O runtime não requer Rust, mise ou acesso à rede.
 
 ## Pontuação e limites
 
-- A nota de 0 a 100 é determinística, mas não representa probabilidade de falha nem certificação do disco. Com evidência utilizável, notas acima de 50 são classificadas como saudáveis e notas até 50 como atenção; sem evidência utilizável, o estado é **SEM DADOS**.
+- A nota de 0 a 100 é determinística, mas não representa probabilidade de falha nem certificação do disco. Com evidência utilizável, notas acima de 50 são classificadas como saudáveis e notas até 50 como atenção; sem evidência utilizável, o estado é **INDISPONÍVEL** (a nota aparece como `N/A`).
 - Para NVMe, a heurística considera percentual de desgaste usado, reserva disponível e avisos críticos reportados pelo dispositivo; condições críticas aplicam limites máximos à nota. Não há padrão portátil confiável para interpretar universalmente atributos ATA brutos: eles podem ser exibidos, mas não afetam a nota sem mapeamento específico e verificado por modelo.
 - A ETA é uma extrapolação indicativa até 100% de desgaste usado, baseada no segmento atual de histórico desde a leitura mais antiga após o último reset/regressão do contador até a mais recente. Exige aumento positivo observado ao longo do tempo; leituras iguais, regressivas ou dados insuficientes não estabelecem tendência. HDDs não recebem previsão. A ETA não prevê falhas nem garante vida útil.
 - O histórico fica em `%APPDATA%\chkdsk\historico.json` (ou na pasta temporária do usuário quando `%APPDATA%` não está definido). Mantém até 35 dias por disco: amostras por hora nos sete dias mais recentes e por dia antes disso. Uma regressão do contador de desgaste descarta o histórico anterior daquele disco para iniciar uma nova linha de base.
@@ -19,9 +19,9 @@ Requer Windows 10/11 e um terminal compatível com TUI. Releases incluem execut�
 ## Controles
 
 - `←` / `→` ou `Tab` / `Shift+Tab`: alternar entre discos.
-- `↑` / `↓`: rolar o conteúdo do painel; `j` / `k` também navegam pela lista de discos.
-- Clique nas abas/lista de discos para selecionar e no controle de saída para sair; roda do mouse rola o conteúdo (sobre as abas, alterna discos).
-- `q` ou `Esc`: sair.
+- `↑` / `↓` (ou `k` / `j`): rolar o painel do disco; `Page Up`, `Page Down`, `Home` e `End` também rolam.
+- Clique em um disco da lista para selecioná-lo; a roda do mouse rola o painel sob o ponteiro.
+- `q` ou `Esc`: sair. Fechar a janela também encerra o aplicativo.
 
 ## Desenvolvimento
 
@@ -32,6 +32,14 @@ Na raiz do repositório, em PowerShell:
 ```powershell
 mise install
 mise exec -- cargo run
+```
+
+O build usa [rune](https://github.com/anomalyco/rune) fixado em um commit exato (`rev` em `Cargo.toml`); atualize-o de propósito, nunca por branch. Fora do Windows o aplicativo compila e os testes rodam, mas a lista de discos fica vazia (a coleta nativa é só para Windows). No Linux, o rune precisa de `libxkbcommon-dev` e `libwayland-dev`; para renderizar sem GPU, `mesa-vulkan-drivers` com `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+
+Capturas sem disco real (discos de exemplo em `src/fixtures.rs`; cenas: `saudavel`, `atencao`, `indisponivel`, `carregando`, `falha`, `vazio`):
+
+```powershell
+cargo run --features scenes -- --snap captura.png --scene saudavel --size 1100x720 --scale 2 --theme dark
 ```
 
 Validação e compilação:

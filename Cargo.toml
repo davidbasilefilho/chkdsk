@@ -5,10 +5,12 @@ edition = "2024"
 publish = false
 
 [dependencies]
-r3bl_tui = { version = "=0.7.8", default-features = false }
+# Rune has no crates.io release; pin the exact `dev` commit.
+rune = { git = "https://github.com/anomalyco/rune", rev = "757bcb1d1da1b3f80484f36ef610b83ddbcc6003", default-features = false, features = ["accessibility"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
@@ -16,3 +18,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_Ioctl",
     "Win32_System_Threading",
 ] }
+
+[features]
+# Fixture disks for `--snap out.png --scene saudavel` and friends; no effect on the window.
+scenes = []
