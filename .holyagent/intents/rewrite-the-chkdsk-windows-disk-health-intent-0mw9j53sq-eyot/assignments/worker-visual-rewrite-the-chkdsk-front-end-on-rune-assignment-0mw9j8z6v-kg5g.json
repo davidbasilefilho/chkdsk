@@ -1,0 +1,89 @@
+{
+  "id": "assignment-0mw9j8z6v-kg5g",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 2,
+  "roleTask": "Worker.visual",
+  "slug": "rewrite-the-chkdsk-front-end-on-rune",
+  "objective": "Rewrite the chkdsk front end on rune (https://github.com/anomalyco/rune), replacing the r3bl_tui terminal UI with an elegant, simple, performant native rune window while keeping the app's behavior.",
+  "state": "Running",
+  "scope": [
+    "Work only in the git worktree /home/user/chkdsk-rune (branch rune-rewrite). The app: Windows disk-health dashboard in Rust, pt_BR UI. Modules: src/backend.rs (Windows IOCTL/SMART/NVMe queries via windows-sys), src/health.rs (heuristic score), src/history.rs (%APPDATA%\\chkdsk\\historico.json, ETA), src/model.rs, src/parse.rs, src/ui.rs (1916-line r3bl_tui UI), src/main.rs; README.md documents behavior and controls",
+    "Rune facts (from research, verify against the repo): Rust GPU UI framework (wgpu+winit), MIT, no crates.io release; depend as rune = { git = \"https://github.com/anomalyco/rune\", rev = \"<pinned dev commit>\" } and pin an exact rev; rune-kit crate in the same repo has TabStrip, SegmentedControl, Sidebar, Badge, Progress, shell, SplitView. Entry: rune::run(AppSpec::new(title,(w,h),State::default,view)); view(&State,&mut Cx)->El built from col()/row()/text(); handlers .on_press(|s:&mut State|..); AppSpec::setup(state,wake) gives a Waker; poll(state,clock,tx)->bool with tx.wake_after(Duration); App::new(spec).init(..), app.handle() gives Send+Sync AppHandle::update(|s,tx|..) to push state from background threads; AppSpec::on_key for window keys; .scroll(ScrollSpec{..}), .virtualize; tok::theme(true); headless testing via Runtime::new(state,view,(w,h),Env{system_dark:true,scale:2.0}), rt.frame(dt), rt.find(key), rt.pointer_down/up; headless snapshots via -- --snap out.png --scene name and --tree. Read crates/rune/README.md, crates/rune-kit/README.md, AGENTS.md and examples (hello, live-values, todo, kit-gallery) in the rune repo (clone it to a temp dir outside the repo, e.g. /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/rune-src) before designing",
+    "Current behavior to keep (read src/ui.rs for exact strings): a list/tabs of disks to switch between; per-disk panel with status badge (SAUDÁVEL / ATENÇÃO / INDISPONÍVEL), 0-100 score, Vida estimada (ETA), Desgaste, Temperatura, Tempo ligado, Última leitura, raw ATA attributes, status/error messages (e.g. Permissão insuficiente…); discovery every 15s, max 4 concurrent queries, background collection that never blocks the UI; keyboard: Left/Right and Tab/Shift+Tab switch disks, Up/Down scroll the panel, q and Esc quit; mouse: click a disk to select, wheel scrolls; color semantics of the palette in ui.rs:29-68 (healthy/attention/unknown)"
+  ],
+  "constraints": [
+    "Keep backend.rs, health.rs, history.rs, model.rs, parse.rs behavior and their tests unchanged except for the minimal edits rune integration needs; the rewrite is of the UI layer and main.rs, so the scoring, history and telemetry stay exactly as they are",
+    "Make the crate build and its tests run on Linux as well as Windows: gate the Windows-only backend with cfg(windows) and give non-Windows a stub that reports no disks (replace the main.rs compile_error), so UI logic is testable headless here; the Windows build stays the shipped product and the Windows targets (x86_64, aarch64, i686 msvc) must keep compiling — verify with cargo check --target x86_64-pc-windows-msvc (install the target with rustup if missing; use cargo xwin only if plain check cannot work) and name any target you could not verify",
+    "Use #![cfg_attr(windows, windows_subsystem = \"windows\")] or equivalent so no console window opens on Windows, unless rune docs say otherwise",
+    "Remove r3bl_tui and any dependency only it needed; keep the dependency set minimal (rune, rune-kit if used, serde, serde_json, windows-sys); drop tokio if a std::thread collector with AppHandle::update is simpler",
+    "Design: read /root/.claude/plugins/synced/03eb801d-6ff6-4373-b5b1-f94edf359a3e_0f3e6ee9-af2e-4c2c-8d3c-9be25ca27713/holyagent/skills/desktop-design/SKILL.md and follow its shared core, Windows section, refuse list and capture checklist; elegant and simple means one calm window: a disk list or tab strip, one detail panel with the score as the hero, few labels, no decorative cards or badges beyond the status; follow system dark/light theme; pt_BR copy",
+    "Performance: view must be cheap (no allocation-heavy work or IO in view; precompute display strings when snapshots arrive), poll returns true only on visible change, no busy-wait or per-frame timers",
+    "UI tests: port the meaning of the existing ui.rs tests to rune Runtime headless tests (selection, key bindings, scroll, quit, status mapping, unknown-health view keeps lifetime estimate visible) plus fixture snapshots of DiskSnapshot data",
+    "Captures: provide a way to render fixture data headlessly (a test or a --scene with fixture disks: one healthy NVMe with history ETA, one attention disk, one unknown/permission-denied, and the empty no-disks state) and save PNG captures at scale 2 for window sizes 1100x720 and 760x560, dark and light, to /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/captures/, listing each file; if headless snapshot needs a GPU that is missing, try a software adapter (e.g. WGPU/lavapipe/llvmpipe via mesa) and report exactly what blocked",
+    "Update README.md (pt_BR) for the window: Executar, Controles, Desenvolvimento sections; keep the disclaimers; fix the discrepancies the map found only where the rewrite touches them (README says SEM DADOS while UI says INDISPONÍVEL; README says j/k navigate disks)",
+    "Leave .github/workflows, scripts/release.py and mise.toml unchanged unless the rune build requires a change there; if it does, make the minimal change and name it",
+    "Make no git commits, branches or pushes; the root commits",
+    "Name, do not fix, unrelated bugs (e.g. backend.rs:824-846 may overwrite the NVMe critical-warning overall_failure)",
+    "Report in under 500 words; put long logs in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/logs/ and give paths"
+  ],
+  "criteria": [
+    {
+      "text": "Read /root/.claude/plugins/synced/03eb801d-6ff6-4373-b5b1-f94edf359a3e_0f3e6ee9-af2e-4c2c-8d3c-9be25ca27713/holyagent/skills/desktop-design/SKILL.md and build and inspect against its checklist and capture list",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "App is a rune window with disk switching (keys, click), scrollable detail, quit (q/Esc and window close), background collection with 15s discovery and max 4 concurrent queries, and the same pt_BR content as the old UI",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "r3bl_tui removed; rune pinned to an exact git rev; cargo build, cargo test and cargo clippy --all-targets -- -D warnings pass on Linux, and cargo check --target x86_64-pc-windows-msvc passes (or the blocker is named)",
+      "blocking": true,
+      "dimension": "tests"
+    },
+    {
+      "text": "Existing backend/health/history/parse tests still pass unchanged; new rune headless UI tests cover selection, keys, scroll, quit and status mapping",
+      "blocking": true,
+      "dimension": "tests"
+    },
+    {
+      "text": "Captures for the four fixture states at both sizes in dark and light saved in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/captures/ and inspected; no clipped, overlapping or illegible text",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "cargo fmt --check clean; changes limited to the worktree paths owned",
+      "blocking": true,
+      "dimension": "style"
+    },
+    {
+      "text": "README updated to describe the window app accurately",
+      "blocking": false,
+      "dimension": "repo-standards"
+    }
+  ],
+  "evidence": [
+    "checks-run",
+    "changed-paths",
+    "captures",
+    "diff-file"
+  ],
+  "ownershipPaths": [
+    "src",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "mise.toml",
+    ".github",
+    "scripts"
+  ],
+  "dependencies": [],
+  "independentFrom": [],
+  "specialist": {
+    "model": "sonnet",
+    "effort": "high",
+    "startedAt": "2026-11-09T17:26:12.007Z"
+  },
+  "createdAt": "2026-11-09T17:26:12.007Z"
+}
