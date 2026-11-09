@@ -21,13 +21,11 @@ ROOT = Path(__file__).resolve().parents[1]
 TARGETS = {
     "x64": "x86_64-pc-windows-msvc",
     "arm64": "aarch64-pc-windows-msvc",
-    "x86": "i686-pc-windows-msvc",
 }
 # vcvarsall takes host_target; each target uses the matching Hostx64 linker.
 MSVC_ENV = {
     "x64": ("x64", "x64"),
     "arm64": ("x64_arm64", "arm64"),
-    "x86": ("x64_x86", "x86"),
 }
 SEMVER = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
@@ -183,7 +181,7 @@ def build_target(architecture: str, name: str) -> Path:
 def release_asset_names(name: str, version: str, mode: str, sha: str) -> list[str]:
     suffix = f"-dev-{sha[:7].lower()}" if mode == "dev" else ""
     base = f"{name}-{version}{suffix}-windows-"
-    return [base + "x64-baseline.exe", base + "arm64.exe", base + "x86.exe"]
+    return [base + "x64-baseline.exe", base + "arm64.exe"]
 
 
 def expected_assets(mode: str, sha: str, name: str, version: str, output: Path) -> list[Path]:
@@ -208,7 +206,7 @@ def verify_assets(assets_dir: Path, expected: list[Path]) -> None:
     expected_lines = [f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}" for path in binaries]
     found_lines = (assets_dir / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
     if found_lines != expected_lines:
-        raise ValueError("release checksum manifest does not match the three executable assets")
+        raise ValueError("release checksum manifest does not match the two executable assets")
 
 
 def package(mode: str, sha: str, tag: str | None, output: Path) -> None:
@@ -435,16 +433,14 @@ def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> 
 
 
 def self_check() -> None:
-    assert tuple(TARGETS) == ("x64", "arm64", "x86")
+    assert tuple(TARGETS) == ("x64", "arm64")
     assert TARGETS == {
         "x64": "x86_64-pc-windows-msvc",
         "arm64": "aarch64-pc-windows-msvc",
-        "x86": "i686-pc-windows-msvc",
     }
     assert MSVC_ENV == {
         "x64": ("x64", "x64"),
         "arm64": ("x64_arm64", "arm64"),
-        "x86": ("x64_x86", "x86"),
     }
     assert {
         architecture: target_linker(architecture, Path("VC"))
@@ -452,7 +448,6 @@ def self_check() -> None:
     } == {
         "x64": Path("VC/bin/Hostx64/x64/link.exe"),
         "arm64": Path("VC/bin/Hostx64/arm64/link.exe"),
-        "x86": Path("VC/bin/Hostx64/x86/link.exe"),
     }
     assert len(set(TARGETS.values())) == len(TARGETS)
     sha = "abcdef0123456789"
@@ -462,12 +457,10 @@ def self_check() -> None:
     assert release_asset_names("chkdsk", "1.2.3", "dev", sha) == [
         "chkdsk-1.2.3-dev-abcdef0-windows-x64-baseline.exe",
         "chkdsk-1.2.3-dev-abcdef0-windows-arm64.exe",
-        "chkdsk-1.2.3-dev-abcdef0-windows-x86.exe",
     ]
     assert release_asset_names("chkdsk", "1.2.3", "stable", sha) == [
         "chkdsk-1.2.3-windows-x64-baseline.exe",
         "chkdsk-1.2.3-windows-arm64.exe",
-        "chkdsk-1.2.3-windows-x86.exe",
     ]
     for invalid in ("01.2.3", "1.2", "1.2.3-01"):
         try:

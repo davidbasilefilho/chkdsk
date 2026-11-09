@@ -6,7 +6,7 @@ Painel de saúde de discos para Windows, escrito em Rust, com uma janela nativa 
 
 ## Executar
 
-Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a nota em destaque, vida estimada, desgaste, temperatura, tempo ligado, última leitura e, em discos ATA, os atributos SMART brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. Releases incluem executáveis para Windows x64-baseline, ARM64 e x86. O runtime não requer Rust, mise ou acesso à rede.
+Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a nota em destaque, vida estimada, desgaste, temperatura, tempo ligado, última leitura e, em discos ATA, os atributos SMART brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. Releases incluem executáveis para Windows x64-baseline e ARM64. O runtime não requer Rust, mise ou acesso à rede.
 
 ## Pontuação e limites
 
@@ -25,7 +25,7 @@ Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o
 
 ## Desenvolvimento
 
-O ambiente de desenvolvimento usa [mise](https://mise.jdx.dev/) para provisionar Rust estável, `rustfmt`, Clippy, Python 3.12, `prek` e uma distribuição LLVM portátil fixada no projeto. LLVM não é necessário para executar o aplicativo. A compilação Windows requer os componentes do Visual Studio Build Tools (toolset MSVC e Windows SDK) para x64, x86 e ARM64; mise instala os componentes Rust, mas não substitui o linker/SDK MSVC.
+O ambiente de desenvolvimento usa [mise](https://mise.jdx.dev/) para provisionar Rust estável, `rustfmt`, Clippy, Python 3.12, `prek` e uma distribuição LLVM portátil fixada no projeto. LLVM não é necessário para executar o aplicativo. A compilação Windows requer os componentes do Visual Studio Build Tools (toolset MSVC e Windows SDK) para x64 e ARM64; mise instala os componentes Rust, mas não substitui o linker/SDK MSVC.
 
 Na raiz do repositório, em PowerShell:
 
@@ -54,7 +54,7 @@ mise run setup-hook
 mise run release
 ```
 
-`validation` confere formatação, regras de release, linkers MSVC, Clippy, testes x64 e compilação nas três arquiteturas. `setup-hook` instala o hook local do `prek`, que verifica `rustfmt`. `release` gera builds otimizados; também existem `release-x64-baseline`, `release-arm64` e `release-x86`.
+`validation` confere formatação, regras de release, linkers MSVC, Clippy, testes x64 e compilação nas duas arquiteturas. `setup-hook` instala o hook local do `prek`, que verifica `rustfmt`. `release` gera builds otimizados; também existem `release-x64-baseline` e `release-arm64`.
 
 ## Releases
 
@@ -63,7 +63,6 @@ Tags estáveis seguem exatamente `v{versão}` e não aceitam versão SemVer pré
 ```text
 chkdsk-{versão}[-dev-{sha7}]-windows-x64-baseline.exe
 chkdsk-{versão}[-dev-{sha7}]-windows-arm64.exe
-chkdsk-{versão}[-dev-{sha7}]-windows-x86.exe
 ```
 
 `mise run release-check` valida localmente regras SemVer, nomes dos artefatos e mapeamentos de arquitetura sem publicar.
