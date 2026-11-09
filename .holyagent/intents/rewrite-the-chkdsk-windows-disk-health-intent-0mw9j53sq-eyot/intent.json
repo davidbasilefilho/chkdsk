@@ -5,9 +5,11 @@
   "requirements": [
     "User words: \"rewrite the app in rune https://github.com/anomalyco/rune\"",
     "User words: \"make it elegant, simple, performant\"",
-    "Preserve existing user-facing behavior (pt_BR UI, SMART/NVMe telemetry, heuristic score, history/ETA, controls) unless rune forces a change, which must be named"
+    "Preserve existing user-facing behavior (pt_BR UI, SMART/NVMe telemetry, heuristic score, history/ETA, disk switching, scrolling, quit) unless rune forces a change, which must be named",
+    "Decision (forced by rune, a Rust GPU GUI framework that cannot render to a terminal): the app becomes a native rune window instead of a terminal UI; the Rust Windows SMART/IOCTL backend, scoring and history logic stay in Rust",
+    "Work branch rune-rewrite in worktree /home/user/chkdsk-rune, from origin/main"
   ],
-  "revision": 1,
+  "revision": 2,
   "state": "Open",
   "createdAt": "2026-11-09T17:23:11.354Z"
 }
