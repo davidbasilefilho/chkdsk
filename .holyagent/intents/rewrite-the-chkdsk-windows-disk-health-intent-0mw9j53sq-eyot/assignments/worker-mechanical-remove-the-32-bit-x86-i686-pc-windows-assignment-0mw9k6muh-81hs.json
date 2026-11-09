@@ -1,0 +1,49 @@
+{
+  "id": "assignment-0mw9k6muh-81hs",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 3,
+  "roleTask": "Worker.mechanical",
+  "slug": "remove-the-32-bit-x86-i686-pc-windows",
+  "objective": "Remove the 32-bit x86 (i686-pc-windows-msvc) build and release target from chkdsk, since its new rune dependency does not compile for it, so releases ship only x64-baseline and ARM64.",
+  "state": "Running",
+  "scope": [
+    "Worktree /home/user/chkdsk-rune (branch rune-rewrite): mise.toml (rust targets, tasks such as release-x86, compile/validation steps), scripts/release.py (target list, asset names, MSVC/vcvars arch handling), .github/workflows/dev.yml, stable.yml, validation.yml, README.md (Executar mentions x86; Desenvolvimento mentions x86 and the release-x86 task)"
+  ],
+  "constraints": [
+    "Remove every i686/x86 entry and only those; keep x64-baseline and ARM64 exactly as they are; keep code paths generic, do not restructure",
+    "README stays pt_BR; adjust sentences so they read naturally (e.g. 'Releases incluem executáveis para Windows x64-baseline e ARM64')",
+    "After editing, run holyagent-free checks: python3 -m py_compile scripts/release.py; python3 scripts/release.py --help if it supports it; any release.py self-test or validate-rules mode it has that runs on Linux; grep the worktree (excluding target/ and Cargo.lock) for i686, x86\\b, release-x86 and report remaining hits with reasons",
+    "Make no git writes",
+    "Report in under 150 words: files changed, check commands with exit codes, remaining hits"
+  ],
+  "criteria": [
+    {
+      "text": "No i686/x86 target remains in mise.toml, scripts/release.py, .github/workflows and README.md; x64-baseline and ARM64 untouched",
+      "blocking": true,
+      "dimension": "scope"
+    },
+    {
+      "text": "release.py still compiles and its Linux-runnable checks pass",
+      "blocking": true,
+      "dimension": "tests"
+    }
+  ],
+  "evidence": [
+    "changed-paths",
+    "checks-run"
+  ],
+  "ownershipPaths": [
+    "mise.toml",
+    "scripts",
+    ".github",
+    "README.md"
+  ],
+  "dependencies": [],
+  "independentFrom": [],
+  "specialist": {
+    "model": "haiku",
+    "effort": "medium",
+    "startedAt": "2026-11-09T17:52:22.313Z"
+  },
+  "createdAt": "2026-11-09T17:52:22.313Z"
+}
