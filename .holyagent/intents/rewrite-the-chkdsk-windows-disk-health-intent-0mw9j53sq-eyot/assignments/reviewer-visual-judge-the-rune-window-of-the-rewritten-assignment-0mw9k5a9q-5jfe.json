@@ -5,7 +5,7 @@
   "roleTask": "Reviewer.visual",
   "slug": "judge-the-rune-window-of-the-rewritten",
   "objective": "Judge the rune window of the rewritten chkdsk disk-health app from its headless captures for elegance, simplicity, legibility and correctness of content.",
-  "state": "Ready",
+  "state": "Running",
   "scope": [
     "Captures in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/captures/ named <scene>-<size>-<theme>.png: scenes saudavel, atencao, indisponivel, vazio, carregando, falha at 1100x720 and 760x560, dark and light, plus indisponivel-640x420-light.png and atencao-640x420-dark.png; rendered at scale 2 headless with lavapipe and Inter font (on Windows Segoe UI Variable is preferred; no native window chrome in captures)",
     "Source for content: /home/user/chkdsk-rune/src/ui.rs, src/present.rs, src/fixtures.rs; README /home/user/chkdsk-rune/README.md"
@@ -42,5 +42,10 @@
   "independentFrom": [
     "assignment-0mw9j8z6v-kg5g"
   ],
+  "specialist": {
+    "model": "sonnet",
+    "effort": "high",
+    "startedAt": "2026-11-09T17:51:25.646Z"
+  },
   "createdAt": "2026-11-09T17:51:19.359Z"
 }
