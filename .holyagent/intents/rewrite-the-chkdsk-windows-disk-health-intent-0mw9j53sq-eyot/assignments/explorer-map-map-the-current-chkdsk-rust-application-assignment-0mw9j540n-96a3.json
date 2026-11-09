@@ -1,0 +1,36 @@
+{
+  "id": "assignment-0mw9j540n-96a3",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 1,
+  "roleTask": "Explorer.map",
+  "slug": "map-the-current-chkdsk-rust-application",
+  "objective": "Map the current chkdsk Rust application so it can be rewritten on another framework without losing behavior.",
+  "state": "Ready",
+  "scope": [
+    "/home/user/chkdsk/src/*.rs (main, backend, health, history, model, parse, ui), Cargo.toml, mise.toml, scripts/release.py, .github/workflows/*.yml, README.md"
+  ],
+  "constraints": [
+    "Read-only",
+    "Write a detailed behavior spec to /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/chkdsk-spec.md: per module responsibilities, public types, the scoring algorithm with exact thresholds/caps, history retention and ETA rules, every UI screen/section/label text (pt_BR strings verbatim), layout, colors, key and mouse bindings, refresh cadence, error/empty states, tests that exist and what they assert, and how CI/release depend on the Rust build (which jobs, tasks and scripts would break if the app stopped being Rust)",
+    "Report in under 400 words with the spec file path"
+  ],
+  "criteria": [
+    {
+      "text": "Spec covers every module and all user-visible strings and bindings, with file:line references",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "Spec lists build/CI/release coupling to Rust/Cargo",
+      "blocking": true,
+      "dimension": "repo-standards"
+    }
+  ],
+  "evidence": [
+    "spec-file"
+  ],
+  "ownershipPaths": [],
+  "dependencies": [],
+  "independentFrom": [],
+  "createdAt": "2026-11-09T17:23:11.639Z"
+}
