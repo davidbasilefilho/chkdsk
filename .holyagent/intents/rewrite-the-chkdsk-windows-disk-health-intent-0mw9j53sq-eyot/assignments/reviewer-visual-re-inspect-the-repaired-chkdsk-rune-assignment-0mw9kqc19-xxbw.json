@@ -1,0 +1,52 @@
+{
+  "id": "assignment-0mw9kqc19-xxbw",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 3,
+  "roleTask": "Reviewer.visual",
+  "slug": "re-inspect-the-repaired-chkdsk-rune",
+  "objective": "Re-inspect the repaired chkdsk rune window from its new captures and confirm the previous material findings are closed without new defects.",
+  "state": "Running",
+  "scope": [
+    "Captures in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/captures/ (re-rendered after the repair): {saudavel,atencao,indisponivel,vazio,carregando,falha}-{1100x720,760x560}-{dark,light}.png, indisponivel-640x420-light.png, atencao-640x420-dark.png, procurando-1100x720-{dark,light}.png, descoberta-1100x720-{dark,light}.png; contrast measurements in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/logs/contrast.log; source /home/user/chkdsk-rune/src/present.rs, src/ui.rs"
+  ],
+  "constraints": [
+    "Render target record: captures produced headless (lavapipe, Inter font, scale 2, no native chrome) by /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/capture.sh in /home/user/chkdsk-rune; judge from these files; start nothing",
+    "Previous material findings: V1 all-caps pill labels; V2 English 'N/A' 72px hero for unknown health; V3 failure explanation in grey while milder permission text red; V4 sidebar dots color-only; V5 error copy without recovery; V6 permanent shortcut footer; V7 pill contrast >= 4.5:1 light and dark; V8 'Consultando e interpretando dados...' copy. State each as closed or open with the capture file",
+    "Report new material discrepancies the repair introduced, separately from preferences",
+    "Read /root/.claude/plugins/synced/03eb801d-6ff6-4373-b5b1-f94edf359a3e_0f3e6ee9-af2e-4c2c-8d3c-9be25ca27713/holyagent/skills/desktop-design/SKILL.md and judge against its checklist and capture list",
+    "Report in under 400 words and list every capture judged"
+  ],
+  "criteria": [
+    {
+      "text": "Read /root/.claude/plugins/synced/03eb801d-6ff6-4373-b5b1-f94edf359a3e_0f3e6ee9-af2e-4c2c-8d3c-9be25ca27713/holyagent/skills/desktop-design/SKILL.md and judge against its checklist and capture list",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "Each of V1-V8 stated closed or open, naming the capture file",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "Every capture in scope opened; new material findings separated from preferences",
+      "blocking": true,
+      "dimension": "behavior"
+    }
+  ],
+  "evidence": [
+    "captures-judged",
+    "findings"
+  ],
+  "ownershipPaths": [],
+  "dependencies": [],
+  "independentFrom": [
+    "assignment-0mw9kg9vv-gm7f"
+  ],
+  "followUpOf": "assignment-0mw9k5a9q-5jfe",
+  "specialist": {
+    "model": "sonnet",
+    "effort": "high",
+    "startedAt": "2026-11-09T18:07:41.421Z"
+  },
+  "createdAt": "2026-11-09T18:07:41.421Z"
+}
