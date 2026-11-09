@@ -5,7 +5,7 @@
   "roleTask": "Explorer.map",
   "slug": "map-the-current-chkdsk-rust-application",
   "objective": "Map the current chkdsk Rust application so it can be rewritten on another framework without losing behavior.",
-  "state": "Ready",
+  "state": "Running",
   "scope": [
     "/home/user/chkdsk/src/*.rs (main, backend, health, history, model, parse, ui), Cargo.toml, mise.toml, scripts/release.py, .github/workflows/*.yml, README.md"
   ],
@@ -32,5 +32,10 @@
   "ownershipPaths": [],
   "dependencies": [],
   "independentFrom": [],
+  "specialist": {
+    "model": "haiku",
+    "effort": "medium",
+    "startedAt": "2026-11-09T17:23:18.011Z"
+  },
   "createdAt": "2026-11-09T17:23:11.639Z"
 }
