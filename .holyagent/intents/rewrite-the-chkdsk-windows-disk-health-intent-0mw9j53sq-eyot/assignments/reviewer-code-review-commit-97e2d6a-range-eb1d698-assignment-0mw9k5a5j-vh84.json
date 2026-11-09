@@ -5,7 +5,7 @@
   "roleTask": "Reviewer.code",
   "slug": "review-commit-97e2d6a-range-eb1d698",
   "objective": "Review commit 97e2d6a (range eb1d698..97e2d6a, branch rune-rewrite, worktree /home/user/chkdsk-rune) that rewrites the chkdsk Windows disk-health app front end from r3bl_tui to rune, for correctness, regressions, simplicity and performance.",
-  "state": "Ready",
+  "state": "Running",
   "scope": [
     "git -C /home/user/chkdsk-rune diff eb1d698..97e2d6a; the new src/ui.rs, src/ui/tests.rs, src/collector.rs, src/present.rs, src/fixtures.rs, src/main.rs, the backend.rs stub, Cargo.toml (rune pinned to rev 757bcb1d1da1b3f80484f36ef610b83ddbcc6003)",
     "Compare against the old behavior in eb1d698 (src/ui.rs, src/main.rs): 15 s discovery, max 4 concurrent queries, history writing, selection/scroll/quit bindings, status mapping, pt_BR text"
@@ -44,5 +44,10 @@
   "independentFrom": [
     "assignment-0mw9j8z6v-kg5g"
   ],
+  "specialist": {
+    "model": "sonnet",
+    "effort": "high",
+    "startedAt": "2026-11-09T17:51:25.488Z"
+  },
   "createdAt": "2026-11-09T17:51:19.208Z"
 }
