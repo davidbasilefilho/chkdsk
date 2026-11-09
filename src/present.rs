@@ -4,10 +4,11 @@
 
 use crate::{
     backend::QueryErrorState,
-    collector::{DiskSnapshot, Reading, Ready},
+    collector::{DISCOVERY_INTERVAL, DiskSnapshot, Reading, Ready},
     health::{HealthOutcome, score_health},
     model::{AtaAttribute, DiskKind, QueryState, Telemetry},
 };
+use std::time::Duration;
 
 /// The three colors of the palette: healthy, attention, no usable data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,7 +89,7 @@ impl Card {
             .unwrap_or_else(|| "capacidade indisponível".into());
         let body = match &snapshot.reading {
             Reading::Pending => Body::Loading,
-            Reading::Failed(state) => Body::Message(query_error_message(*state).into()),
+            Reading::Failed(state) => Body::Message(query_error_message(*state)),
             Reading::Ready(ready) => Body::Health(Box::new(Health::new(identity.kind, ready, now))),
         };
         Card {
@@ -198,14 +199,20 @@ fn attribute_row(attribute: &AtaAttribute) -> AttributeRow {
 const PERMISSION_MESSAGE: &str =
     "Permissão insuficiente para consultar o dispositivo. Tente executar como administrador.";
 
-pub fn query_error_message(state: QueryErrorState) -> &'static str {
+pub fn query_error_message(state: QueryErrorState) -> String {
     match state {
-        QueryErrorState::Permission => PERMISSION_MESSAGE,
-        QueryErrorState::Unsupported => "Leitura de saúde não compatível com o dispositivo",
-        QueryErrorState::Transient | QueryErrorState::Partial => {
-            "Não foi possível consultar os dados de saúde. Uma nova tentativa acontece em até 15 segundos."
-        }
+        QueryErrorState::Permission => PERMISSION_MESSAGE.into(),
+        QueryErrorState::Unsupported => "Leitura de saúde não compatível com o dispositivo".into(),
+        QueryErrorState::Transient | QueryErrorState::Partial => retry_message(DISCOVERY_INTERVAL),
     }
+}
+
+/// The retry is the next discovery, so the promised wait is that interval.
+fn retry_message(interval: Duration) -> String {
+    format!(
+        "Não foi possível consultar os dados de saúde. Uma nova tentativa acontece em até {} segundos.",
+        interval.as_secs()
+    )
 }
 
 fn telemetry_has_usable_data(telemetry: &Telemetry) -> bool {
@@ -417,7 +424,7 @@ mod tests {
         );
         assert_eq!(
             bare.body,
-            Body::Message(query_error_message(QueryErrorState::Transient).into())
+            Body::Message(query_error_message(QueryErrorState::Transient))
         );
 
         let unknown = card(identity("id"), ready(Telemetry::default()));
@@ -499,6 +506,15 @@ mod tests {
             assert_eq!(failed.body, Body::Message(message.into()));
             assert_eq!(failed.tone(), Some(Tone::Unknown));
         }
+    }
+
+    #[test]
+    fn the_retry_message_states_the_discovery_interval() {
+        assert!(retry_message(Duration::from_secs(40)).contains("até 40 segundos"));
+        assert_eq!(
+            query_error_message(QueryErrorState::Transient),
+            retry_message(DISCOVERY_INTERVAL)
+        );
     }
 
     #[test]

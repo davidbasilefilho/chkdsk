@@ -340,6 +340,50 @@ fn a_selection_moved_by_an_update_opens_its_panel_at_the_top() {
 }
 
 #[test]
+fn an_update_that_moves_the_selection_keeps_its_row_in_the_list() {
+    let window_height = 560.0;
+    let mut rt = runtime(pending_disks(12), (760.0, window_height));
+    let (_, y) = rt.find("disco-11").expect("the last row is laid out");
+    assert!(
+        y > window_height,
+        "the last row starts below the window: {y}"
+    );
+
+    // The selected disk is now the last one in the list.
+    let mut disks: Vec<_> = (0..12)
+        .map(|index| DiskSnapshot {
+            identity: identity(&index.to_string()),
+            reading: Reading::Pending,
+        })
+        .collect();
+    disks.reverse();
+    rt.update(|state, tx| {
+        state.deliver(Update::Disks(disks), NOW, tx);
+    });
+    settle(&mut rt);
+    assert_eq!(rt.state.selected, 11);
+    let (_, y) = rt.find("disco-0").expect("the selected row is laid out");
+    assert!(y < window_height, "the selected row is on screen: {y}");
+}
+
+#[test]
+fn a_later_successful_discovery_clears_the_failure_notice() {
+    let mut dashboard = Dashboard::default();
+    dashboard.apply(Update::DiscoveryFailed, NOW);
+    assert_eq!(dashboard.notice, Notice::DiscoveryFailed);
+    dashboard.apply(Update::Disks(fixtures::disks()), NOW);
+    assert_ne!(dashboard.notice, Notice::DiscoveryFailed);
+
+    // With disks listed, a failed discovery leaves the window and the notice alone.
+    assert!(!dashboard.apply(Update::DiscoveryFailed, NOW));
+    assert_ne!(dashboard.notice, Notice::DiscoveryFailed);
+
+    // When the disks later vanish, the window says so rather than repeating the failure.
+    dashboard.apply(Update::Disks(Vec::new()), NOW);
+    assert_eq!(dashboard.notice, Notice::NoDisks);
+}
+
+#[test]
 fn disk_switching_ignores_ctrl_alt_and_super() {
     let mut rt = runtime(pending_disks(4), (1100.0, 720.0));
     plain(&mut rt, Key::Right);

@@ -90,19 +90,23 @@ impl Dashboard {
                     .and_then(|old| cards.iter().position(|card| card.id == old.id))
                     .unwrap_or(0)
                     .min(cards.len().saturating_sub(1));
-                let notice = if cards.is_empty() {
-                    Notice::NoDisks
-                } else {
-                    self.notice
+                // A failed discovery is over once a later one lists disks.
+                let notice = match (cards.is_empty(), self.notice) {
+                    (true, _) => Notice::NoDisks,
+                    (false, Notice::DiscoveryFailed) => Notice::Searching,
+                    (false, notice) => notice,
                 };
                 let changed =
                     cards != self.cards || selected != self.selected || notice != self.notice;
                 (self.cards, self.selected, self.notice) = (cards, selected, notice);
                 changed
             }
+            // Only the empty window shows the notice; with disks listed it stays as is.
             Update::DiscoveryFailed => {
-                let changed = self.notice != Notice::DiscoveryFailed;
-                self.notice = Notice::DiscoveryFailed;
+                let changed = self.cards.is_empty() && self.notice != Notice::DiscoveryFailed;
+                if self.cards.is_empty() {
+                    self.notice = Notice::DiscoveryFailed;
+                }
                 changed
             }
         }
@@ -110,11 +114,18 @@ impl Dashboard {
 
     /// `apply` for the window: when the selection moves to another disk because
     /// the selected one vanished, the panel opens at its top, as `select` does.
+    /// Whenever the selected row moves, the list scrolls to keep it visible.
     pub fn deliver(&mut self, update: Update, now: u64, tx: &mut Tx) -> bool {
-        let before = self.selected_id().map(str::to_owned);
+        let before = (self.selected, self.selected_id().map(str::to_owned));
         let changed = self.apply(update, now);
-        if self.selected_id() != before.as_deref() {
+        let id = self.selected_id();
+        if id != before.1.as_deref() {
             tx.scroll_to_instant(DETAIL_KEY, 0.0, 0.0);
+        }
+        if let Some(id) = id
+            && (self.selected != before.0 || Some(id) != before.1.as_deref())
+        {
+            tx.scroll_into_view(row_key(id));
         }
         changed
     }

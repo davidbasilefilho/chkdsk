@@ -62,10 +62,15 @@ fn main() {
     }
 }
 
-/// The window could not open (no GPU or DirectX 12). A Windows GUI process has
-/// no console, so say it in a message box; elsewhere stderr is enough.
+/// The run failed. Headless captures (`--snap`) report on stderr only. A window
+/// that could not open (no GPU or DirectX 12) also gets a message box, since a
+/// Windows GUI process has no console.
 fn report_start_failure(error: &str) {
-    eprintln!("chkdsk: {error}");
+    if rune::is_headless() {
+        eprintln!("chkdsk: {error}");
+        return;
+    }
+    eprintln!("chkdsk: could not open the window: {error}");
     #[cfg(windows)]
     {
         use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
