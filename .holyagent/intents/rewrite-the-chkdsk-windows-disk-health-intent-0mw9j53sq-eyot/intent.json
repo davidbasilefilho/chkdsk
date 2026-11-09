@@ -1,0 +1,13 @@
+{
+  "id": "intent-0mw9j53sq-eyot",
+  "slug": "rewrite-the-chkdsk-windows-disk-health",
+  "objective": "Rewrite the chkdsk Windows disk-health app using rune (https://github.com/anomalyco/rune), keeping its behavior and making it elegant, simple and performant.",
+  "requirements": [
+    "User words: \"rewrite the app in rune https://github.com/anomalyco/rune\"",
+    "User words: \"make it elegant, simple, performant\"",
+    "Preserve existing user-facing behavior (pt_BR UI, SMART/NVMe telemetry, heuristic score, history/ETA, controls) unless rune forces a change, which must be named"
+  ],
+  "revision": 1,
+  "state": "Open",
+  "createdAt": "2026-11-09T17:23:11.354Z"
+}
