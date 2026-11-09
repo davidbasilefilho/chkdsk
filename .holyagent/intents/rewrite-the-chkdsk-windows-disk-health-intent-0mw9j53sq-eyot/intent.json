@@ -7,9 +7,10 @@
     "User words: \"make it elegant, simple, performant\"",
     "Preserve existing user-facing behavior (pt_BR UI, SMART/NVMe telemetry, heuristic score, history/ETA, disk switching, scrolling, quit) unless rune forces a change, which must be named",
     "Decision (forced by rune, a Rust GPU GUI framework that cannot render to a terminal): the app becomes a native rune window instead of a terminal UI; the Rust Windows SMART/IOCTL backend, scoring and history logic stay in Rust",
-    "Work branch rune-rewrite in worktree /home/user/chkdsk-rune, from origin/main"
+    "Work branch rune-rewrite in worktree /home/user/chkdsk-rune, from origin/main",
+    "User decision: drop the 32-bit x86 (i686-pc-windows-msvc) release target, because rune does not compile for it; releases ship x64-baseline and ARM64 only"
   ],
-  "revision": 2,
+  "revision": 3,
   "state": "Open",
   "createdAt": "2026-11-09T17:23:11.354Z"
 }
