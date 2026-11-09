@@ -1,0 +1,54 @@
+{
+  "id": "assignment-0mw9ku2w5-2zri",
+  "intentId": "intent-0mw9j53sq-eyot",
+  "intentRevision": 3,
+  "roleTask": "Worker.implementation",
+  "slug": "final-cleanup-round-for-the-chkdsk-rune",
+  "objective": "Final cleanup round for the chkdsk rune rewrite: fix the remaining non-blocking code-review findings.",
+  "state": "Running",
+  "scope": [
+    "Worktree /home/user/chkdsk-rune, branch rune-rewrite at 0da10d6; files src/main.rs, src/ui.rs, src/ui/tests.rs, src/present.rs, src/collector.rs"
+  ],
+  "constraints": [
+    "N1 src/main.rs report_start_failure (~:147): try_run also covers the headless --snap path of the scenes feature; on Windows a headless failure would show a GPU-worded blocking MessageBox and hide the real error. Show the dialog only for the windowed run, include the underlying error text in the stderr message, keep the pt_BR dialog for the windowed failure",
+    "N2 src/ui.rs Dashboard::deliver (~:103-121): when an update moves the selection, also scroll the sidebar so the selected row is visible (rune tx.scroll_into_view(key) or the equivalent available in deliver's context), and clear a stale DiscoveryFailed notice once a later discovery succeeds and disks are listed (check present.rs/ui.rs notice handling; keep the existing rule that the notice shows only when relevant); add tests for both that fail without the fix",
+    "N3 src/present.rs: the recovery copy hard-codes '15 segundos'; derive the number from collector::DISCOVERY_INTERVAL (or the existing constant) so the text cannot drift, with a test asserting the text matches the constant",
+    "Keep scoring, history, model, parse and backend unchanged; no visual or copy changes beyond N3",
+    "Run cargo fmt --check, cargo test, cargo test --all-features, cargo clippy --all-targets --all-features -- -D warnings, and cargo xwin clippy --all-targets --all-features -- -D warnings for x86_64-pc-windows-msvc and aarch64-pc-windows-msvc",
+    "Make no git writes",
+    "Report in under 250 words with N1-N3 outcomes, tests added, gate exit codes and counts; logs in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/logs/"
+  ],
+  "criteria": [
+    {
+      "text": "N1, N2, N3 each fixed; N2 and N3 have tests that fail without the fix",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "fmt, test (both feature sets), clippy, and xwin clippy x86_64/aarch64 pass with exit codes and counts",
+      "blocking": true,
+      "dimension": "tests"
+    },
+    {
+      "text": "Changes limited to N1-N3",
+      "blocking": true,
+      "dimension": "scope"
+    }
+  ],
+  "evidence": [
+    "checks-run",
+    "changed-paths"
+  ],
+  "ownershipPaths": [
+    "src"
+  ],
+  "dependencies": [],
+  "independentFrom": [],
+  "followUpOf": "assignment-0mw9kg9vv-gm7f",
+  "specialist": {
+    "model": "sonnet",
+    "effort": "high",
+    "startedAt": "2026-11-09T18:10:36.197Z"
+  },
+  "createdAt": "2026-11-09T18:10:36.197Z"
+}
