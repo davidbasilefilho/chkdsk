@@ -4,16 +4,19 @@
 //! acontece em `view`.
 
 mod detail;
+#[cfg(feature = "scenes")]
+mod preview;
 mod scrollbar;
 mod titlebar;
 
 use crate::{
     collector::{DiskSnapshot, Update},
-    export::{self, Outcome},
+    export::{self, Failure, Outcome},
     present::{Card, Tone},
 };
 use rune::{
-    Color, Cursor, Cx, El, Key, KeyEvent, Transition, Tx, Waker, col, el, oklch, row, text,
+    Color, Cursor, Cx, El, HelpLook, Key, KeyEvent, Transition, Tx, Waker, col, el, oklch, row,
+    text,
     tok::{self, TextStyle},
 };
 use scrollbar::{Bars, Which};
@@ -50,6 +53,7 @@ const FRAME_TINT: f32 = 0.05;
 // Windows type ramp: Caption 12/16, Body 14/20, Subtitle 20/28 (semibold, never bold),
 // with a larger score in place of Display. Only the wordmark in the title bar is bold.
 const CAPTION: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0);
+const CAPTION_NUMBER: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0).features("'tnum' 1");
 const CAPTION_STRONG: TextStyle = TextStyle::new(12.0, 600.0).lh(16.0).features("'tnum' 1");
 const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(20.0).features("'tnum' 1");
 const BODY_STRONG: TextStyle = TextStyle::new(14.0, 600.0).lh(20.0).features("'tnum' 1");
@@ -93,10 +97,21 @@ pub struct Toast {
     pub until: Option<f64>,
 }
 
+/// Where the keyboard focus rests, so Tab knows where to go on from. Tab walks the
+/// disks one by one, then Avançado (when the open disk has it), then Exportar, and
+/// back to the first disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    Disk,
+    Advanced,
+    Export,
+}
+
 /// The export in flight: its thread answers through the channel and wakes the window.
+/// `None` is a closed dialog, which says nothing.
 struct Exporting {
-    sender: Sender<Outcome>,
-    receiver: Receiver<Outcome>,
+    sender: Sender<Option<Outcome>>,
+    receiver: Receiver<Option<Outcome>>,
     waker: Option<Waker>,
     saving: bool,
 }
@@ -112,6 +127,7 @@ pub struct Dashboard {
     /// The window has the keyboard focus; the title bar dims without it.
     focused: bool,
     pub toast: Option<Toast>,
+    stop: Stop,
     exporting: Exporting,
     /// The Save dialog; tests put a scripted one here.
     picker: Option<export::Picker>,
@@ -129,6 +145,7 @@ impl Default for Dashboard {
             advanced: false,
             focused: true,
             toast: None,
+            stop: Stop::Disk,
             exporting: Exporting {
                 sender,
                 receiver,
@@ -215,6 +232,7 @@ impl Dashboard {
         if self.cards.is_empty() {
             return;
         }
+        self.stop = Stop::Disk;
         let index = index.min(self.cards.len() - 1);
         if index != self.selected {
             self.selected = index;
@@ -229,7 +247,7 @@ impl Dashboard {
         } else {
             self.selected.saturating_sub(1)
         };
-        self.select(index, tx);
+        self.show_disk(index, tx);
     }
 
     fn scroll_by(&self, delta: f32, tx: &mut Tx) {
@@ -240,8 +258,19 @@ impl Dashboard {
         );
     }
 
-    /// Open or close Avançado; opening brings its content into view.
+    /// The open disk has an Avançado section to show.
+    pub fn has_advanced(&self) -> bool {
+        self.cards
+            .get(self.selected)
+            .is_some_and(Card::has_advanced)
+    }
+
+    /// Open or close Avançado; opening brings its content into view. A disk without
+    /// the section has nothing to toggle.
     pub fn toggle_advanced(&mut self, tx: &mut Tx) {
+        if !self.has_advanced() {
+            return;
+        }
         self.advanced = !self.advanced;
         if self.advanced {
             // The header goes to the top, with its content below it.
@@ -263,7 +292,7 @@ impl Dashboard {
         }
         self.toast = None;
         let Some(picker) = self.picker else {
-            return self.finish_export(Outcome::Unavailable, tx);
+            return self.finish_export(Some(Outcome::Unavailable), tx);
         };
         self.exporting.saving = true;
         let snapshots = self.snapshots.clone();
@@ -273,22 +302,28 @@ impl Dashboard {
         let spawned = std::thread::Builder::new()
             .name("chkdsk-export".into())
             .spawn(move || {
-                let outcome =
-                    export::run(&snapshots, now, owner, Some(picker), export::stored_history);
+                // Whatever happens inside, the window hears an answer and stops saving.
+                let outcome = export::run_isolated(
+                    &snapshots,
+                    now,
+                    owner,
+                    Some(picker),
+                    export::stored_history,
+                );
                 let _ = sender.send(outcome);
                 if let Some(wake) = waker {
                     wake();
                 }
             });
         if spawned.is_err() {
-            self.finish_export(Outcome::Failed, tx);
+            self.finish_export(Some(Outcome::Failed(Failure::Start)), tx);
         }
     }
 
     /// The export ended: say how, unless the user only closed the dialog.
-    pub fn finish_export(&mut self, outcome: Outcome, tx: &mut Tx) {
+    pub fn finish_export(&mut self, outcome: Option<Outcome>, tx: &mut Tx) {
         self.exporting.saving = false;
-        self.toast = (outcome != Outcome::Cancelled).then(|| {
+        self.toast = outcome.map(|outcome| {
             let until = tx.clock() + TOAST_SECONDS;
             tx.wake_at(until);
             Toast {
@@ -296,6 +331,70 @@ impl Dashboard {
                 until: Some(until),
             }
         });
+    }
+
+    /// Tab goes through the disks, then Avançado and Exportar where they can be used,
+    /// and wraps around; Shift+Tab goes back. Every stop shows the focus ring.
+    fn tab(&mut self, forward: bool, tx: &mut Tx) {
+        let controls: Vec<Stop> = [
+            (Stop::Advanced, self.has_advanced()),
+            (Stop::Export, self.can_export()),
+        ]
+        .into_iter()
+        .filter_map(|(stop, usable)| usable.then_some(stop))
+        .collect();
+        let here = if self.stop == Stop::Disk || controls.contains(&self.stop) {
+            self.stop
+        } else {
+            Stop::Disk
+        };
+        let last = self.cards.len().saturating_sub(1);
+        let position = controls.iter().position(|stop| *stop == here);
+        let target = match (here, forward) {
+            (Stop::Disk, true) if self.selected < last => Stop::Disk,
+            (Stop::Disk, true) => controls.first().copied().unwrap_or(Stop::Disk),
+            (Stop::Disk, false) if self.selected > 0 => Stop::Disk,
+            (Stop::Disk, false) => controls.last().copied().unwrap_or(Stop::Disk),
+            (_, true) => position
+                .and_then(|index| controls.get(index + 1).copied())
+                .unwrap_or(Stop::Disk),
+            (_, false) => position
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| controls.get(index).copied())
+                .unwrap_or(Stop::Disk),
+        };
+        match target {
+            Stop::Disk if here == Stop::Disk => {
+                // Past the last disk with nothing else to visit, Tab stays put.
+                let next = if forward {
+                    (self.selected + 1).min(last)
+                } else {
+                    self.selected.saturating_sub(1)
+                };
+                self.show_disk(next, tx);
+            }
+            // Coming back from a control wraps to the far end of the list.
+            Stop::Disk => self.show_disk(if forward { 0 } else { last }, tx),
+            control => {
+                self.stop = control;
+                let key = if control == Stop::Advanced {
+                    "avancado"
+                } else {
+                    "exportar"
+                };
+                tx.focus(key, true);
+                // Avançado sits at the end of a long panel: bring it into view.
+                tx.scroll_into_view(key);
+            }
+        }
+    }
+
+    /// Select a disk from the keyboard and put the focus ring on its row.
+    fn show_disk(&mut self, index: usize, tx: &mut Tx) {
+        self.select(index, tx);
+        if let Some(id) = self.selected_id() {
+            tx.focus(row_key(id), true);
+        }
     }
 }
 
@@ -329,10 +428,11 @@ pub fn on_focus(state: &mut Dashboard, focused: bool, _: &mut Tx) {
     state.focused = focused;
 }
 
-/// The keys of the window: arrows and Tab switch disks (not with Ctrl, Alt or
-/// Super held, which belong to the system), Up and Down scroll the panel, `a`
-/// opens or closes Avançado, Ctrl+E exports, `q` and Esc quit. Page keys are
-/// left to rune, which scrolls the panel.
+/// The keys of the window: arrows switch disks, and Tab goes through the disks and
+/// then Avançado and Exportar (not with Ctrl, Alt or Super held, which belong to the
+/// system), Up and Down scroll the panel, `a` opens or closes Avançado when the disk
+/// has it, Ctrl+E exports, `q` and Esc quit. A focused control presses with Space or
+/// Return, which rune handles. Page keys are left to rune, which scrolls the panel.
 pub fn on_key(state: &mut Dashboard, event: &KeyEvent, tx: &mut Tx) -> bool {
     let mods = event.mods;
     let plain = !(mods.cmd || mods.ctrl || mods.alt || mods.logo);
@@ -346,7 +446,7 @@ pub fn on_key(state: &mut Dashboard, event: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Text(text) if plain && text.eq_ignore_ascii_case("a") => state.toggle_advanced(tx),
         Key::Left if plain => state.step(false, tx),
         Key::Right if plain => state.step(true, tx),
-        Key::Tab if plain => state.step(!mods.shift, tx),
+        Key::Tab if plain => state.tab(!mods.shift, tx),
         Key::Up => state.scroll_by(-SCROLL_STEP, tx),
         Key::Down => state.scroll_by(SCROLL_STEP, tx),
         Key::Text(text) if plain && text == "k" => state.scroll_by(-SCROLL_STEP, tx),
@@ -412,7 +512,15 @@ pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
     let palette = Palette::new(cx.system_dark(), cx.accent());
     let t = palette.theme;
     cx.caption_color(t.text);
+    // Every pressable control takes focus, but Tab is the window's own (`State::tab`): it
+    // walks the disks, then Avançado and Exportar, so rune's traversal skips them all.
+    cx.web_focus();
+    cx.focus_ring(2.0, 2.0, t.text);
+    // Tooltips keep clear of the window edge, so they never cover the scroll bar.
+    cx.help_look(HelpLook::system(cx.system_dark()).margin(S6));
     let insets = cx.chrome_insets();
+    #[cfg(feature = "scenes")]
+    let insets = preview::insets(insets);
     let narrow = cx
         .layout_with("janela", |rect| rect[2] < NARROW_BELOW)
         .unwrap_or(false);
@@ -427,7 +535,7 @@ pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
             .min_h(0.0)
             .child(empty(state.notice, &palette)),
     };
-    col()
+    let window = col()
         .key("janela")
         .w_full()
         .h_full()
@@ -438,7 +546,10 @@ pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
             insets.leading,
             insets.trailing,
         ))
-        .child(body)
+        .child(body);
+    #[cfg(feature = "scenes")]
+    let window = window.children(preview::caption_buttons(&palette));
+    window
 }
 
 fn row_key(id: &str) -> String {
@@ -455,18 +566,19 @@ fn sidebar(state: &Dashboard, palette: &Palette, narrow: bool) -> El {
             Some(tone) => el().w(S2).h(S2).radius(S1).fill(palette.tone(tone)),
             None => el().w(S2).h(S2).radius(S1).border(1.5, t.text_secondary),
         };
-        // The highlight and the accent marker exist only on the selected row, so
-        // each travels to the next one instead of fading out and in.
+        // The highlight fades from one row to the next: a flying highlight is drawn above
+        // the whole window, so it would cover the text of every row it passes. The small
+        // accent marker has no text to cover, so it travels.
         let highlight = selected.then(|| {
             el().key("selecao")
                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                 .radius(tok::radius::SM)
                 .fill(t.card)
-                .matched("selecao")
                 .transition(Transition::opacity())
         });
         let marker = el().w(3.0).h(S4).ml(S1).children(selected.then(|| {
-            el().w(3.0)
+            el().key("marcador")
+                .w(3.0)
                 .h(S4)
                 .radius(1.5)
                 .fill(palette.accent)
@@ -511,6 +623,7 @@ fn sidebar(state: &Dashboard, palette: &Palette, narrow: bool) -> El {
                 .hover(t.hover)
                 .press(t.press)
                 .cursor(Cursor::Pointer)
+                .tab_index(-1)
                 .on_press_tx(move |s: &mut Dashboard, tx: &mut Tx| s.select(index, tx))
                 .children(highlight)
                 .child(marker)

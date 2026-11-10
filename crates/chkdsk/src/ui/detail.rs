@@ -2,8 +2,8 @@
 //! aligned grid, the verdict with its reasons, and Avançado, closed until asked.
 
 use super::{
-    BODY, BODY_STRONG, CAPTION, CAPTION_STRONG, DETAIL_KEY, Dashboard, FRAME_TINT, PILL_TINT,
-    Palette, S1, S2, S3, S4, S6, S8, SCORE, SUBTITLE, raised, scrollbar::Which,
+    BODY, BODY_STRONG, CAPTION, CAPTION_NUMBER, CAPTION_STRONG, DETAIL_KEY, Dashboard, FRAME_TINT,
+    PILL_TINT, Palette, S1, S2, S3, S4, S6, S8, SCORE, SUBTITLE, Stop, raised, scrollbar::Which,
 };
 use crate::present::{AttributeRow, Body, Card, Detail, Health, Tone};
 use rune::{
@@ -14,6 +14,11 @@ use rune::{
 };
 
 const CONTENT_WIDTH: f32 = 760.0;
+
+/// The label column of the facts and the technical details, so both grids align.
+fn label_width(narrow: bool) -> f32 {
+    if narrow { 144.0 } else { 160.0 }
+}
 
 static CHEVRON: Icon = Icon {
     name: "chkdsk-chevron",
@@ -138,7 +143,7 @@ fn health_body(page: El, health: &Health, palette: &Palette, narrow: bool) -> El
         None => hero.child(pill),
     };
 
-    let label_width = if narrow { 144.0 } else { 160.0 };
+    let label_width = label_width(narrow);
     let fact = |key: &'static str, label: &'static str, value: &str, style: TextStyle| {
         grid_row(key, label, value, style, label_width, palette)
     };
@@ -219,7 +224,8 @@ fn verdict(health: &Health, palette: &Palette) -> El {
         Some(Tone::Attention) => status.font(BODY_STRONG).color(palette.attention),
         // A gap the user can close (permissions) is the one thing to read here.
         Some(tone) if tone != Tone::Unknown => status.font(BODY_STRONG).color(palette.tone(tone)),
-        Some(_) => status.font(BODY_STRONG).color(t.text),
+        // An error message about the query reads as plain text, like the failed query's.
+        Some(_) => status.font(BODY).color(t.text),
         None if framed => status.font(BODY).color(t.text),
         None => status.font(BODY).color(t.text_secondary),
     };
@@ -280,7 +286,7 @@ fn advanced(state: &Dashboard, card: &Card, palette: &Palette, narrow: bool) -> 
         Body::Health(health) => &health.attributes,
         _ => &[],
     };
-    if card.details.is_empty() && attributes.is_empty() {
+    if !card.has_advanced() {
         return None;
     }
     let open = state.advanced;
@@ -299,7 +305,12 @@ fn advanced(state: &Dashboard, card: &Card, palette: &Palette, narrow: bool) -> 
         .hover(t.hover)
         .press(t.press)
         .cursor(Cursor::Pointer)
-        .on_press_tx(|s: &mut Dashboard, tx: &mut Tx| s.toggle_advanced(tx))
+        // Tab is the window's own (`Dashboard::tab`), so rune's traversal skips the header.
+        .tab_index(-1)
+        .on_press_tx(|s: &mut Dashboard, tx: &mut Tx| {
+            s.stop = Stop::Advanced;
+            s.toggle_advanced(tx)
+        })
         .child(
             icon(&CHEVRON, S4)
                 .color(t.text_secondary)
@@ -322,7 +333,7 @@ fn advanced(state: &Dashboard, card: &Card, palette: &Palette, narrow: bool) -> 
             body = body.child(details(&card.details, palette, narrow));
         }
         if !attributes.is_empty() {
-            body = body.child(attribute_table(attributes, palette));
+            body = body.child(attribute_table(attributes, palette, narrow));
         }
         section = section.child(body);
     }
@@ -330,7 +341,7 @@ fn advanced(state: &Dashboard, card: &Card, palette: &Palette, narrow: bool) -> 
 }
 
 fn details(details: &[Detail], palette: &Palette, narrow: bool) -> El {
-    let width = if narrow { 144.0 } else { 160.0 };
+    let width = label_width(narrow);
     let mut grid = col().key("tecnico");
     for (index, detail) in details.iter().enumerate() {
         grid = grid.child(grid_row(
@@ -346,17 +357,35 @@ fn details(details: &[Detail], palette: &Palette, narrow: bool) -> El {
 }
 
 /// The ATA table: ID, name, then the numbers, right-aligned in fixed columns so
-/// their digits line up (tabular figures).
-fn attribute_table(rows: &[AttributeRow], palette: &Palette) -> El {
+/// their digits line up (tabular figures). The name takes the flexible width; in the
+/// narrow window the columns tighten and the raw value drops to caption size, so
+/// names wrap as little as possible.
+fn attribute_table(rows: &[AttributeRow], palette: &Palette, narrow: bool) -> El {
     let t = palette.theme;
+    let columns = if narrow {
+        TableColumns {
+            numbers: [36.0, 36.0, 44.0],
+            raw: 92.0,
+            raw_gap: S1,
+            raw_style: Some(CAPTION_NUMBER),
+        }
+    } else {
+        TableColumns {
+            numbers: [40.0, 40.0, 48.0],
+            raw: 104.0,
+            raw_gap: S2,
+            raw_style: None,
+        }
+    };
     let line = |cells: [&str; 6], style: TextStyle, color| {
-        let number = |content: &str, width: f32| {
+        let number = |content: &str, width: f32, style: TextStyle| {
             text(content.to_owned())
                 .font(style)
                 .color(color)
                 .w(width)
                 .align(Align::End)
         };
+        let [current, worst, limit] = columns.numbers;
         // A name that does not fit wraps; the numbers keep their fixed columns.
         row()
             .gap(S2)
@@ -370,11 +399,14 @@ fn attribute_table(rows: &[AttributeRow], palette: &Palette) -> El {
                     .grow(1.0)
                     .min_w(0.0),
             )
-            .child(number(cells[2], 40.0))
-            .child(number(cells[3], 40.0))
-            .child(number(cells[4], 48.0))
+            .child(number(cells[2], current, style))
+            .child(number(cells[3], worst, style))
+            .child(number(cells[4], limit, style))
             // Extra room before the raw value: its leading zeros must not read as part of the limit.
-            .child(number(cells[5], 104.0).ml(S2))
+            .child(
+                number(cells[5], columns.raw, columns.raw_style.unwrap_or(style))
+                    .ml(columns.raw_gap),
+            )
     };
     let mut table = col()
         .key("atributos")
@@ -396,7 +428,7 @@ fn attribute_table(rows: &[AttributeRow], palette: &Palette) -> El {
             .pb(S2)
             .border_sides([0.0, 0.0, 1.0, 0.0], t.card_border),
         );
-    for attribute in rows {
+    for (index, attribute) in rows.iter().enumerate() {
         table = table.child(
             line(
                 [
@@ -410,8 +442,20 @@ fn attribute_table(rows: &[AttributeRow], palette: &Palette) -> El {
                 BODY,
                 t.text,
             )
-            .min_h(S8),
+            // A name on two lines keeps room above and below it.
+            .key(format!("atributo-{index}"))
+            .min_h(S8)
+            .py(S2),
         );
     }
     table
+}
+
+/// Widths of the ATA table's number columns: current, worst and limit, then the raw value.
+struct TableColumns {
+    numbers: [f32; 3],
+    raw: f32,
+    raw_gap: f32,
+    /// The raw value's own type, when it is smaller than the rest of the row.
+    raw_style: Option<TextStyle>,
 }

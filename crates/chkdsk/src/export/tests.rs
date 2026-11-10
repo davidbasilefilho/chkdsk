@@ -7,7 +7,8 @@ use chkdsk_core::model::DiskKind;
 use serde_json::Value;
 
 fn json_of(snapshots: &[DiskSnapshot], history: &History) -> Value {
-    serde_json::from_str(&to_json(snapshots, history, NOW)).expect("the export is valid JSON")
+    let json = to_json(snapshots, history, NOW).expect("the export serializes");
+    serde_json::from_str(&json).expect("the export is valid JSON")
 }
 
 /// The fixture history of the first disk, as the collector would have stored it.
@@ -111,7 +112,7 @@ fn csv_has_a_byte_order_mark_a_header_and_one_row_per_disk() {
     // The failing hard drive has hours and a temperature but no wear figure.
     assert_eq!(
         lines[2],
-        "WDC WD10EZEX-08WN4A0,hdd,1000204886016,20,Atenção,,34,33815,"
+        "WDC WD10EZEX-08WN4A0,hdd,1000204886016,20,Crítico,,34,33815,"
     );
     // A disk still being read has only what discovery knew.
     assert_eq!(lines[4], "Kingston NV2 500GB,nvme,500107862016,,Lendo…,,,,");
@@ -221,9 +222,9 @@ fn running_an_export_writes_the_chosen_format_and_reports_the_outcome() {
     let path = target("json.json");
     assert_eq!(
         outcome,
-        Outcome::Saved {
+        Some(Outcome::Saved {
             name: path.file_name().unwrap().to_string_lossy().into()
-        },
+        }),
         "the filter added .json"
     );
     let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -235,7 +236,7 @@ fn running_an_export_writes_the_chosen_format_and_reports_the_outcome() {
         panic!("a CSV has no history to load")
     });
     let path = target("table.csv");
-    assert!(matches!(outcome, Outcome::Saved { .. }));
+    assert!(matches!(outcome, Some(Outcome::Saved { .. })));
     let bytes = std::fs::read(&path).unwrap();
     assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]), "BOM bytes on disk");
     assert_eq!(
@@ -246,15 +247,65 @@ fn running_an_export_writes_the_chosen_format_and_reports_the_outcome() {
 
     assert_eq!(
         run(&disks, NOW, 0, Some(pick_nothing), History::default),
-        Outcome::Cancelled
+        None,
+        "a closed dialog has no outcome to report"
     );
     assert_eq!(
         run(&disks, NOW, 0, Some(pick_missing_folder), History::default),
-        Outcome::Failed
+        Some(Outcome::Failed(Failure::Write))
     );
     assert_eq!(
         run(&disks, NOW, 0, None, History::default),
-        Outcome::Unavailable
+        Some(Outcome::Unavailable)
+    );
+}
+
+#[test]
+fn a_file_is_replaced_in_one_piece_and_a_failure_leaves_the_old_one_alone() {
+    let path = target("replace.json");
+    std::fs::write(&path, b"old contents").unwrap();
+    write_atomically(&path, b"new contents").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new contents");
+    std::fs::remove_file(&path).unwrap();
+
+    // A folder where the file should go: the move fails, the folder stays, and no
+    // temporary file is left beside it.
+    let blocked = target("blocked.json");
+    std::fs::create_dir(&blocked).unwrap();
+    assert!(write_atomically(&blocked, b"never lands").is_err());
+    assert!(blocked.is_dir(), "the old target is untouched");
+    let stem = blocked.file_name().unwrap().to_string_lossy().into_owned();
+    let leftovers: Vec<_> = std::fs::read_dir(blocked.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with(&stem) && name.ends_with(".tmp")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    std::fs::remove_dir(&blocked).unwrap();
+}
+
+fn pick_and_panic(_: usize, _: &str) -> Option<Pick> {
+    panic!("the dialog blew up")
+}
+
+#[test]
+fn a_panic_inside_the_export_is_reported_as_a_failure() {
+    let disks = fixtures::disks();
+    assert_eq!(
+        run_isolated(&disks, NOW, 0, Some(pick_and_panic), History::default),
+        Some(Outcome::Failed(Failure::Interrupted))
+    );
+    // Without a panic it answers like `run`.
+    assert_eq!(
+        run_isolated(&disks, NOW, 0, Some(pick_nothing), History::default),
+        None
+    );
+    assert_eq!(
+        run_isolated(&disks, NOW, 0, None, History::default),
+        Some(Outcome::Unavailable)
     );
 }
 

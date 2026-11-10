@@ -13,8 +13,8 @@ use chkdsk_windows::backend::QueryErrorState;
 use std::{collections::HashSet, time::Duration};
 
 /// How loudly a disk speaks: healthy, a passing disk with warnings (caution),
-/// a device-reported failure (attention) or no usable data. Caution and attention
-/// share the word "Atenção" but not the color.
+/// a device-reported failure (attention) or no usable data. Caution reads "Atenção"
+/// and attention reads "Crítico", so the two differ in words as well as color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Healthy,
@@ -72,7 +72,7 @@ pub struct Health {
     pub last_reading: String,
     /// Device-reported failures and softer signals behind the score, one line each.
     pub warnings: Vec<String>,
-    /// What to do about an Atenção verdict; none otherwise.
+    /// What to do about an Atenção or Crítico verdict; none otherwise.
     pub advice: Option<&'static str>,
     pub attributes: Vec<AttributeRow>,
 }
@@ -127,6 +127,15 @@ impl Card {
         }
     }
 
+    /// Avançado has something to show: technical details or the ATA table.
+    pub fn has_advanced(&self) -> bool {
+        let attributes = match &self.body {
+            Body::Health(health) => health.attributes.len(),
+            _ => 0,
+        };
+        !self.details.is_empty() || attributes > 0
+    }
+
     /// The word next to the disk in the list, so color is never the only signal.
     pub fn status_label(&self) -> &'static str {
         match &self.body {
@@ -156,7 +165,7 @@ impl Health {
                 ("Saudável", Tone::Healthy)
             }
             HealthOutcome::Pass => ("Atenção", Tone::Caution),
-            HealthOutcome::Fail => ("Atenção", Tone::Attention),
+            HealthOutcome::Fail => ("Crítico", Tone::Attention),
             HealthOutcome::Unknown => ("Indisponível", Tone::Unknown),
         };
         let score = (health.outcome != HealthOutcome::Unknown).then_some(health.score);
@@ -731,7 +740,7 @@ mod tests {
         };
         for (telemetry, label, tone) in [
             (healthy, "Saudável", Tone::Healthy),
-            (worn, "Atenção", Tone::Attention),
+            (worn, "Crítico", Tone::Attention),
             (Telemetry::default(), "Indisponível", Tone::Unknown),
         ] {
             let expected = score_health(DiskKind::Nvme, &telemetry);
@@ -1015,7 +1024,7 @@ mod tests {
             ..Default::default()
         };
         let health = health_of(spare_only, DiskKind::Nvme);
-        assert_eq!(health.label, "Atenção");
+        assert_eq!(health.label, "Crítico");
         assert_eq!(
             health.warnings,
             ["Reserva NVMe abaixo do limite (5% < 10%)"]
@@ -1044,7 +1053,7 @@ mod tests {
             ..Default::default()
         };
         let health = health_of(telemetry, DiskKind::Hdd);
-        assert_eq!((health.label, health.tone), ("Atenção", Tone::Attention));
+        assert_eq!((health.label, health.tone), ("Crítico", Tone::Attention));
         assert_eq!(
             health.warnings,
             [

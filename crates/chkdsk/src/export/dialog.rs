@@ -1,10 +1,13 @@
 //! The Windows Save dialog (`GetSaveFileNameW`), offering JSON and CSV.
 
-use super::{Format, Pick};
-use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
-use windows_sys::Win32::UI::Controls::Dialogs::{
-    GetSaveFileNameW, OFN_EXPLORER, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
-    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+use super::{Format, Pick, with_extension};
+use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::Path, path::PathBuf};
+use windows_sys::Win32::UI::{
+    Controls::Dialogs::{
+        GetSaveFileNameW, OFN_DONTADDTORECENT, OFN_EXPLORER, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
+        OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    },
+    WindowsAndMessaging::{IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MessageBoxW},
 };
 
 /// Room for a long path: 32 K UTF-16 units, the Windows limit.
@@ -33,7 +36,6 @@ pub fn pick(owner: usize, suggested_name: &str) -> Option<Pick> {
     }
     let filters = filters();
     let title = wide("Exportar discos");
-    let default_extension = wide(Format::Json.extension());
     // SAFETY: `OPENFILENAMEW` is plain data, and all-zero is its documented empty state.
     let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
     dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
@@ -43,21 +45,51 @@ pub fn pick(owner: usize, suggested_name: &str) -> Option<Pick> {
     dialog.lpstrFile = file.as_mut_ptr();
     dialog.nMaxFile = PATH_UNITS as u32;
     dialog.lpstrTitle = title.as_ptr();
-    dialog.lpstrDefExt = default_extension.as_ptr();
-    dialog.Flags =
-        OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+    // No default extension: the chosen filter adds its own (`with_extension`), where a
+    // fixed `.json` would name a CSV choice wrongly.
+    dialog.Flags = OFN_EXPLORER
+        | OFN_OVERWRITEPROMPT
+        | OFN_PATHMUSTEXIST
+        | OFN_NOCHANGEDIR
+        | OFN_HIDEREADONLY
+        | OFN_DONTADDTORECENT;
     // SAFETY: every pointer in `dialog` refers to a buffer that outlives the call, and
     // `lpstrFile` has room for `nMaxFile` units. A false return is a cancel or an error.
     if unsafe { GetSaveFileNameW(&mut dialog) } == 0 {
         return None;
     }
     let length = file.iter().position(|unit| *unit == 0)?;
-    Some(Pick {
-        path: PathBuf::from(OsString::from_wide(&file[..length])),
-        filter: if dialog.nFilterIndex == 2 {
-            Format::Csv
-        } else {
-            Format::Json
-        },
-    })
+    let typed = PathBuf::from(OsString::from_wide(&file[..length]));
+    let filter = if dialog.nFilterIndex == 2 {
+        Format::Csv
+    } else {
+        Format::Json
+    };
+    let path = with_extension(typed.clone(), filter);
+    // The dialog checked the name as typed; one that gained an extension needs its own check.
+    if path != typed && path.exists() && !confirm_replace(owner, &path) {
+        return None;
+    }
+    Some(Pick { path, filter })
+}
+
+/// Ask whether to replace a file the dialog could not warn about.
+fn confirm_replace(owner: usize, path: &Path) -> bool {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let message = wide(&format!("{name} já existe. Deseja substituí-lo?"));
+    let title = wide("Exportar discos");
+    // SAFETY: both buffers are NUL-terminated and outlive the call; `owner` is a window
+    // handle or zero.
+    let answer = unsafe {
+        MessageBoxW(
+            owner as _,
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        )
+    };
+    answer == IDYES
 }

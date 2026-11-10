@@ -5,7 +5,8 @@
 //! them with `Cx::chrome_insets`. Everything not pressable moves the window.
 
 use super::{
-    BODY, CAPTION_STRONG, Dashboard, Palette, S1, S2, S3, S4, S5, Toast, export, export::Outcome,
+    BODY, CAPTION_STRONG, Dashboard, Palette, S1, S2, S3, S4, S5, Stop, Toast, export,
+    export::Outcome,
 };
 use rune::{Cursor, El, Icon, Transition, Tx, el, icon, row, text, tok, tok::TextStyle};
 
@@ -108,7 +109,12 @@ fn export_button(state: &Dashboard, palette: &Palette) -> El {
             .hover(t.control_track)
             .press(t.control_off)
             .cursor(Cursor::Pointer)
-            .on_press_tx(|s: &mut Dashboard, tx: &mut Tx| s.start_export(tx))
+            // Tab is the window's own (`Dashboard::tab`), so rune's traversal skips the button.
+            .tab_index(-1)
+            .on_press_tx(|s: &mut Dashboard, tx: &mut Tx| {
+                s.stop = Stop::Export;
+                s.start_export(tx)
+            })
     } else {
         button.disabled(true).opacity(0.5)
     }
@@ -124,17 +130,14 @@ fn confirmation(toast: &Toast, palette: &Palette) -> El {
             palette.attention,
             "Exportar só está disponível no Windows".to_owned(),
         ),
-        Outcome::Failed | Outcome::Cancelled => (
-            &WARNING,
-            palette.attention,
-            "Não foi possível salvar o arquivo".to_owned(),
-        ),
+        Outcome::Failed(failure) => (&WARNING, palette.attention, failure.message().to_owned()),
     };
     row()
         .key("confirmacao")
         .role("status")
         .label(message.clone())
-        .min_w(0.0)
+        // The status gives way first, so Exportar and the caption buttons keep their room.
+        .shrink()
         .px(S3)
         .py(S1)
         .gap(S2)
@@ -143,10 +146,11 @@ fn confirmation(toast: &Toast, palette: &Palette) -> El {
         .fill(color.alpha(super::PILL_TINT))
         .child(icon(glyph, S4).color(color))
         .child(
-            text(message)
+            text(message.clone())
                 .font(CAPTION_STRONG)
                 .color(color)
                 .truncate()
+                .help_when_truncated(message)
                 .min_w(0.0),
         )
         .transition(Transition::offset(S4, 0.0).combined(Transition::opacity()))

@@ -72,12 +72,36 @@ pub const PICKER: Option<Picker> = Some(dialog::pick);
 #[cfg(not(windows))]
 pub const PICKER: Option<Picker> = None;
 
-/// The window the user just clicked in, which the dialog opens over.
+/// The window handle the Save dialog sits over, kept from the window's creation.
+#[cfg(windows)]
+static OWNER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Remember the native handle of the window, on its thread.
+#[cfg(windows)]
+pub fn remember_owner(window: &rune::WindowHandle) {
+    use rune::raw_window_handle::RawWindowHandle;
+    let handle = window.with_raw_handle(|handle| match handle.as_raw() {
+        RawWindowHandle::Win32(window) => Some(window.hwnd.get() as usize),
+        _ => None,
+    });
+    if let Ok(Some(hwnd)) = handle {
+        OWNER.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn remember_owner(_: &rune::WindowHandle) {}
+
+/// The window the dialog opens over: the one rune created, else the window the user
+/// just clicked in. Call it on the window's thread.
 #[cfg(windows)]
 pub fn owner_window() -> usize {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-    // SAFETY: plain query with no arguments.
-    unsafe { GetForegroundWindow() as usize }
+    match OWNER.load(std::sync::atomic::Ordering::Relaxed) {
+        // SAFETY: plain query with no arguments.
+        0 => unsafe { GetForegroundWindow() as usize },
+        hwnd => hwnd,
+    }
 }
 
 #[cfg(not(windows))]
@@ -85,49 +109,108 @@ pub fn owner_window() -> usize {
     0
 }
 
-/// What the export did, for the confirmation the window shows.
+/// What the export did, for the confirmation the window shows. A closed dialog is
+/// not an outcome: it says nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Saved {
         name: String,
     },
-    /// The user closed the dialog: nothing to say.
-    Cancelled,
     /// There is no Save dialog on this platform.
     Unavailable,
-    /// The file could not be written.
-    Failed,
+    Failed(Failure),
+}
+
+/// Why nothing was saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// The file could not be written or put in place.
+    Write,
+    /// The data could not be turned into JSON.
+    Serialize,
+    /// The export stopped on an internal error.
+    Interrupted,
+    /// The export could not start.
+    Start,
+}
+
+impl Failure {
+    /// What the title bar says, with the reason.
+    pub fn message(self) -> &'static str {
+        match self {
+            Failure::Write => "Não foi possível gravar o arquivo",
+            Failure::Serialize => "Não foi possível preparar os dados",
+            Failure::Interrupted => "A exportação foi interrompida",
+            Failure::Start => "Não foi possível iniciar a exportação",
+        }
+    }
+}
+
+/// `run`, with a panic inside it (a dialog, a disk, the history) turned into a failure,
+/// so the thread always has an answer for the window and saving never sticks.
+pub fn run_isolated(
+    snapshots: &[DiskSnapshot],
+    now: u64,
+    owner: usize,
+    picker: Option<Picker>,
+    history: impl FnOnce() -> History,
+) -> Option<Outcome> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(snapshots, now, owner, picker, history)
+    }))
+    .unwrap_or(Some(Outcome::Failed(Failure::Interrupted)))
 }
 
 /// Ask where, then write every disk there. Blocks on the dialog, so it runs on
-/// its own thread.
+/// its own thread. None: the user closed the dialog.
 pub fn run(
     snapshots: &[DiskSnapshot],
     now: u64,
     owner: usize,
     picker: Option<Picker>,
     history: impl FnOnce() -> History,
-) -> Outcome {
+) -> Option<Outcome> {
     let Some(picker) = picker else {
-        return Outcome::Unavailable;
+        return Some(Outcome::Unavailable);
     };
-    let Some(pick) = picker(owner, SUGGESTED_NAME) else {
-        return Outcome::Cancelled;
-    };
+    let pick = picker(owner, SUGGESTED_NAME)?;
     let path = with_extension(pick.path, pick.filter);
     let contents = match Format::of_path(&path) {
-        Format::Json => to_json(snapshots, &history(), now),
+        Format::Json => match to_json(snapshots, &history(), now) {
+            Ok(json) => json,
+            Err(_) => return Some(Outcome::Failed(Failure::Serialize)),
+        },
         Format::Csv => to_csv(snapshots, now),
     };
-    match std::fs::write(&path, contents) {
+    Some(match write_atomically(&path, contents.as_bytes()) {
         Ok(()) => Outcome::Saved {
             name: path.file_name().map_or_else(
                 || path.display().to_string(),
                 |name| name.to_string_lossy().into(),
             ),
         },
-        Err(_) => Outcome::Failed,
+        Err(_) => Outcome::Failed(Failure::Write),
+    })
+}
+
+/// Write to a temporary file beside `path` and move it over `path`, so a failure
+/// halfway never leaves a truncated file where a good one was.
+fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+    let mut temporary = name.to_os_string();
+    temporary.push(format!(".{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(temporary);
+    let written = std::fs::File::create(&temporary).and_then(|mut file| {
+        file.write_all(contents)?;
+        file.sync_all()
+    });
+    // `rename` replaces an existing file on every platform, Windows included.
+    let result = written.and_then(|()| std::fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
+    result
 }
 
 /// The history the collector keeps on disk, for the JSON export.
@@ -239,7 +322,11 @@ fn disk_json(snapshot: &DiskSnapshot, history: &History, now: u64) -> Value {
 }
 
 /// Every disk with what the window knows of it, and the stored history samples.
-pub fn to_json(snapshots: &[DiskSnapshot], history: &History, now: u64) -> String {
+pub fn to_json(
+    snapshots: &[DiskSnapshot],
+    history: &History,
+    now: u64,
+) -> Result<String, serde_json::Error> {
     let document = json!({
         "app": "chkdsk",
         "version": env!("CARGO_PKG_VERSION"),
@@ -250,9 +337,9 @@ pub fn to_json(snapshots: &[DiskSnapshot], history: &History, now: u64) -> Strin
             .map(|snapshot| disk_json(snapshot, history, now))
             .collect::<Vec<_>>(),
     });
-    let mut text = serde_json::to_string_pretty(&document).unwrap_or_default();
+    let mut text = serde_json::to_string_pretty(&document)?;
     text.push('\n');
-    text
+    Ok(text)
 }
 
 const CSV_HEADER: [&str; 9] = [

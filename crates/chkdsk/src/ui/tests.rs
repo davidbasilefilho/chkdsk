@@ -173,12 +173,14 @@ fn up_down_and_the_wheel_scroll_the_panel_and_a_new_disk_starts_at_the_top() {
 fn status_mapping_reaches_the_screen_with_its_color_tone() {
     let cases = [
         (0, "Saudável", Some(Tone::Healthy)),
-        (1, "Atenção", Some(Tone::Attention)),
+        (1, "Crítico", Some(Tone::Attention)),
         (2, "Indisponível", Some(Tone::Unknown)),
+        (6, "Atenção", Some(Tone::Caution)),
     ];
     for (index, label, tone) in cases {
         let dashboard = fixtures::dashboard(index);
         assert_eq!(dashboard.cards[index].tone(), tone);
+        assert_eq!(dashboard.cards[index].status_label(), label);
         let rt = runtime(dashboard, (1100.0, 720.0));
         assert!(screen(&rt).contains(label), "{label} is shown");
     }
@@ -503,9 +505,12 @@ fn the_list_says_each_status_in_words_and_has_no_shortcut_footer() {
     for label in [
         "Saudável",
         "Atenção",
+        "Crítico",
         "Indisponível",
         "Lendo…",
         "Samsung SSD 990 PRO 1TB, NVMe  ·  931,5 GiB, Saudável",
+        "WDC WD10EZEX-08WN4A0, HD  ·  931,5 GiB, Crítico",
+        "WD Blue SN570 1TB, NVMe  ·  931,5 GiB, Atenção",
     ] {
         assert!(shown.contains(label), "{label} is missing: {shown}");
     }
@@ -823,10 +828,22 @@ fn caution_and_attention_use_different_colors_and_frames() {
             "no data is not a warning"
         );
     }
-    // Both read "Atenção", but the mild one never claims a device failure.
+    // They differ in words too: the mild one is Atenção and never claims a device failure,
+    // the severe one is Crítico, in the pill and in the list.
     let mild = shell(6, (1100.0, 720.0));
     let severe = shell(1, (1100.0, 720.0));
-    assert!(screen(&mild).contains("Atenção") && screen(&severe).contains("Atenção"));
+    for (rt, index, word) in [(&mild, 6, "Atenção"), (&severe, 1, "Crítico")] {
+        let Body::Health(health) = &rt.state.cards[index].body else {
+            panic!("the fixture has a reading");
+        };
+        assert_eq!(health.label, word);
+        let row = format!(", {word}\"");
+        assert!(screen(rt).contains(&row), "the list row says {word}");
+        assert!(
+            screen(rt).matches(word).count() >= 3,
+            "the list row, its status word and the pill say {word}"
+        );
+    }
     assert!(!screen(&mild).contains("O dispositivo relatou uma falha"));
     assert!(screen(&severe).contains("O dispositivo relatou uma falha"));
     for rt in [&mild, &severe] {
@@ -1162,14 +1179,23 @@ fn status_colors_keep_their_contrast_on_the_panel_and_inside_the_framed_verdict(
 }
 
 fn selection_x(rt: &Runtime<Dashboard>) -> f32 {
-    rect(rt, "selecao")[1]
+    rect(rt, "marcador")[1]
 }
 
 #[test]
-fn the_selection_highlight_travels_between_rows_and_snaps_under_reduced_motion() {
-    // Normal motion: a few frames after the click the highlight is between rows.
+fn the_selection_marker_travels_and_the_highlight_fades_without_covering_text() {
+    // Normal motion: a few frames after the click the marker is between rows, while the
+    // highlight only fades on the rows themselves, so it never hides a row's text.
     let mut rt = shell(0, (1100.0, 720.0));
-    let (from, to) = (selection_x(&rt), rect(&rt, "disco-interface:usb-2")[1]);
+    let from = selection_x(&rt);
+    // The marker sits at the same height inside every row.
+    let to = rect(&rt, "disco-interface:usb-2")[1] + from - rect(&rt, "disco-interface:nvme-0")[1];
+    let rows: Vec<f32> = rt
+        .state
+        .cards
+        .iter()
+        .map(|card| rect(&rt, &row_key(&card.id))[1])
+        .collect();
     let (x, y) = rt.find("disco-interface:usb-2").unwrap();
     rt.pointer_down(x, y);
     rt.pointer_up(x, y);
@@ -1178,6 +1204,11 @@ fn the_selection_highlight_travels_between_rows_and_snaps_under_reduced_motion()
     }
     let mid = selection_x(&rt);
     assert!(mid > from && mid < to, "in flight: {from} < {mid} < {to}");
+    let highlight = rect(&rt, "selecao")[1];
+    assert!(
+        rows.iter().any(|row| (row - highlight).abs() < 0.5),
+        "the highlight sits on a row, not between rows: {highlight} in {rows:?}"
+    );
     settle(&mut rt);
     assert_eq!(selection_x(&rt), to, "and it lands on the row");
 
@@ -1192,7 +1223,7 @@ fn the_selection_highlight_travels_between_rows_and_snaps_under_reduced_motion()
     let mut seen = Vec::new();
     for _ in 0..14 {
         rt.frame(FRAME);
-        if let Some((rect, _)) = rt.presented("selecao") {
+        if let Some((rect, _)) = rt.presented("marcador") {
             seen.push(rect[1]);
         }
     }
@@ -1378,4 +1409,247 @@ fn without_a_save_dialog_the_action_says_so_and_with_no_disks_it_is_disabled() {
     assert!(!rt.state.can_export(), "nothing to export yet");
     assert!(rt.find("exportar").is_some(), "the action stays in place");
     assert!(screen(&rt).contains("Não há discos para exportar"));
+}
+
+// ---- Repair round: keyboard stops, caption clearance, table at 760, export failures ----
+
+/// The element that has the keyboard focus, and whether its ring shows.
+fn focus(rt: &Runtime<Dashboard>) -> Option<(String, bool)> {
+    rt.elements()
+        .into_iter()
+        .find(|element| element.focused)
+        .and_then(|element| element.key.map(|key| (key, element.focus_visible)))
+}
+
+fn shift_tab(rt: &mut Runtime<Dashboard>) {
+    press(
+        rt,
+        Key::Tab,
+        Mods {
+            shift: true,
+            ..Mods::default()
+        },
+    );
+}
+
+fn focused_key(rt: &Runtime<Dashboard>) -> String {
+    focus(rt).expect("something has the focus").0
+}
+
+#[test]
+fn tab_goes_through_the_disks_then_avancado_and_exportar_and_wraps_around() {
+    let mut rt = shell(0, (1100.0, 720.0));
+    assert_eq!(focus(&rt), None, "nothing is focused before the first key");
+    let last = rt.state.cards.len() - 1;
+    for index in 1..=last {
+        plain(&mut rt, Key::Tab);
+        assert_eq!(rt.state.selected, index);
+        let id = rt.state.cards[index].id.clone();
+        assert_eq!(
+            focus(&rt),
+            Some((row_key(&id), true)),
+            "the row shows its ring"
+        );
+    }
+    plain(&mut rt, Key::Tab);
+    assert_eq!(rt.state.selected, last, "Avançado belongs to the last disk");
+    assert_eq!(focus(&rt), Some(("avancado".into(), true)));
+    plain(&mut rt, Key::Tab);
+    assert_eq!(focus(&rt), Some(("exportar".into(), true)));
+    plain(&mut rt, Key::Tab);
+    assert_eq!(
+        rt.state.selected, 0,
+        "past Exportar it wraps to the first disk"
+    );
+    assert_eq!(
+        focus(&rt),
+        Some((row_key(&rt.state.cards[0].id.clone()), true))
+    );
+    shift_tab(&mut rt);
+    assert_eq!(
+        focused_key(&rt),
+        "exportar",
+        "Shift+Tab from the first disk"
+    );
+    shift_tab(&mut rt);
+    assert_eq!(focused_key(&rt), "avancado");
+    shift_tab(&mut rt);
+    assert_eq!(rt.state.selected, last, "back to the last disk");
+    shift_tab(&mut rt);
+    assert_eq!(rt.state.selected, last - 1);
+}
+
+#[test]
+fn a_focused_avancado_and_exportar_press_with_space_and_return() {
+    let mut rt = shell(6, (1100.0, 720.0));
+    rt.state.picker = None;
+    plain(&mut rt, Key::Tab);
+    assert_eq!(focused_key(&rt), "avancado", "the last disk's Tab stop");
+    assert!(!rt.state.advanced);
+    typed(&mut rt, " ");
+    assert!(rt.state.advanced, "Space opens Avançado");
+    plain(&mut rt, Key::Enter);
+    assert!(!rt.state.advanced, "Return closes it");
+    plain(&mut rt, Key::Tab);
+    assert_eq!(focused_key(&rt), "exportar");
+    plain(&mut rt, Key::Enter);
+    assert_eq!(
+        rt.state.toast.as_ref().map(|toast| &toast.outcome),
+        Some(&crate::export::Outcome::Unavailable),
+        "Return presses the focused export button"
+    );
+    // Arrows leave the controls and go back to the disks.
+    plain(&mut rt, Key::Left);
+    assert_eq!(rt.state.selected, 5);
+    assert_eq!(
+        focus(&rt),
+        Some((row_key(&rt.state.cards[5].id.clone()), true))
+    );
+}
+
+#[test]
+fn clicking_a_control_makes_it_the_stop_tab_goes_on_from() {
+    let mut rt = shell(0, (1100.0, 720.0));
+    click(&mut rt, "avancado");
+    assert!(rt.state.advanced);
+    plain(&mut rt, Key::Tab);
+    assert_eq!(focused_key(&rt), "exportar");
+    click(&mut rt, "disco-interface:usb-2");
+    plain(&mut rt, Key::Tab);
+    assert_eq!(
+        rt.state.selected, 3,
+        "from a clicked row Tab steps to the next disk"
+    );
+}
+
+#[test]
+fn the_a_key_and_the_tab_stop_skip_avancado_on_a_disk_without_the_section() {
+    let mut rt = runtime(pending_disks(2), (1100.0, 720.0));
+    assert!(!rt.state.has_advanced());
+    assert!(rt.find("avancado").is_none());
+    typed(&mut rt, "a");
+    assert!(!rt.state.advanced, "nothing to open");
+    plain(&mut rt, Key::Tab);
+    assert_eq!(rt.state.selected, 1);
+    plain(&mut rt, Key::Tab);
+    assert_eq!(rt.state.selected, 1);
+    // Past the last disk the only stop left is Exportar.
+    assert_eq!(focused_key(&rt), "exportar");
+}
+
+#[test]
+fn the_export_status_keeps_clear_of_the_caption_buttons_and_the_action() {
+    for size in [(1100.0, 720.0), (760.0, 560.0), (640.0, 420.0)] {
+        for outcome in [
+            crate::export::Outcome::Saved {
+                name: "chkdsk-discos-com-um-nome-bem-longo.json".into(),
+            },
+            crate::export::Outcome::Failed(crate::export::Failure::Write),
+            crate::export::Outcome::Unavailable,
+        ] {
+            let mut dashboard = fixtures::dashboard(0);
+            dashboard.toast = Some(Toast {
+                outcome: outcome.clone(),
+                until: None,
+            });
+            let mut rt = runtime(dashboard, size);
+            with_windows_chrome(&mut rt);
+            let (status, export) = (rect(&rt, "confirmacao"), rect(&rt, "exportar"));
+            assert!(
+                export[0] + export[2] <= size.0 - CAPTION_BUTTONS,
+                "{size:?} {outcome:?}: Exportar clears the caption buttons"
+            );
+            assert!(
+                status[0] + status[2] <= export[0],
+                "{size:?} {outcome:?}: the status ends before Exportar: {status:?} {export:?}"
+            );
+            assert!(
+                status[0] >= rect(&rt, "marca")[0] + rect(&rt, "marca")[2],
+                "{size:?} {outcome:?}: and starts after the wordmark"
+            );
+        }
+    }
+}
+
+#[test]
+fn export_failures_say_why_and_a_panic_never_leaves_the_window_saving() {
+    fn blow_up(_: usize, _: &str) -> Option<crate::export::Pick> {
+        panic!("the dialog blew up")
+    }
+    let mut rt = shell(0, (1100.0, 720.0));
+    rt.state.picker = Some(blow_up);
+    click(&mut rt, "exportar");
+    wait_for_export(&mut rt);
+    assert_eq!(
+        rt.state.toast.as_ref().map(|toast| &toast.outcome),
+        Some(&crate::export::Outcome::Failed(
+            crate::export::Failure::Interrupted
+        ))
+    );
+    settle(&mut rt);
+    assert!(screen(&rt).contains("A exportação foi interrompida"));
+    assert!(rt.state.can_export(), "saving ended, so the next try works");
+
+    for (failure, message) in [
+        (
+            crate::export::Failure::Write,
+            "Não foi possível gravar o arquivo",
+        ),
+        (
+            crate::export::Failure::Serialize,
+            "Não foi possível preparar os dados",
+        ),
+        (
+            crate::export::Failure::Start,
+            "Não foi possível iniciar a exportação",
+        ),
+    ] {
+        assert_eq!(failure.message(), message);
+    }
+}
+
+#[test]
+fn the_attribute_table_at_the_narrow_size_keeps_names_on_few_lines_with_room_around_them() {
+    let mut rt = shell(1, (760.0, 560.0));
+    // Below the fold at this height: the key scrolls Avançado to the top as it opens.
+    typed(&mut rt, "a");
+    assert!(rt.state.advanced);
+    let table = rect(&rt, "atributos");
+    let panel = rect(&rt, "painel");
+    assert!(
+        table[0] + table[2] <= panel[0] + panel[2],
+        "the table stays inside the panel"
+    );
+    let Body::Health(health) = &rt.state.cards[1].body else {
+        panic!("the hard drive has a reading");
+    };
+    let count = health.attributes.len();
+    assert!(count > 0, "the hard drive has an ATA table");
+    let mut tall = 0;
+    for index in 0..count {
+        let row = rect(&rt, &format!("atributo-{index}"));
+        assert!(row[3] >= 36.0, "row {index} keeps its padding: {row:?}");
+        assert!(row[0] + row[2] <= panel[0] + panel[2], "row {index} fits");
+        if row[3] > 40.0 {
+            tall += 1;
+        }
+    }
+    // Most names fit one line: the flexible column has the room the raw value gave back.
+    assert!(tall * 3 <= count, "{tall} of {count} rows wrap");
+}
+
+#[test]
+fn tabbing_to_avancado_brings_it_into_view_in_a_short_window() {
+    let mut rt = shell(6, (760.0, 560.0));
+    assert!(
+        rect(&rt, "avancado")[1] > 560.0 - 48.0 || rt.presented("avancado").is_none(),
+        "Avançado starts below the fold"
+    );
+    plain(&mut rt, Key::Tab);
+    assert_eq!(focused_key(&rt), "avancado");
+    let header = rect(&rt, "avancado");
+    assert!(
+        header[1] >= 0.0 && header[1] + header[3] <= 560.0 - 12.0,
+        "the focused header is visible: {header:?}"
+    );
 }

@@ -55,7 +55,9 @@ fn main() {
     let handle = app.handle();
     // Collection starts after the first frame; headless captures never start it.
     let mut started = false;
-    let app = app.on_ready(move |_| {
+    let app = app.on_ready(move |window| {
+        // The Save dialog opens over this window; a recreated window reports itself again.
+        export::remember_owner(window);
         if !std::mem::replace(&mut started, true) {
             let handle = handle.clone();
             collector::spawn(move |update| {

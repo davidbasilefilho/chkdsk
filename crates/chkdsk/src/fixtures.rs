@@ -7,7 +7,7 @@
 
 use crate::{
     collector::{DiskSnapshot, Reading, Update, ready_reading},
-    export::Outcome,
+    export::{Failure, Outcome},
     ui::{Dashboard, Scene, Toast},
 };
 use chkdsk_core::{
@@ -45,7 +45,7 @@ pub const SCENES: &[Scene] = &[
     ("exportar-falhou", |s| {
         *s = dashboard(0);
         s.toast = Some(Toast {
-            outcome: Outcome::Failed,
+            outcome: Outcome::Failed(Failure::Write),
             until: None,
         });
     }),
