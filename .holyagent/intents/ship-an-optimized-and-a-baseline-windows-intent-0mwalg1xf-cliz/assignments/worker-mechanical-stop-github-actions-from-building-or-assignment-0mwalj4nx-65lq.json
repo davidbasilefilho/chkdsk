@@ -1,0 +1,42 @@
+{
+  "id": "assignment-0mwalj4nx-65lq",
+  "intentId": "intent-0mwalg1xf-cliz",
+  "intentRevision": 1,
+  "roleTask": "Worker.mechanical",
+  "slug": "stop-github-actions-from-building-or",
+  "objective": "Stop GitHub Actions from building or releasing on pushes to holyagent/* branches, starting with the holyagent/state branch's own workflow files, because GitHub evaluates a push's workflow triggers from the pushed commit's tree.",
+  "state": "Running",
+  "scope": [
+    "Only the git worktree /home/user/chkdsk/.git/holyagent/holyagent-state-c9bdc9d6fc (branch holyagent/state): .github/workflows/dev.yml and .github/workflows/validation.yml"
+  ],
+  "constraints": [
+    "dev.yml: in on.push replace branches: [\"**\"] with branches-ignore: [\"holyagent/**\"] and keep tags-ignore: [\"**\"] as is",
+    "validation.yml: in on.push replace branches: [\"**\"] with branches-ignore: [\"holyagent/**\"]; keep pull_request unchanged",
+    "Touch nothing else: not .holyagent/, not stable.yml, no other files",
+    "Verify with python3 -c 'import yaml,sys;[print(f, yaml.safe_load(open(f))[True][\"push\"]) for f in sys.argv[1:]]' .github/workflows/dev.yml .github/workflows/validation.yml (PyYAML reads the on key as True; if PyYAML is missing use pip install --user pyyaml or report)",
+    "Make no git writes",
+    "Report in under 150 words: git diff --stat and the printed push filters"
+  ],
+  "criteria": [
+    {
+      "text": "Both workflows ignore holyagent/** branch pushes; dev.yml still ignores tags; diff touches only those two files",
+      "blocking": true,
+      "dimension": "scope"
+    }
+  ],
+  "evidence": [
+    "changed-paths",
+    "checks-run"
+  ],
+  "ownershipPaths": [
+    "holyagent-state/.github/workflows"
+  ],
+  "dependencies": [],
+  "independentFrom": [],
+  "specialist": {
+    "model": "haiku",
+    "effort": "medium",
+    "startedAt": "2026-11-10T11:17:51.069Z"
+  },
+  "createdAt": "2026-11-10T11:17:51.069Z"
+}
