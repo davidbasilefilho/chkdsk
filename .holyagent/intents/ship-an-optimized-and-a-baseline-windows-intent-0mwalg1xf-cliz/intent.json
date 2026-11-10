@@ -1,0 +1,13 @@
+{
+  "id": "intent-0mwalg1xf-cliz",
+  "slug": "ship-an-optimized-and-a-baseline-windows",
+  "objective": "Ship an optimized and a -baseline Windows executable for every architecture that builds (x64, arm64, x86 if rune compiles for it), and keep x86 out of the build when it does not.",
+  "requirements": [
+    "User words: \"there shouldn't be only x64-baseline. -baseline is only if rust supports it, but in bun, there is/was -baseline targets that targeted older architectures within x64, x86 or arm64, that's the point of -baseline, if possible all (x64, arm64, x86) are supposed to have -baseline. also, I thought x86 wasn't possible here, if still the case remove it from being built\"",
+    "Bun convention: the plain asset targets modern CPUs, -baseline targets older CPUs of the same architecture",
+    "The x86 assets in the user screenshot came from a dev release of the holyagent/state branch (v0.0.1-dev-9bab024), whose tree is the old main; current main builds no x86"
+  ],
+  "revision": 1,
+  "state": "Open",
+  "createdAt": "2026-11-10T11:15:27.556Z"
+}
