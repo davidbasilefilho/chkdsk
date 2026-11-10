@@ -1,58 +1,127 @@
-name: development release
+name: dev
 
+# Pushes to dev and pull requests into dev or main. Every other branch triggers
+# nothing, and pull requests from holyagent/** or checkpoint branches skip every
+# job (plan, version and checks carry the head-branch condition; the other jobs
+# need plan). A pull request's push event is not listed, so a commit never runs
+# twice; the one overlap, a push to dev while a dev -> main pull request is open,
+# is skipped by the plan job.
+#
+# Require exactly one check on dev and main: `checks`. It always runs and is
+# green only when every job succeeded or was skipped on purpose, so documentation-only
+# changes and duplicate runs still report it.
 on:
   push:
-    branches-ignore: ["codex/checkpoint/**"]
-    tags-ignore: ["**"]
+    branches: [dev]
+  pull_request:
+    branches: [dev, main]
+
+# Newer pull request commits supersede older runs. Every push to dev has its own
+# group, so no push run is cancelled or dropped from a queue (a pending run would
+# replace an older pending one). Cancelling a pull request run that is publishing
+# is safe: publishing is resumable (draft first, assets verified before the draft
+# is published, an existing draft reused), and a cancelled run's commit has been
+# superseded. At worst it leaves an unpublished draft, which prune never touches.
+concurrency:
+  group: dev-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('push-{0}', github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
 
 jobs:
-  validation:
-    uses: ./.github/workflows/validation.yml
+  # Pull requests into main must come from dev and raise the ZeroVer version
+  # above the latest stable tag. The required `checks` job and the pre-release
+  # both depend on it.
+  version:
+    if: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' && !(startsWith(github.head_ref, 'holyagent/') || startsWith(github.head_ref, 'checkpoint/') || contains(github.head_ref, '/checkpoint/')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: read
-
-  build:
-    needs: validation
-    if: ${{ needs.validation.result == 'success' }}
-    runs-on: windows-2022
-    permissions:
-      contents: read
-    env:
-      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
-      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          install: true
-      - name: Build all development executables
-        run: mise run package-dev
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-assets
-          path: dist/release/*
-          if-no-files-found: error
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the source branch and the version bump
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: python3 scripts/release.py check-version
 
-  publish:
-    needs: [validation, build]
-    if: ${{ needs.validation.result == 'success' && needs.build.result == 'success' }}
-    runs-on: windows-2022
+  # Decides what this event validates and releases, from the commit alone:
+  # documentation-only changes, an open pull request covering a push to dev,
+  # forks, and a pre-release that already exists all skip work.
+  plan:
+    if: ${{ github.event_name != 'pull_request' || !(startsWith(github.head_ref, 'holyagent/') || startsWith(github.head_ref, 'checkpoint/') || contains(github.head_ref, '/checkpoint/')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      validate: ${{ steps.plan.outputs.validate }}
+      release: ${{ steps.plan.outputs.release }}
+      sha: ${{ steps.plan.outputs.sha }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          # The whole pull request (its merge base), not the last push, decides "documentation only".
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BRANCH: ${{ github.ref_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py plan-dev
+
+  validation:
+    needs: plan
+    if: ${{ needs.plan.outputs.validate == 'true' }}
+    uses: ./.github/workflows/validation.yml
+    with:
+      ref: ${{ needs.plan.outputs.sha }}
+    permissions:
+      contents: read
+
+  # Pull requests into main only publish once the version check passed.
+  prerelease:
+    needs: [plan, validation, version]
+    if: ${{ !cancelled() && needs.plan.outputs.release == 'true' && needs.validation.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.version.result) }}
+    uses: ./.github/workflows/release.yml
+    with:
+      mode: dev
+      sha: ${{ needs.plan.outputs.sha }}
+      tag: ${{ needs.plan.outputs.tag }}
+    # Only pushes to dev may sign; the token is blank on pull requests, which run
+    # unreviewed code, and release.yml refuses to sign them even if it were not.
+    secrets:
+      SIGNPATH_API_TOKEN: ${{ github.event_name == 'push' && secrets.SIGNPATH_API_TOKEN || '' }}
     permissions:
       contents: write
-    env:
-      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
-      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
+      actions: read
+
+  # The one required check. It runs even when jobs were skipped or failed and
+  # folds their results; see decide_gate in scripts/release.py.
+  checks:
+    needs: [plan, version, validation, prerelease]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !(startsWith(github.head_ref, 'holyagent/') || startsWith(github.head_ref, 'checkpoint/') || contains(github.head_ref, '/checkpoint/'))) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          install: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-assets
-          path: dist/release
-      - name: Verify assets and publish the completed draft
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Require every job to have succeeded or been skipped on purpose
         env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: mise run publish-dev
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/release.py gate
