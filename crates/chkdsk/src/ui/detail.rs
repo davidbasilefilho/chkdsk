@@ -80,6 +80,8 @@ pub fn panel(state: &Dashboard, card: &Card, palette: &Palette, narrow: bool) ->
             stick_bottom: false,
         })
         .scroll_edge_fade(S4)
+        // A control scrolled into view stops clear of the edge, so its focus ring is whole.
+        .scroll_margin(S4)
         .on_scroll_offset(state.bars.detail.follow())
         .child(page);
     raised(palette)

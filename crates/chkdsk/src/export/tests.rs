@@ -165,10 +165,18 @@ fn dates_are_iso_8601_utc() {
 
 #[test]
 fn the_file_name_decides_the_format_and_the_filter_fills_a_missing_extension() {
-    assert_eq!(Format::of_path(Path::new("a.csv")), Format::Csv);
-    assert_eq!(Format::of_path(Path::new("a.CSV")), Format::Csv);
-    assert_eq!(Format::of_path(Path::new("a.json")), Format::Json);
-    assert_eq!(Format::of_path(Path::new("a.txt")), Format::Json);
+    let json = Format::Json;
+    let csv = Format::Csv;
+    assert_eq!(Format::of_path(Path::new("a.csv"), json), Format::Csv);
+    assert_eq!(Format::of_path(Path::new("a.CSV"), json), Format::Csv);
+    assert_eq!(Format::of_path(Path::new("a.json"), csv), Format::Json);
+    assert_eq!(Format::of_path(Path::new("a.txt"), json), Format::Json);
+    assert_eq!(
+        Format::of_path(Path::new("a.txt"), csv),
+        Format::Csv,
+        "another extension takes the chosen filter"
+    );
+    assert_eq!(Format::of_path(Path::new("a"), csv), Format::Csv);
     assert_eq!(
         with_extension("dir/discos".into(), Format::Csv),
         PathBuf::from("dir/discos.csv")
@@ -200,6 +208,13 @@ fn pick_csv(_: usize, _: &str) -> Option<Pick> {
     Some(Pick {
         path: target("table.csv"),
         filter: Format::Json,
+    })
+}
+
+fn pick_csv_filter_other_extension(_: usize, _: &str) -> Option<Pick> {
+    Some(Pick {
+        path: target("table.txt"),
+        filter: Format::Csv,
     })
 }
 
@@ -245,6 +260,22 @@ fn running_an_export_writes_the_chosen_format_and_reports_the_outcome() {
     );
     std::fs::remove_file(&path).unwrap();
 
+    let outcome = run(
+        &disks,
+        NOW,
+        0,
+        Some(pick_csv_filter_other_extension),
+        || panic!("a CSV has no history to load"),
+    );
+    let path = target("table.txt");
+    assert!(matches!(outcome, Some(Outcome::Saved { .. })));
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+        "the CSV filter decides for another extension"
+    );
+    std::fs::remove_file(&path).unwrap();
+
     assert_eq!(
         run(&disks, NOW, 0, Some(pick_nothing), History::default),
         None,
@@ -285,6 +316,11 @@ fn a_file_is_replaced_in_one_piece_and_a_failure_leaves_the_old_one_alone() {
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
     std::fs::remove_dir(&blocked).unwrap();
+}
+
+#[test]
+fn temporary_names_differ_on_every_call() {
+    assert_ne!(temporary_suffix(), temporary_suffix());
 }
 
 fn pick_and_panic(_: usize, _: &str) -> Option<Pick> {

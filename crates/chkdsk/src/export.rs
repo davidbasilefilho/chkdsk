@@ -39,11 +39,13 @@ impl Format {
         }
     }
 
-    /// What the file name asks for: `.csv` is CSV, anything else is JSON.
-    pub fn of_path(path: &Path) -> Format {
+    /// What the file name asks for: `.json` is JSON and `.csv` is CSV; any other name
+    /// (or none) takes the format of the filter the user chose.
+    pub fn of_path(path: &Path, filter: Format) -> Format {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some(extension) if extension.eq_ignore_ascii_case("csv") => Format::Csv,
-            _ => Format::Json,
+            Some(extension) if extension.eq_ignore_ascii_case("json") => Format::Json,
+            _ => filter,
         }
     }
 }
@@ -80,13 +82,16 @@ static OWNER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::n
 #[cfg(windows)]
 pub fn remember_owner(window: &rune::WindowHandle) {
     use rune::raw_window_handle::RawWindowHandle;
-    let handle = window.with_raw_handle(|handle| match handle.as_raw() {
-        RawWindowHandle::Win32(window) => Some(window.hwnd.get() as usize),
-        _ => None,
-    });
-    if let Ok(Some(hwnd)) = handle {
-        OWNER.store(hwnd, std::sync::atomic::Ordering::Relaxed);
-    }
+    // A lookup that fails clears the handle, so the dialog never sits over a stale window.
+    let hwnd = window
+        .with_raw_handle(|handle| match handle.as_raw() {
+            RawWindowHandle::Win32(window) => Some(window.hwnd.get() as usize),
+            _ => None,
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    OWNER.store(hwnd, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(not(windows))]
@@ -173,9 +178,9 @@ pub fn run(
     let Some(picker) = picker else {
         return Some(Outcome::Unavailable);
     };
-    let pick = picker(owner, SUGGESTED_NAME)?;
-    let path = with_extension(pick.path, pick.filter);
-    let contents = match Format::of_path(&path) {
+    let Pick { path, filter } = picker(owner, SUGGESTED_NAME)?;
+    let path = with_extension(path, filter);
+    let contents = match Format::of_path(&path, filter) {
         Format::Json => match to_json(snapshots, &history(), now) {
             Ok(json) => json,
             Err(_) => return Some(Outcome::Failed(Failure::Serialize)),
@@ -193,24 +198,57 @@ pub fn run(
     })
 }
 
-/// Write to a temporary file beside `path` and move it over `path`, so a failure
-/// halfway never leaves a truncated file where a good one was.
+/// Tries to pick an unused temporary name before giving up.
+const TEMPORARY_ATTEMPTS: usize = 8;
+
+/// Write to a new temporary file beside `path` and move it over `path`, so a failure
+/// halfway never leaves a truncated file where a good one was. The temporary is created
+/// exclusively under an unpredictable name, so it never follows a planted file or link.
 fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
-    let mut temporary = name.to_os_string();
-    temporary.push(format!(".{}.tmp", std::process::id()));
-    let temporary = path.with_file_name(temporary);
-    let written = std::fs::File::create(&temporary).and_then(|mut file| {
-        file.write_all(contents)?;
-        file.sync_all()
-    });
+    let mut attempts = 0;
+    let (temporary, mut file) = loop {
+        let mut candidate = name.to_os_string();
+        candidate.push(format!(".{}.tmp", temporary_suffix()));
+        let candidate = path.with_file_name(candidate);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && attempts + 1 < TEMPORARY_ATTEMPTS =>
+            {
+                attempts += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let written = file.write_all(contents).and_then(|()| file.sync_all());
+    drop(file);
     // `rename` replaces an existing file on every platform, Windows included.
     let result = written.and_then(|()| std::fs::rename(&temporary, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result
+}
+
+/// Process id, clock and a counter: distinct for every call, and not guessable ahead.
+fn temporary_suffix() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    format!(
+        "{}-{nanos:08x}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// The history the collector keeps on disk, for the JSON export.

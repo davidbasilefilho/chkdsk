@@ -516,8 +516,9 @@ pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
     // walks the disks, then Avançado and Exportar, so rune's traversal skips them all.
     cx.web_focus();
     cx.focus_ring(2.0, 2.0, t.text);
-    // Tooltips keep clear of the window edge, so they never cover the scroll bar.
-    cx.help_look(HelpLook::system(cx.system_dark()).margin(S6));
+    // Tooltips keep clear of the window edge, so they never cover the scroll bar, and
+    // sit far enough below their element that Exportar's clears the panel's top edge.
+    cx.help_look(HelpLook::system(cx.system_dark()).margin(S6).gap(S4));
     let insets = cx.chrome_insets();
     #[cfg(feature = "scenes")]
     let insets = preview::insets(insets);
@@ -641,6 +642,8 @@ fn sidebar(state: &Dashboard, palette: &Palette, narrow: bool) -> El {
             })
             .key(LIST_KEY)
             .scroll_edge_fade(S4)
+            // A row scrolled into view stops clear of the edge, so its focus ring is whole.
+            .scroll_margin(S4)
             .on_scroll_offset(state.bars.list.follow())
             .grow(1.0)
             .min_h(0.0),
