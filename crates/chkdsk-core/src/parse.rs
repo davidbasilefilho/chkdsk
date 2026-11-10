@@ -2,7 +2,7 @@
 
 use crate::model::{AtaAttribute, AtaHealth, NvmeHealth};
 
-pub const HEALTH_LOG_SIZE: usize = 512;
+pub(crate) const HEALTH_LOG_SIZE: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]

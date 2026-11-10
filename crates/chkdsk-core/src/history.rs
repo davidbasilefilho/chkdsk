@@ -5,11 +5,11 @@ use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
-pub const HISTORY_MAX_DISKS: usize = 16;
-pub const HISTORY_RETENTION_SECS: u64 = 35 * 24 * 60 * 60;
-pub const HISTORY_HOURLY_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+pub(crate) const HISTORY_MAX_DISKS: usize = 16;
+pub(crate) const HISTORY_RETENTION_SECS: u64 = 35 * 24 * 60 * 60;
+pub(crate) const HISTORY_HOURLY_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 /// At most 169 hourly buckets for the recent week plus 29 daily buckets.
-pub const HISTORY_MAX_SAMPLES_PER_DISK: usize = 198;
+pub(crate) const HISTORY_MAX_SAMPLES_PER_DISK: usize = 198;
 const HISTORY_MAX_SAMPLES_TOTAL: usize = HISTORY_MAX_DISKS * HISTORY_MAX_SAMPLES_PER_DISK;
 // Bound temporary allocation when loading oversized/corrupt files, then keep
 // the newest serialized tail before normal retention and disk caps are applied.
@@ -127,7 +127,7 @@ impl History {
     /// disks, 35 days per disk, one sample per hour for the newest seven days,
     /// and one per day before that. Within a bucket the newest observation is
     /// retained, preserving a useful long-term wear trend at bounded size.
-    pub fn sanitize(&mut self) {
+    pub(crate) fn sanitize(&mut self) {
         if self.version == 0 {
             self.version = 1;
         }
@@ -315,7 +315,7 @@ impl History {
     /// with a device-reported power-on-hour counter. This is an age estimate,
     /// not a health or failure forecast.
     #[allow(dead_code)]
-    pub fn estimated_first_power_on_unix_secs(&self, disk_id: &str) -> Option<u64> {
+    pub(crate) fn estimated_first_power_on_unix_secs(&self, disk_id: &str) -> Option<u64> {
         self.samples
             .iter()
             .filter(|sample| sample.disk_id == disk_id)

@@ -6,7 +6,7 @@
 //! a refused or ineffective elevation cannot loop.
 
 /// Appended to the arguments of the elevated copy. Unknown to rune, which passes it through.
-pub const RELAUNCH_FLAG: &str = "--elevated-relaunch";
+pub(crate) const RELAUNCH_FLAG: &str = "--elevated-relaunch";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StartupDecision {

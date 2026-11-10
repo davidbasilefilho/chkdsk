@@ -1,18 +1,12 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
-#![cfg_attr(not(windows), allow(dead_code))]
 
-mod ata;
-mod backend;
 mod collector;
-mod elevation;
 #[cfg(any(test, feature = "scenes"))]
 mod fixtures;
-mod health;
-mod history;
-mod model;
-mod parse;
 mod present;
 mod ui;
+
+use chkdsk_windows::elevation;
 
 use rune::{App, AppSpec};
 

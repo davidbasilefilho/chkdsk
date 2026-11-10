@@ -1,12 +1,12 @@
 //! Coleta em segundo plano: descoberta periódica, consultas limitadas, histórico
 //! em disco. Nada aqui toca a interface: o resultado chega como `Update`.
 
-use crate::{
-    backend::{self, QueryErrorState},
+use chkdsk_core::{
     health::{HealthOutcome, score_health},
     history::{HealthSample, History},
     model::{DiskIdentity, Telemetry},
 };
+use chkdsk_windows::backend::{self, QueryErrorState};
 use std::{
     collections::{HashMap, VecDeque},
     io::Write,
@@ -402,7 +402,7 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DiskKind, NvmeHealth};
+    use chkdsk_core::model::{DiskKind, NvmeHealth};
 
     fn identity(id: &str, index: u32) -> DiskIdentity {
         DiskIdentity {

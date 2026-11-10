@@ -531,8 +531,26 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 name = "chkdsk"
 version = "0.1.0"
 dependencies = [
+ "chkdsk-core",
+ "chkdsk-windows",
  "rune",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "chkdsk-core"
+version = "0.1.0"
+dependencies = [
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "chkdsk-windows"
+version = "0.1.0"
+dependencies = [
+ "chkdsk-core",
  "serde_json",
  "windows-sys 0.61.2",
 ]

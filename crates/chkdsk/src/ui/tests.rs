@@ -2,9 +2,9 @@ use super::*;
 use crate::{
     collector::{DiskSnapshot, Reading},
     fixtures::{self, NOW},
-    model::{DiskIdentity, DiskKind},
     present::Tone,
 };
+use chkdsk_core::model::{DiskIdentity, DiskKind};
 use rune::{Env, Mods, Runtime, Shell};
 
 const FRAME: f64 = 1.0 / 60.0;

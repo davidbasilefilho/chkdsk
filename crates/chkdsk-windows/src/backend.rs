@@ -5,7 +5,7 @@
 
 // The Win32 half below uses most of these; other platforms only get the stubs.
 #[cfg_attr(not(windows), allow(unused_imports))]
-use crate::{
+use chkdsk_core::{
     model::{DiskIdentity, DiskKind, QueryState, Telemetry},
     parse,
 };
@@ -755,7 +755,7 @@ mod windows {
         }
     }
 
-    fn nvme_health(device: &Device) -> Result<crate::model::NvmeHealth, u32> {
+    fn nvme_health(device: &Device) -> Result<chkdsk_core::model::NvmeHealth, u32> {
         // STORAGE_PROTOCOL_SPECIFIC_DATA is 40 bytes on all supported ABIs.
         let mut protocol = [0u8; 40];
         put_u32(&mut protocol, 0, PROTOCOL_TYPE_NVME);
@@ -884,13 +884,13 @@ mod windows {
         // Parse into a throwaway value before selecting the pass-through
         // response. Duplicate IDs or a bad checksum must permit the existing
         // legacy IOCTL to retry, without mutating the valid READ DATA result.
-        let mut scratch = crate::model::AtaHealth::default();
+        let mut scratch = chkdsk_core::model::AtaHealth::default();
         parse::apply_ata_smart_thresholds(&mut scratch, sector)
             .map_err(|error| AtaCommandError::InvalidSmartThresholds(error.to_string()))
     }
 
     fn read_ata_smart_thresholds_with(
-        health: &mut crate::model::AtaHealth,
+        health: &mut chkdsk_core::model::AtaHealth,
         pass_through: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
         legacy: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
     ) -> Result<(), AtaCommandError> {
@@ -900,7 +900,7 @@ mod windows {
             .map_err(|error| AtaCommandError::InvalidSmartThresholds(error.to_string()))
     }
 
-    fn ata_health(device: &Device) -> Result<crate::model::AtaHealth, AtaCommandError> {
+    fn ata_health(device: &Device) -> Result<chkdsk_core::model::AtaHealth, AtaCommandError> {
         let sector = ata_data_sector_validated(
             || {
                 ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_DATA, true)
@@ -1157,8 +1157,8 @@ mod windows {
             let mut bad_pass = valid_legacy.clone();
             bad_pass[511] ^= 1;
             let mut legacy_called = false;
-            let mut health = crate::model::AtaHealth {
-                attributes: vec![crate::model::AtaAttribute {
+            let mut health = chkdsk_core::model::AtaHealth {
+                attributes: vec![chkdsk_core::model::AtaAttribute {
                     id: 197,
                     flags: 0,
                     current: 100,
@@ -1186,8 +1186,8 @@ mod windows {
         fn valid_pass_through_threshold_page_skips_legacy_and_both_invalid_leave_read_data_usable()
         {
             let valid = smart_threshold_sector(&[(197, 10)]);
-            let mut threshold_health = crate::model::AtaHealth {
-                attributes: vec![crate::model::AtaAttribute {
+            let mut threshold_health = chkdsk_core::model::AtaHealth {
+                attributes: vec![chkdsk_core::model::AtaAttribute {
                     id: 197,
                     flags: 0,
                     current: 100,
@@ -1208,8 +1208,8 @@ mod windows {
             let mut bad_checksum = smart_threshold_sector(&[(197, 10)]);
             bad_checksum[511] ^= 1;
             let duplicate = smart_threshold_sector(&[(197, 10), (197, 5)]);
-            let mut read_data = crate::model::AtaHealth {
-                attributes: vec![crate::model::AtaAttribute {
+            let mut read_data = chkdsk_core::model::AtaHealth {
+                attributes: vec![chkdsk_core::model::AtaAttribute {
                     id: 197,
                     flags: 0,
                     current: 100,
@@ -1326,7 +1326,7 @@ mod windows {
         ) -> serde_json::Value {
             let summary = match result {
                 Ok(telemetry) => {
-                    let health_score = crate::health::score_health(identity.kind, telemetry);
+                    let health_score = chkdsk_core::health::score_health(identity.kind, telemetry);
                     let ata = match &telemetry.ata {
                         QueryState::Success(health) => {
                             let attributes: Vec<_> = health
@@ -1402,8 +1402,8 @@ mod windows {
                 kind: DiskKind::Ssd,
             };
             let telemetry = Telemetry {
-                ata: QueryState::Success(crate::model::AtaHealth {
-                    attributes: vec![crate::model::AtaAttribute {
+                ata: QueryState::Success(chkdsk_core::model::AtaHealth {
+                    attributes: vec![chkdsk_core::model::AtaAttribute {
                         id: 202,
                         flags: 0x0018,
                         current: 100,
