@@ -2,7 +2,7 @@ name: validation
 
 on:
   push:
-    branches: ["**"]
+    branches-ignore: ["holyagent/**"]
   pull_request:
 
 jobs:

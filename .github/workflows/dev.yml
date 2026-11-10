@@ -2,7 +2,7 @@ name: development release
 
 on:
   push:
-    branches: ["**"]
+    branches-ignore: ["holyagent/**"]
     tags-ignore: ["**"]
 
 jobs:
