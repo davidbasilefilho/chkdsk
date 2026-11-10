@@ -6,7 +6,7 @@ Painel de saúde de discos para Windows, escrito em Rust, com uma janela nativa 
 
 ## Executar
 
-Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a nota em destaque, vida estimada, desgaste, temperatura, tempo ligado, última leitura, os avisos de saúde e, em discos ATA, os atributos SMART com limites e valores brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. Releases incluem executáveis para Windows x64-baseline e ARM64. O runtime não requer Rust, mise ou acesso à rede.
+Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. A janela desenha a própria barra de título, com o nome **chkdsk** e a ação **Exportar**; o Windows continua cuidando de redimensionar, dos layouts de encaixe, do menu da janela (clique direito na barra ou Alt+Espaço) e do maximizar com duplo clique. À esquerda, sobre o fundo da janela, ficam os discos, com um ponto de cor para o estado de cada um; à direita, num painel elevado e recuado das bordas, o disco selecionado, com a nota em percentual, vida estimada, desgaste, temperatura, tempo ligado, última leitura e os avisos de saúde. A seção **Avançado**, fechada ao abrir, guarda o barramento, o firmware, o número de série, as fontes dos dados e, em discos ATA, os atributos SMART com limites e valores brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. Releases incluem executáveis para Windows x64-baseline e ARM64. O runtime não requer Rust, mise ou acesso à rede.
 
 ## Pontuação e limites
 
@@ -34,8 +34,19 @@ Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o
 
 - `←` / `→` ou `Tab` / `Shift+Tab`: alternar entre discos.
 - `↑` / `↓` (ou `k` / `j`): rolar o painel do disco; `Page Up`, `Page Down`, `Home` e `End` também rolam.
-- Clique em um disco da lista para selecioná-lo; a roda do mouse rola o painel sob o ponteiro.
+- Clique em um disco da lista para selecioná-lo; a roda do mouse rola o painel sob o ponteiro. A barra de rolagem fina aparece só quando o conteúdo não cabe: arraste a barra, ou clique na trilha para rolar uma página.
+- `A` ou um clique em **Avançado**: abrir e fechar os detalhes técnicos.
+- `Ctrl+E` ou o botão **Exportar**: salvar todos os discos em um arquivo (veja abaixo).
 - `q` ou `Esc`: sair. Fechar a janela também encerra o aplicativo.
+
+Com a opção do Windows que desliga animações (Configurações › Acessibilidade › Efeitos visuais › Efeitos de animação), os movimentos viram cortes e as transições, um desvanecer curto.
+
+## Exportar
+
+**Exportar** abre a janela Salvar do Windows, que oferece JSON e CSV, e grava todos os discos listados; a barra de título mostra o nome do arquivo salvo ou o motivo da falha. Cancelar a janela não grava nem avisa nada. Fora do Windows o botão fica desativado.
+
+- **JSON**: um objeto com a versão do aplicativo, a data da exportação e `disks`, com, por disco, identidade (modelo, série, firmware, barramento, tipo, capacidade em bytes), estado, nota, veredito, avisos, valores de telemetria, atributos SMART (`id`, `name`, `flags`, `current`, `worst`, `threshold`, `raw`) e as amostras de histórico guardadas em `%APPDATA%\chkdsk\historico.json`.
+- **CSV**: uma linha por disco, com `model,kind,capacity_bytes,score_percent,status,wear_percent,temperature_c,power_on_hours,last_reading_utc`. UTF-8 com BOM (o Excel abre os acentos corretamente), separador vírgula, campos entre aspas conforme a RFC 4180 e linhas terminadas em CRLF. Textos que o dispositivo informa e que começariam com `=`, `+`, `-` ou `@` recebem um apóstrofo na frente, para que planilhas não os executem como fórmula.
 
 ## Desenvolvimento
 
@@ -48,11 +59,11 @@ mise install
 mise exec -- cargo run -p chkdsk
 ```
 
-O build usa [rune](https://github.com/anomalyco/rune) fixado em um commit exato (`rev` em `[workspace.dependencies]` do `Cargo.toml` da raiz); atualize-o de propósito, nunca por branch. Fora do Windows o aplicativo compila e os testes rodam, mas a lista de discos fica vazia (a coleta nativa é só para Windows). No Linux, o rune precisa de `libxkbcommon-dev` e `libwayland-dev`; para renderizar sem GPU, `mesa-vulkan-drivers` com `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+O build usa [rune](https://github.com/anomalyco/rune) fixado em um commit exato (`rev` em `[workspace.dependencies]` do `Cargo.toml` da raiz); atualize-o de propósito, nunca por branch. Fora do Windows o aplicativo compila e os testes rodam, mas a lista de discos fica vazia (a coleta nativa é só para Windows) e a janela Salvar da exportação não existe. No Linux, o rune precisa de `libxkbcommon-dev` e `libwayland-dev`; para renderizar sem GPU, `mesa-vulkan-drivers` com `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
 
-O código é um workspace Cargo em `crates/`: `chkdsk-core` (modelo, leitura dos dados SMART/NVMe, pontuação de saúde e histórico; lógica pura, sem dependências de plataforma), `chkdsk-windows` (acesso nativo aos discos e elevação UAC, com stubs fora do Windows) e `chkdsk` (o executável: coleta, textos, janela e as cenas de exemplo). Comandos que valem para tudo usam `--workspace`, por exemplo `cargo test --workspace`.
+O código é um workspace Cargo em `crates/`: `chkdsk-core` (modelo, leitura dos dados SMART/NVMe, pontuação de saúde e histórico; lógica pura, sem dependências de plataforma), `chkdsk-windows` (acesso nativo aos discos e elevação UAC, com stubs fora do Windows) e `chkdsk` (o executável: coleta, textos, janela, exportação e as cenas de exemplo). Comandos que valem para tudo usam `--workspace`, por exemplo `cargo test --workspace`.
 
-Capturas sem disco real (discos de exemplo em `crates/chkdsk/src/fixtures.rs`; cenas: `saudavel`, `atencao`, `indisponivel`, `carregando`, `falha`, `vazio`, `procurando`, `descoberta`):
+Capturas sem disco real (discos de exemplo em `crates/chkdsk/src/fixtures.rs`; cenas: `saudavel`, `atencao`, `atencao-leve`, `indisponivel`, `carregando`, `falha`, `dados-insuficientes`, `avancado-aberto`, `exportado`, `exportar-falhou`, `vazio`, `procurando`, `descoberta`; `--script` reproduz cliques, teclas e `{"focus":false}`):
 
 ```powershell
 cargo run -p chkdsk --features scenes -- --snap captura.png --scene saudavel --size 1100x720 --scale 2 --theme dark

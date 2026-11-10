@@ -12,10 +12,13 @@ use chkdsk_core::{
 use chkdsk_windows::backend::QueryErrorState;
 use std::{collections::HashSet, time::Duration};
 
-/// The three colors of the palette: healthy, attention, no usable data.
+/// How loudly a disk speaks: healthy, a passing disk with warnings (caution),
+/// a device-reported failure (attention) or no usable data. Caution and attention
+/// share the word "Atenção" but not the color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Healthy,
+    Caution,
     Attention,
     Unknown,
 }
@@ -29,7 +32,16 @@ pub struct Card {
     /// Title of the detail panel.
     pub title: String,
     pub subtitle: String,
+    /// Bus, firmware, serial and data sources, for the collapsed Avançado section.
+    pub details: Vec<Detail>,
     pub body: Body,
+}
+
+/// One technical fact about a disk: `Barramento`, `NVMe`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Detail {
+    pub label: &'static str,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,8 +57,8 @@ pub enum Body {
 pub struct Health {
     pub tone: Tone,
     pub label: &'static str,
-    /// `93`; none when there is no usable evidence.
-    pub score: Option<String>,
+    /// 0 to 100; none when there is no usable evidence.
+    pub score: Option<u8>,
     /// `412 dias` or `aguardando histórico`.
     pub lifetime: String,
     /// The lifetime is an estimate, not the waiting placeholder.
@@ -68,6 +80,8 @@ pub struct Health {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttributeRow {
     pub id: String,
+    /// The attribute's usual name where it is the same on every drive.
+    pub name: String,
     pub current: String,
     pub worst: String,
     /// The device's declared failure threshold; `—` when it declares none.
@@ -108,6 +122,7 @@ impl Card {
             list_name: model.unwrap_or("Disco").into(),
             title: model.unwrap_or("Modelo desconhecido").into(),
             subtitle: format!("{kind}  ·  {capacity}"),
+            details: details(identity, &snapshot.reading),
             body,
         }
     }
@@ -140,10 +155,11 @@ impl Health {
             HealthOutcome::Pass if health.warnings.is_empty() && health.score > 50 => {
                 ("Saudável", Tone::Healthy)
             }
-            HealthOutcome::Pass | HealthOutcome::Fail => ("Atenção", Tone::Attention),
+            HealthOutcome::Pass => ("Atenção", Tone::Caution),
+            HealthOutcome::Fail => ("Atenção", Tone::Attention),
             HealthOutcome::Unknown => ("Indisponível", Tone::Unknown),
         };
-        let score = (health.outcome != HealthOutcome::Unknown).then(|| health.score.to_string());
+        let score = (health.outcome != HealthOutcome::Unknown).then_some(health.score);
         let status = match telemetry_status(telemetry) {
             SMART_AVAILABLE if health.outcome == HealthOutcome::Unknown => SMART_INSUFFICIENT,
             status => status,
@@ -176,7 +192,7 @@ impl Health {
                 .map(|timestamp| format!("há {}", format_duration(now.saturating_sub(timestamp))))
                 .unwrap_or_else(|| "indisponível".into()),
             warnings: warning_lines(&health, telemetry),
-            advice: (tone == Tone::Attention).then_some(BACKUP_ADVICE),
+            advice: matches!(tone, Tone::Caution | Tone::Attention).then_some(BACKUP_ADVICE),
             attributes: match &telemetry.ata {
                 QueryState::Success(ata) => ata.attributes.iter().map(attribute_row).collect(),
                 _ => Vec::new(),
@@ -337,7 +353,15 @@ fn values_against(current: u8, threshold: u8) -> String {
 /// `Setores realocados (05)`: the attribute's usual name where it is the same on
 /// every drive, so the number in the table can be found; otherwise only its ID.
 fn attribute_label(id: u8) -> String {
-    let name = match id {
+    format!(
+        "{} ({id:02X})",
+        attribute_name(id).unwrap_or("Atributo ATA")
+    )
+}
+
+/// The name most drives agree on; vendors define the rest.
+pub fn attribute_name(id: u8) -> Option<&'static str> {
+    Some(match id {
         0x01 => "Taxa de erros de leitura",
         0x03 => "Tempo de aceleração do disco",
         0x04 => "Ciclos de partida e parada",
@@ -351,9 +375,61 @@ fn attribute_label(id: u8) -> String {
         0xC5 => "Setores pendentes",
         0xC6 => "Setores incorrigíveis offline",
         0xC7 => "Erros de CRC na interface",
-        _ => "Atributo ATA",
+        _ => return None,
+    })
+}
+
+/// `96%`: the score as the window and the exports write it.
+pub fn percent(value: u8) -> String {
+    format!("{value}%")
+}
+
+/// What the Avançado section lists besides the attribute table: where the disk
+/// sits on the machine and which readings the numbers above came from.
+fn details(identity: &DiskIdentity, reading: &Reading) -> Vec<Detail> {
+    let mut details = Vec::new();
+    let mut add = |label: &'static str, value: Option<&str>| {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            details.push(Detail {
+                label,
+                value: value.to_owned(),
+            });
+        }
     };
-    format!("{name} ({id:02X})")
+    add("Barramento", identity.bus.as_deref());
+    add("Firmware", identity.firmware.as_deref());
+    add("Número de série", identity.serial.as_deref());
+    if let Reading::Ready(ready) = reading {
+        let sources = data_sources(&ready.telemetry);
+        add(
+            "Fontes dos dados",
+            (!sources.is_empty()).then(|| sources.join(", ")).as_deref(),
+        );
+        add(
+            "Perfil de atributos",
+            ready.telemetry.ata_profile.as_deref(),
+        );
+    }
+    details
+}
+
+/// The readings that succeeded, as the user would name them.
+fn data_sources(telemetry: &Telemetry) -> Vec<&'static str> {
+    let mut sources = Vec::new();
+    if matches!(&telemetry.nvme, QueryState::Success(_)) {
+        sources.push("log de saúde NVMe");
+    }
+    if let QueryState::Success(ata) = &telemetry.ata {
+        sources.push(if ata.thresholds_available {
+            "SMART ATA com limites"
+        } else {
+            "SMART ATA sem limites"
+        });
+    }
+    if matches!(&telemetry.overall_failure, QueryState::Success(_)) {
+        sources.push("estado geral SMART");
+    }
+    sources
 }
 
 fn attribute_row(attribute: &AtaAttribute) -> AttributeRow {
@@ -366,6 +442,9 @@ fn attribute_row(attribute: &AtaAttribute) -> AttributeRow {
         .collect();
     AttributeRow {
         id: format!("{:02X}", attribute.id),
+        name: attribute_name(attribute.id)
+            .unwrap_or("Específico do fabricante")
+            .into(),
         current: attribute.current.to_string(),
         worst: attribute.worst.to_string(),
         threshold: attribute
@@ -665,7 +744,7 @@ mod tests {
             };
             assert_eq!((health.label, health.tone), (label, tone));
             if tone != Tone::Unknown {
-                assert_eq!(health.score, Some(expected.score.to_string()));
+                assert_eq!(health.score, Some(expected.score));
             } else {
                 assert_eq!(health.score, None);
             }
@@ -848,6 +927,7 @@ mod tests {
             health.attributes,
             [AttributeRow {
                 id: "C2".into(),
+                name: "Específico do fabricante".into(),
                 current: "71".into(),
                 worst: "53".into(),
                 threshold: "10".into(),
@@ -866,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn a_passing_disk_with_soft_signals_reads_as_attention_and_says_why() {
+    fn a_passing_disk_with_soft_signals_reads_as_caution_and_says_why() {
         let telemetry = Telemetry {
             nvme: QueryState::Success(NvmeHealth {
                 percentage_used: Some(4),
@@ -880,8 +960,13 @@ mod tests {
             HealthOutcome::Pass
         );
         let health = health_of(telemetry, DiskKind::Nvme);
-        assert_eq!((health.label, health.tone), ("Atenção", Tone::Attention));
+        assert_eq!((health.label, health.tone), ("Atenção", Tone::Caution));
         assert!(health.score.is_some());
+        assert_eq!(
+            health.advice,
+            Some(BACKUP_ADVICE),
+            "caution still advises a backup"
+        );
         assert_eq!(health.warnings, ["Erros de mídia NVMe registrados: 12"]);
 
         let exhausted = Telemetry {
