@@ -6,7 +6,7 @@ Painel de saúde de discos para Windows, escrito em Rust, com uma janela nativa 
 
 ## Executar
 
-Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a nota em destaque, vida estimada, desgaste, temperatura, tempo ligado, última leitura, os avisos de saúde e, em discos ATA, os atributos SMART com limites e valores brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. Releases incluem executáveis para Windows x64-baseline e ARM64. O runtime não requer Rust, mise ou acesso à rede.
+Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a nota em destaque, vida estimada, desgaste, temperatura, tempo ligado, última leitura, os avisos de saúde e, em discos ATA, os atributos SMART com limites e valores brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. Cada release traz três executáveis: `x64` (compilado para `x86-64-v3`, exige CPU com AVX2, a partir de Haswell/Excavator), `x64-baseline` (`x86-64-v2`, para qualquer CPU aceita pelo Windows 11 24H2 e para as que não têm AVX2) e `arm64`. Na dúvida, use `x64-baseline`. Não há build de 32 bits (o rune não compila para i686) nem `arm64-baseline`. O runtime não requer Rust, mise ou acesso à rede.
 
 ## Pontuação e limites
 
@@ -70,18 +70,52 @@ mise run setup-hook
 mise run release
 ```
 
-`validation` confere formatação, regras de release, linkers MSVC, Clippy, testes x64 e compilação nas duas arquiteturas. `setup-hook` instala o hook local do `prek`, que verifica `rustfmt`. `release` gera builds otimizados; também existem `release-x64-baseline` e `release-arm64`.
+`validation` confere formatação, regras de release, linkers MSVC, Clippy, testes x64 e compilação nas duas arquiteturas (no Windows, com o MSVC). `setup-hook` instala o hook local do `prek`, que verifica `rustfmt`. `release` gera os três executáveis otimizados em `dist/release` com os nomes de um build de desenvolvimento; também existem `release-x64`, `release-x64-baseline` e `release-arm64`. Cada variante usa o próprio diretório `target/<variante>`, porque `x64` e `x64-baseline` diferem em `-C target-cpu` e não podem compartilhar artefatos.
+
+No Linux (e no CI), `mise run ci-linux` roda formatação, a autoverificação de `scripts/release.py`, Clippy no host, Clippy para `x86_64` e `aarch64` MSVC com [cargo-xwin](https://github.com/rust-cross/cargo-xwin) (`mise run clippy-xwin`) e `cargo test --workspace` (`mise run tests-host`). Isso exige `clang`, `lld`, `llvm` e as bibliotecas do rune descritas acima; o cargo-xwin baixa o CRT e o SDK do Windows na primeira execução. O perfil `release` usa LTO completo (`fat`), uma unidade de codegen e `strip` (menor executável medido: 19,7 MB contra 21,6 MB do perfil padrão), mantendo `panic = "unwind"` (o coletor depende de `catch_unwind`).
+
+### CI e fluxo de branches
+
+Todo PR vai para `dev`; só `dev` vai para `main`. Os merges são squash, então o workflow de release registra `main` em `dev` com um merge `-s ours` (veja abaixo). Nenhum outro branch dispara workflows (`holyagent/**` e branches de checkpoint incluídos).
+
+| Workflow | Quando | O que faz |
+| --- | --- | --- |
+| `dev` | push em `dev`; PR para `dev` ou `main` | `plan` decide o que rodar; `validation`; `prerelease`; no PR para `main`, o job `version` |
+| `validation` | chamado por `dev` e `stable` | `linux` (fmt, Clippy host e xwin, testes, autoverificação) e `windows` (testes no Windows) |
+| `release` | chamado por `dev` e `stable` | `build` (x64, x64-baseline e arm64, em paralelo), `sign` (opcional), `publish` |
+| `stable` | push em `main` | `plan`, `validation`, `release` e `backmerge` |
+
+O job `plan` pula tudo quando o PR só muda documentação (`*.md`, `docs/`, `LICENSE`), quando um push em `dev` já é coberto por um PR aberto de `dev` e, nos pré-releases, para PRs de forks e commits que já têm release. A verificação é feita dentro do job, e não por `paths-ignore`, para que os checks obrigatórios continuem reportando. Execuções de PR cancelam as anteriores do mesmo PR; releases estáveis nunca são canceladas. Configure `dev / version`, `dev / validation / linux` e `dev / validation / windows` como checks obrigatórios.
+
+#### Assinatura com SignPath (opcional)
+
+Quando a variável `SIGNPATH_ORGANIZATION_ID` e o segredo `SIGNPATH_API_TOKEN` existem, o job `sign` envia os três `.exe` ao [SignPath](https://signpath.io) antes de gerar os checksums; sem eles, o passo é pulado e os executáveis saem sem assinatura. Em *Settings > Secrets and variables > Actions*, defina:
+
+- variável `SIGNPATH_ORGANIZATION_ID`: ID da organização;
+- variável `SIGNPATH_PROJECT_SLUG`: slug do projeto;
+- variável `SIGNPATH_SIGNING_POLICY_SLUG`: slug da política de assinatura;
+- variável `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG`: slug da configuração de artefato (um zip com `*.exe` na raiz);
+- segredo `SIGNPATH_API_TOKEN`: token da API.
+
+No SignPath, o projeto precisa confiar neste repositório como *trusted build system* (GitHub.com). PRs de forks não recebem segredos e nunca assinam.
 
 ## Releases
 
-Tags estáveis seguem exatamente `v{versão}` e não aceitam versão SemVer pré-lançamento. Builds de desenvolvimento usam `v{versão}-dev-{sha7}`. Os executáveis têm estes nomes (o sufixo `-dev-{sha7}` aparece somente em builds de desenvolvimento):
+O projeto segue [ZeroVer](https://0ver.org/): a versão major é sempre `0` (`0.y.z`, sem sufixos), e `[workspace.package] version` no `Cargo.toml` da raiz é a única fonte da versão.
+
+- **Pré-releases.** Cada commit de um push em `dev` ou da ponta de um PR (para `dev` ou `main`) gera, no máximo uma vez, um pré-release `v{versão}-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}` (por exemplo `v0.1.0-dev.2026-11-10.12-45-02.g50eb54a`). Data e hora são as do commit, em UTC; como os campos têm largura fixa, a ordem alfabética e a ordem de precedência SemVer são cronológicas. Depois de publicar, o workflow apaga os pré-releases de desenvolvimento (e suas tags) além dos 10 mais recentes; releases estáveis nunca são apagados.
+- **Versão.** Um PR para `main` só pode sair de `dev` e precisa elevar a versão para um valor ZeroVer maior que a última tag estável `v*`; o check `dev / version` falha caso contrário.
+- **Release estável.** O merge em `main` cria a tag `v{versão}` (se ainda não existir), compila, verifica, assina (se configurado) e publica automaticamente. Se a tag já existe em outro commit, o release é recusado. Em seguida, o job `backmerge` faz `git merge -s ours` do commit de release em `dev`; se `dev` não aceitar o push de `github-actions`, o job falha com instruções.
+
+Os executáveis têm estes nomes (o sufixo `-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}` aparece somente em builds de desenvolvimento) e vêm com `SHA256SUMS.txt`:
 
 ```text
-chkdsk-{versão}[-dev-{sha7}]-windows-x64-baseline.exe
-chkdsk-{versão}[-dev-{sha7}]-windows-arm64.exe
+chkdsk-{versão}[-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}]-windows-x64.exe
+chkdsk-{versão}[-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}]-windows-x64-baseline.exe
+chkdsk-{versão}[-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}]-windows-arm64.exe
 ```
 
-`mise run release-check` valida localmente regras SemVer, nomes dos artefatos e mapeamentos de arquitetura sem publicar.
+`mise run release-check` valida localmente as regras de tag, ZeroVer, planejamento, poda e nomes de artefatos, sem publicar.
 
 ## Licença
 

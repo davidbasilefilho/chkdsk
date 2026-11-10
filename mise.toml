@@ -16,20 +16,42 @@ run = "python scripts/release.py clippy"
 description = "Run the complete x64 Windows test suite"
 run = "python scripts/release.py tests"
 
+[tasks.clippy-host]
+description = "Lint every target and feature for the host platform"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.clippy-xwin]
+description = "Cross-lint the x64 and ARM64 Windows targets with cargo-xwin (runs on Linux)"
+run = "python scripts/release.py xwin-clippy"
+
+[tasks.tests-host]
+description = "Run the workspace tests on the host platform (Windows-only code is stubbed out)"
+run = "cargo test --workspace --all-features"
+
 [tasks.compile]
 description = "Compile every Cargo target and feature for x64 and ARM64"
 run = "python scripts/release.py compile"
 
 [tasks.release-check]
-description = "Self-check release naming and Windows target mapping"
+description = "Self-check release tags, version rules, planning, pruning and Windows target mapping"
 run = "python scripts/release.py self-check"
 
 [tasks.linker-check]
 description = "Verify the x64 and ARM64 MSVC environment and linkers"
 run = "python scripts/release.py linker-check"
 
+[tasks.ci-linux]
+description = "Checks CI runs on Linux: formatting, host and xwin lint, host tests, release script self-check"
+run = [
+  { task = "fmt" },
+  { task = "release-check" },
+  { task = "clippy-host" },
+  { task = "clippy-xwin" },
+  { task = "tests-host" },
+]
+
 [tasks.validation]
-description = "Run formatting, lint, tests, all-architecture compilation, and release checks"
+description = "Run formatting, lint, tests, all-architecture compilation, and release checks on Windows"
 run = [
   { task = "fmt" },
   { task = "release-check" },
@@ -44,32 +66,21 @@ description = "Install the repository pre-commit hook"
 run = "prek install"
 
 [tasks.release]
-description = "Build optimized x64-baseline and ARM64 executables"
+description = "Build the optimized x64, x64-baseline and ARM64 executables for the current commit"
 run = [
+  { task = "release-x64" },
   { task = "release-x64-baseline" },
   { task = "release-arm64" },
 ]
 
+[tasks.release-x64]
+description = "Build the x64 (x86-64-v3, AVX2) executable into dist/release"
+run = "python scripts/release.py build --mode dev --variant x64"
+
 [tasks.release-x64-baseline]
-description = "Build the optimized x64-baseline executable"
-run = "python scripts/release.py build --architecture x64"
+description = "Build the x64-baseline (x86-64-v2) executable into dist/release"
+run = "python scripts/release.py build --mode dev --variant x64-baseline"
 
 [tasks.release-arm64]
-description = "Build the optimized ARM64 executable"
-run = "python scripts/release.py build --architecture arm64"
-
-[tasks.package-dev]
-description = "Package the complete development release using the current commit"
-run = 'python scripts/release.py package --mode dev --output dist/release'
-
-[tasks.publish-dev]
-description = "Verify and publish the development release for the current commit"
-run = 'python scripts/release.py publish --mode dev --assets-dir dist/release'
-
-[tasks.package-stable]
-description = "Validate the current tag and package the complete stable release"
-run = 'python scripts/release.py package --mode stable --output dist/release'
-
-[tasks.publish-stable]
-description = "Verify and publish the stable release for the current tag and commit"
-run = 'python scripts/release.py publish --mode stable --assets-dir dist/release'
+description = "Build the ARM64 executable into dist/release"
+run = "python scripts/release.py build --mode dev --variant arm64"

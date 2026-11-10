@@ -1,0 +1,173 @@
+name: release
+
+# Reusable build, sign and publish pipeline shared by dev.yml (pre-releases) and
+# stable.yml (stable releases). Callers decide whether a commit needs a release;
+# nothing here builds a commit twice because every artifact feeds the same publish job.
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: dev or stable
+        required: true
+        type: string
+      sha:
+        description: Commit to release
+        required: true
+        type: string
+      tag:
+        description: Tag computed by the caller's plan job (re-derived and compared by release.py)
+        required: true
+        type: string
+    secrets:
+      SIGNPATH_API_TOKEN:
+        required: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  MISE_DISABLE_TOOLS: github:llvm/llvm-project,prek
+
+jobs:
+  # Job conditions cannot read secrets, so this job turns "signing is configured"
+  # into an output. Pull requests from forks have no secrets and never sign.
+  config:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      sign: ${{ steps.signing.outputs.sign }}
+    steps:
+      - id: signing
+        env:
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          if [ -n "$SIGNPATH_ORGANIZATION_ID" ] && [ -n "$SIGNPATH_API_TOKEN" ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            echo "SignPath is not configured; the executables are published unsigned."
+          fi
+
+  # One native MSVC build per asset; each variant has its own target directory and cache.
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        variant: [x64, x64-baseline, arm64]
+    defaults:
+      run:
+        shell: bash
+    env:
+      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
+      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          install: true
+          cache: true
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ". -> target/${{ matrix.variant }}"
+          key: release-${{ matrix.variant }}
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' }}
+      - name: Build, verify and smoke-test the executable
+        env:
+          MODE: ${{ inputs.mode }}
+          VARIANT: ${{ matrix.variant }}
+          RELEASE_SHA: ${{ inputs.sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: mise exec -- python scripts/release.py build --mode "$MODE" --variant "$VARIANT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: exe-${{ matrix.variant }}
+          path: dist/release/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  # Optional Authenticode signing through SignPath, before checksums are written.
+  sign:
+    needs: [config, build]
+    if: ${{ needs.config.outputs.sign == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: exe-*
+          merge-multiple: true
+          path: dist/unsigned
+      - id: unsigned
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-exes
+          path: dist/unsigned/*.exe
+          if-no-files-found: error
+          retention-days: 1
+      - uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: "true"
+          output-artifact-directory: dist/signed
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-exes
+          path: dist/signed/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [build, sign]
+    if: ${{ !cancelled() && needs.build.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.sign.result) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      MODE: ${{ inputs.mode }}
+      RELEASE_SHA: ${{ inputs.sha }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - name: Download the signed executables
+        if: ${{ needs.sign.result == 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-exes
+          path: dist/release
+      - name: Download the executables
+        if: ${{ needs.sign.result != 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: exe-*
+          merge-multiple: true
+          path: dist/release
+      - name: Write checksums and publish the verified release
+        run: |
+          python3 scripts/release.py checksums --mode "$MODE" --assets-dir dist/release
+          python3 scripts/release.py publish --mode "$MODE" --assets-dir dist/release
+      - name: Prune old development pre-releases
+        if: ${{ inputs.mode == 'dev' }}
+        run: python3 scripts/release.py prune --keep 10

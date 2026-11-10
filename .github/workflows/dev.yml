@@ -1,58 +1,91 @@
-name: development release
+name: dev
 
+# Pushes to dev and pull requests into dev or main (every other branch, including
+# holyagent/** and checkpoint branches, triggers nothing). A pull request's push
+# event is not listed, so a commit never runs twice; the one overlap, a push to dev
+# while a dev -> main pull request is open, is skipped by the plan job.
 on:
   push:
-    branches-ignore: ["codex/checkpoint/**"]
-    tags-ignore: ["**"]
+    branches: [dev]
+  pull_request:
+    branches: [dev, main]
+
+# Newer pull request commits supersede older runs. Pushes to dev queue instead,
+# so a run that is publishing is never cancelled halfway.
+concurrency:
+  group: dev-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
 
 jobs:
-  validation:
-    uses: ./.github/workflows/validation.yml
+  # Pull requests into main must come from dev and raise the ZeroVer version
+  # above the latest stable tag. Make this job a required check on main.
+  version:
+    if: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: read
-
-  build:
-    needs: validation
-    if: ${{ needs.validation.result == 'success' }}
-    runs-on: windows-2022
-    permissions:
-      contents: read
-    env:
-      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
-      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          install: true
-      - name: Build all development executables
-        run: mise run package-dev
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-assets
-          path: dist/release/*
-          if-no-files-found: error
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the source branch and the version bump
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: python3 scripts/release.py check-version
 
-  publish:
-    needs: [validation, build]
-    if: ${{ needs.validation.result == 'success' && needs.build.result == 'success' }}
-    runs-on: windows-2022
+  # Decides what this event validates and releases, from the commit alone:
+  # documentation-only changes, an open pull request covering a push to dev,
+  # forks, and a pre-release that already exists all skip work.
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      validate: ${{ steps.plan.outputs.validate }}
+      release: ${{ steps.plan.outputs.release }}
+      sha: ${{ steps.plan.outputs.sha }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}
+          BRANCH: ${{ github.ref_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py plan-dev
+
+  validation:
+    needs: plan
+    if: ${{ needs.plan.outputs.validate == 'true' }}
+    uses: ./.github/workflows/validation.yml
+    with:
+      ref: ${{ needs.plan.outputs.sha }}
+    permissions:
+      contents: read
+
+  prerelease:
+    needs: [plan, validation]
+    if: ${{ needs.plan.outputs.release == 'true' }}
+    uses: ./.github/workflows/release.yml
+    with:
+      mode: dev
+      sha: ${{ needs.plan.outputs.sha }}
+      tag: ${{ needs.plan.outputs.tag }}
+    secrets: inherit
     permissions:
       contents: write
-    env:
-      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
-      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
-        with:
-          install: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-assets
-          path: dist/release
-      - name: Verify assets and publish the completed draft
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: mise run publish-dev
+      actions: read

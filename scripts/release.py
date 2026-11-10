@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""MSVC-aware validation and draft-first Windows release packaging."""
+"""MSVC-aware validation, release planning and draft-first Windows release packaging."""
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -14,11 +15,14 @@ import sys
 import tempfile
 import time
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# 32-bit x86 is deliberately absent: rune does not build for i686-pc-windows-msvc.
 TARGETS = {
     "x64": "x86_64-pc-windows-msvc",
     "arm64": "aarch64-pc-windows-msvc",
@@ -28,12 +32,41 @@ MSVC_ENV = {
     "x64": ("x64", "x64"),
     "arm64": ("x64_arm64", "arm64"),
 }
+
+
+class Variant(NamedTuple):
+    architecture: str
+    cpu: str | None  # rustc -C target-cpu; None keeps the target default
+
+
+# Release assets, in publication order. The key is the asset suffix.
+#   x64          x86-64-v3 (AVX2): Haswell/Excavator or newer.
+#   x64-baseline x86-64-v2 (SSE4.2, POPCNT): the Windows 11 24H2 minimum CPU.
+#   arm64        the default armv8-a baseline; no arm64-baseline variant exists.
+# The names were checked against `rustc --print target-cpus --target x86_64-pc-windows-msvc`.
+VARIANTS = {
+    "x64": Variant("x64", "x86-64-v3"),
+    "x64-baseline": Variant("x64", "x86-64-v2"),
+    "arm64": Variant("arm64", None),
+}
 SEMVER = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
     r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?"
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
+# The project is ZeroVer: every release is 0.y.z, without prerelease or build metadata.
+ZEROVER = re.compile(r"0\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
+STABLE_TAG = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
+# v<version>-dev.<YYYY-MM-DD>.<HH-MM-SS>.g<sha7>. Both date parts are fixed-width
+# SemVer identifiers, so ASCII comparison orders tags chronologically.
+DEV_TAG = re.compile(
+    r"v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-dev\.\d{4}-\d{2}-\d{2}\.\d{2}-\d{2}-\d{2}\.g[0-9a-f]{7}"
+)
+# The earlier scheme, v<version>-dev-<sha7>; such releases are still pruned.
+LEGACY_DEV_TAG = re.compile(r"v\d+\.\d+\.\d+-dev-[0-9a-f]{7,40}")
+DOCS_ONLY_PATTERNS = ("README.md", "*.md", "docs/*", "LICENSE")
+KEEP_DEV_RELEASES = 10
 VSWHERE = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
 VS_COMPONENTS = (
     "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
@@ -48,44 +81,75 @@ def version_parts(version: str) -> tuple[bool, bool]:
     return match.group(4) is not None, match.group(5) is not None
 
 
-def expected_tag(mode: str, version: str, sha: str) -> str:
-    prerelease, has_build_metadata = version_parts(version)
+def require_zerover(version: str) -> tuple[int, int, int]:
+    version_parts(version)
+    if not ZEROVER.fullmatch(version):
+        raise ValueError(f"version must be ZeroVer 0.y.z without prerelease or build metadata: {version!r}")
+    major, minor, patch = (int(part) for part in version.split("."))
+    return major, minor, patch
+
+
+def dev_suffix(sha: str, committed: int) -> str:
+    """`dev.<date>.<time>.g<sha7>` from the commit time in UTC; one commit, one suffix."""
+    when = datetime.fromtimestamp(committed, tz=timezone.utc)
+    if not 1970 <= when.year <= 9999:
+        raise ValueError(f"commit time is outside the supported range: {committed}")
+    return f"dev.{when:%Y-%m-%d}.{when:%H-%M-%S}.g{sha[:7].lower()}"
+
+
+def expected_tag(mode: str, version: str, sha: str, committed: int | None = None) -> str:
+    require_zerover(version)
     if mode == "stable":
-        if prerelease:
-            raise ValueError("stable mode requires a normal (non-prerelease) Cargo version")
         return f"v{version}"
     if mode != "dev":
         raise ValueError(f"unsupported release mode: {mode}")
     if not re.fullmatch(r"[0-9a-fA-F]{7,64}", sha):
         raise ValueError("dev mode requires a hexadecimal commit SHA of at least seven characters")
-    if has_build_metadata:
-        raise ValueError("dev release versions must not contain SemVer build metadata")
-    return f"v{version}-dev-{sha[:7].lower()}"
+    if committed is None:
+        raise ValueError("dev mode requires the commit time")
+    return f"v{version}-{dev_suffix(sha, committed)}"
 
 
-def validate_tag(mode: str, version: str, sha: str, supplied_tag: str | None) -> str:
-    tag = expected_tag(mode, version, sha)
+def validate_tag(mode: str, version: str, sha: str, committed: int | None, supplied_tag: str | None) -> str:
+    tag = expected_tag(mode, version, sha, committed)
     if supplied_tag is not None and supplied_tag != tag:
         raise ValueError(f"tag mismatch: expected {tag!r} for {mode} mode, got {supplied_tag!r}")
     return tag
 
 
-def release_inputs(
-    mode: str, sha: str | None, tag: str | None, environ: dict[str, str] | None = None
-) -> tuple[str, str | None]:
-    """Commit and tag from the flags, else from the Actions environment.
+def is_dev_tag(tag: str) -> bool:
+    return bool(DEV_TAG.fullmatch(tag) or LEGACY_DEV_TAG.fullmatch(tag))
 
-    The workflow never interpolates ref names into a shell line; this reads them
-    from the environment instead. A dev run builds on a branch, so only stable
-    mode takes its tag from GITHUB_REF_NAME.
+
+def release_inputs(
+    sha: str | None, tag: str | None, head: str, environ: dict[str, str] | None = None
+) -> tuple[str, str | None]:
+    """Release commit and optional tag from flags, else RELEASE_SHA/RELEASE_TAG.
+
+    The workflow never interpolates ref names into a shell line. The commit
+    defaults to the checked-out HEAD and must equal it: a pull_request event's
+    GITHUB_SHA is a merge commit, and building the wrong commit would publish
+    assets under another commit's tag.
     """
     environment = os.environ if environ is None else environ
-    sha = sha or environment.get("GITHUB_SHA")
-    if not sha:
-        raise ValueError("a commit SHA is required: pass --sha or set GITHUB_SHA")
-    if tag is None and mode == "stable":
-        tag = environment.get("GITHUB_REF_NAME") or None
-    return sha, tag
+    sha = (sha or environment.get("RELEASE_SHA") or head).lower()
+    if sha != head.lower():
+        raise ValueError(f"the checked-out commit {head} is not the release commit {sha}")
+    return sha, tag or environment.get("RELEASE_TAG") or None
+
+
+def git(*arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments], cwd=ROOT, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def git_head() -> str:
+    return git("rev-parse", "HEAD")
+
+
+def commit_time(sha: str) -> int:
+    return int(git("show", "-s", "--format=%ct", sha))
 
 
 BINARY_MANIFEST = Path("crates") / "chkdsk" / "Cargo.toml"
@@ -160,10 +224,8 @@ def msvc_environment(architecture: str) -> tuple[dict[str, str], Path]:
 
     path_entries = [str(host_linker.parent), str(linker.parent), environment.get("PATH", "")]
     environment["PATH"] = os.pathsep.join(entry for entry in path_entries if entry)
-    host_target = TARGETS["x64"].upper().replace("-", "_")
-    environment[f"CARGO_TARGET_{host_target}_LINKER"] = str(host_linker)
-    target_key = TARGETS[architecture].upper().replace("-", "_")
-    environment[f"CARGO_TARGET_{target_key}_LINKER"] = str(linker)
+    environment[f"CARGO_TARGET_{target_key(TARGETS['x64'])}_LINKER"] = str(host_linker)
+    environment[f"CARGO_TARGET_{target_key(TARGETS[architecture])}_LINKER"] = str(linker)
     return environment, linker
 
 
@@ -172,8 +234,26 @@ def run(command: list[str], *, env: dict[str, str] | None = None, capture: bool 
     return subprocess.run(command, cwd=ROOT, env=env, check=True, text=True, capture_output=capture)
 
 
-def cargo_for(architecture: str, arguments: list[str]) -> None:
+def target_key(target: str) -> str:
+    return target.upper().replace("-", "_")
+
+
+def variant_environment(variant: str, base: dict[str, str]) -> dict[str, str]:
+    """Environment that applies the variant's target-cpu to its target only.
+
+    RUSTFLAGS outranks target-specific flags in Cargo, so it is dropped rather
+    than letting an ambient value silently replace the CPU level.
+    """
+    architecture, cpu = VARIANTS[variant]
+    environment = {key: value for key, value in base.items() if key not in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}
+    environment[f"CARGO_TARGET_{target_key(TARGETS[architecture])}_RUSTFLAGS"] = f"-C target-cpu={cpu}" if cpu else ""
+    return environment
+
+
+def cargo_for(architecture: str, arguments: list[str], *, variant: str | None = None) -> None:
     environment, linker = msvc_environment(architecture)
+    if variant is not None:
+        environment = variant_environment(variant, environment)
     print(f"MSVC {architecture} linker: {linker}", flush=True)
     run(["cargo", *arguments], env=environment)
 
@@ -194,23 +274,34 @@ def compile_all() -> None:
         cargo_for(architecture, ["check", "--workspace", "--all-targets", "--all-features", "--target", target])
 
 
-def build_target(architecture: str, name: str) -> Path:
+def xwin_clippy_all() -> None:
+    """Cross-lint the Windows targets from Linux with cargo-xwin (no Windows runner)."""
+    for target in TARGETS.values():
+        run(["cargo", "xwin", "clippy", "--workspace", "--all-targets", "--all-features", "--target", target, "--", "-D", "warnings"])
+
+
+def build_target(variant: str, name: str) -> Path:
+    """Release build into a per-variant target dir, so variants never share artifacts."""
+    architecture, _ = VARIANTS[variant]
     target = TARGETS[architecture]
-    cargo_for(architecture, ["build", "--release", "--package", name, "--target", target])
-    executable = ROOT / "target" / target / "release" / f"{name}.exe"
+    target_dir = ROOT / "target" / variant
+    cargo_for(
+        architecture,
+        ["build", "--release", "--package", name, "--target", target, "--target-dir", str(target_dir)],
+        variant=variant,
+    )
+    executable = target_dir / target / "release" / f"{name}.exe"
     if not executable.is_file():
         raise FileNotFoundError(f"expected release executable was not produced: {executable}")
     return executable
 
 
-def release_asset_names(name: str, version: str, mode: str, sha: str) -> list[str]:
-    suffix = f"-dev-{sha[:7].lower()}" if mode == "dev" else ""
-    base = f"{name}-{version}{suffix}-windows-"
-    return [base + "x64-baseline.exe", base + "arm64.exe"]
+def release_asset_names(name: str, tag: str) -> list[str]:
+    return [f"{name}-{tag.removeprefix('v')}-windows-{variant}.exe" for variant in VARIANTS]
 
 
-def expected_assets(mode: str, sha: str, name: str, version: str, output: Path) -> list[Path]:
-    return [*(output / filename for filename in release_asset_names(name, version, mode, sha)), output / "SHA256SUMS.txt"]
+def expected_assets(tag: str, name: str, output: Path) -> list[Path]:
+    return [*(output / filename for filename in release_asset_names(name, tag)), output / "SHA256SUMS.txt"]
 
 
 def write_checksums(assets: list[Path], checksum_path: Path) -> None:
@@ -231,7 +322,7 @@ def verify_assets(assets_dir: Path, expected: list[Path]) -> None:
     expected_lines = [f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}" for path in binaries]
     found_lines = (assets_dir / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
     if found_lines != expected_lines:
-        raise ValueError("release checksum manifest does not match the two executable assets")
+        raise ValueError("release checksum manifest does not match the executable assets")
 
 
 def verify_pe_machine(binary: Path, architecture: str) -> None:
@@ -253,39 +344,60 @@ def smoke_environment() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key.upper() not in ("GH_TOKEN", "GITHUB_TOKEN")}
 
 
-def verify_executables(binaries: list[Path], name: str, version: str) -> None:
-    if len(binaries) != len(TARGETS):
-        raise ValueError("exactly two Windows executables are required")
-    for architecture, binary in zip(TARGETS, binaries, strict=True):
-        verify_pe_machine(binary, architecture)
+def verify_executable(binary: Path, variant: str, name: str, version: str, *, smoke: bool) -> None:
+    architecture, _ = VARIANTS[variant]
+    verify_pe_machine(binary, architecture)
+    if not smoke or architecture != "x64":
+        return  # ARM64 gets PE validation only; the Windows x64 runner cannot execute it.
     if os.name != "nt":
-        raise RuntimeError("packaged x64 version smoke checks require Windows")
+        raise RuntimeError("x64 version smoke checks require Windows")
     # --version returns before elevation or the window start; never open the GUI here.
-    for architecture, binary in zip(TARGETS, binaries, strict=True):
-        if architecture == "arm64":
-            continue  # PE validation only; the Windows x64 runner cannot execute ARM64.
-        result = subprocess.run(
-            [str(binary), "--version"],
-            check=True, capture_output=True, text=True, timeout=30, env=smoke_environment(),
-        )
-        expected = f"{name} {version}"
-        if result.stdout.strip() != expected:
-            raise ValueError(f"unexpected --version from {binary.name}: {result.stdout!r}; expected {expected!r}")
-        print(f"verified {architecture} --version: {result.stdout.strip()}", flush=True)
+    result = subprocess.run(
+        [str(binary), "--version"],
+        check=True, capture_output=True, text=True, timeout=30, env=smoke_environment(),
+    )
+    expected = f"{name} {version}"
+    if result.stdout.strip() != expected:
+        raise ValueError(f"unexpected --version from {binary.name}: {result.stdout!r}; expected {expected!r}")
+    print(f"verified {variant} --version: {result.stdout.strip()}", flush=True)
 
 
-def package(mode: str, sha: str, tag: str | None, output: Path) -> None:
+def verify_executables(binaries: list[Path], name: str, version: str, *, smoke: bool) -> None:
+    if len(binaries) != len(VARIANTS):
+        raise ValueError(f"exactly {len(VARIANTS)} Windows executables are required")
+    for variant, binary in zip(VARIANTS, binaries, strict=True):
+        verify_executable(binary, variant, name, version, smoke=smoke)
+
+
+def resolve_release(mode: str, sha: str | None, supplied_tag: str | None) -> tuple[str, str, str, str]:
+    """(binary name, version, commit, tag) for the checked-out commit."""
+    sha, tag = release_inputs(sha, supplied_tag, git_head())
     name, version = manifest()
-    release_tag = validate_tag(mode, version, sha, tag)
+    committed = commit_time(sha) if mode == "dev" else None
+    return name, version, sha, validate_tag(mode, version, sha, committed, tag)
+
+
+def build(mode: str, variant: str, sha: str | None, tag: str | None, output: Path) -> Path:
+    """Build one variant into the release directory under its final asset name."""
+    name, version, _, release_tag = resolve_release(mode, sha, tag)
     output.mkdir(parents=True, exist_ok=True)
-    assets = expected_assets(mode, sha, name, version, output)
-    binaries = assets[:-1]
-    for architecture, asset in zip(TARGETS, binaries, strict=True):
-        shutil.copy2(build_target(architecture, name), asset)
-    write_checksums(binaries, assets[-1])
-    verify_assets(output, assets)
-    verify_executables(binaries, name, version)
-    print(f"verified release assets for {release_tag}: {', '.join(path.name for path in assets)}")
+    asset = output / release_asset_names(name, release_tag)[list(VARIANTS).index(variant)]
+    shutil.copy2(build_target(variant, name), asset)
+    verify_executable(asset, variant, name, version, smoke=True)
+    return asset
+
+
+def checksums(mode: str, sha: str | None, tag: str | None, assets_dir: Path) -> None:
+    """Check the three executables (after any signing), then write SHA256SUMS.txt."""
+    name, version, _, release_tag = resolve_release(mode, sha, tag)
+    assets = expected_assets(release_tag, name, assets_dir)
+    missing = [path.name for path in assets[:-1] if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"release executables are missing: {missing}")
+    verify_executables(assets[:-1], name, version, smoke=False)
+    write_checksums(assets[:-1], assets[-1])
+    verify_assets(assets_dir, assets)
+    print(f"checksums written for {release_tag}: {', '.join(path.name for path in assets)}")
 
 
 def gh_json(arguments: list[str]) -> dict:
@@ -293,14 +405,15 @@ def gh_json(arguments: list[str]) -> dict:
     return json.loads(result.stdout)
 
 
+def list_releases(repository: str) -> list[dict]:
+    """Every release, drafts included (a tag lookup cannot see drafts)."""
+    result = run(["gh", "api", "--paginate", "--slurp", f"repos/{repository}/releases"], capture=True)
+    return [release for page in json.loads(result.stdout) for release in page]
+
+
 def release_id_for_tag(repository: str, tag: str, *, retries: int = 3) -> str | None:
     for attempt in range(retries + 1):
-        result = run(
-            ["gh", "api", "--paginate", "--slurp", f"repos/{repository}/releases"],
-            capture=True,
-        )
-        pages = json.loads(result.stdout)
-        matches = [release for page in pages for release in page if release.get("tag_name") == tag]
+        matches = [release for release in list_releases(repository) if release.get("tag_name") == tag]
         if len(matches) > 1:
             raise RuntimeError(f"multiple GitHub releases found for tag {tag}")
         if matches:
@@ -456,12 +569,13 @@ def resume_remote_assets(repository: str, tag: str, draft: dict, assets: list[Pa
              "--clobber", "--repo", repository])
 
 
-def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> None:
-    name, version = manifest()
-    tag = validate_tag(mode, version, sha, supplied_tag)
-    assets = expected_assets(mode, sha, name, version, assets_dir)
+def publish(mode: str, sha: str | None, supplied_tag: str | None, assets_dir: Path) -> None:
+    name, version, sha, tag = resolve_release(mode, sha, supplied_tag)
+    assets = expected_assets(tag, name, assets_dir)
     verify_assets(assets_dir, assets)
-    verify_executables(assets[:-1], name, version)
+    # The x64 smoke test ran on Windows in the build job; the Linux publisher
+    # re-checks the PE headers of the (possibly signed) files it uploads.
+    verify_executables(assets[:-1], name, version, smoke=False)
     repository = os.environ.get("GITHUB_REPOSITORY")
     if not repository:
         raise ValueError("GITHUB_REPOSITORY is required to publish")
@@ -499,6 +613,336 @@ def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> 
     print(f"published verified release {tag}")
 
 
+def docs_only(paths: list[str]) -> bool:
+    """True when every changed path is documentation; no change at all counts as code."""
+    return bool(paths) and all(
+        any(fnmatch.fnmatchcase(path, pattern) for pattern in DOCS_ONLY_PATTERNS) for path in paths
+    )
+
+
+def stable_versions(tags: list[str]) -> list[tuple[int, int, int]]:
+    return [
+        (int(parts[0]), int(parts[1]), int(parts[2]))
+        for tag in tags
+        if STABLE_TAG.fullmatch(tag)
+        for parts in [tag[1:].split(".")]
+    ]
+
+
+def check_version_bump(version: str, tags: list[str]) -> None:
+    """The version must be ZeroVer and strictly above every stable tag."""
+    key = require_zerover(version)
+    latest = max(stable_versions(tags), default=None)
+    if latest is not None and key <= latest:
+        raise ValueError(
+            f"version {version} must be greater than the latest stable release "
+            f"v{'.'.join(map(str, latest))}: bump [workspace.package] version in Cargo.toml"
+        )
+
+
+def check_pr_source(head_ref: str, head_repo: str, repository: str) -> None:
+    if head_repo != repository or head_ref != "dev":
+        raise ValueError(f"pull requests into main must come from the dev branch of {repository}, not {head_repo}:{head_ref}")
+
+
+def decide_dev(*, docs: bool, duplicate: bool, fork: bool, released: bool) -> tuple[bool, bool, str]:
+    """(validate, release, reason) for a push to dev or a pull request."""
+    if duplicate:
+        return False, False, "an open pull request from this branch runs the same commit"
+    if docs:
+        return False, False, "documentation-only change"
+    if fork:
+        return True, False, "pull request from a fork gets no pre-release"
+    if released:
+        return True, False, "a release for this commit already exists"
+    return True, True, "new commit"
+
+
+def decide_stable(
+    version: str, sha: str, tag_commit: str | None, release_published: bool, tags: list[str]
+) -> tuple[bool, str]:
+    """(skip, reason); raises when the release would contradict an existing tag or version."""
+    tag = f"v{version}"
+    require_zerover(version)
+    if tag_commit is None:
+        check_version_bump(version, tags)
+        return False, "new version"
+    if tag_commit != sha:
+        raise ValueError(
+            f"tag {tag} already exists at {tag_commit[:7]}, not {sha[:7]}: "
+            "stable tags are immutable; bump the version instead"
+        )
+    return release_published, "already released" if release_published else "resuming an incomplete release"
+
+
+def select_prune(releases: list[dict], keep: int) -> list[dict]:
+    """Dev pre-releases beyond the newest `keep` by creation date; stable releases are never listed."""
+    dev = [
+        release for release in releases
+        if release.get("prerelease") and is_dev_tag(str(release.get("tag_name", "")))
+    ]
+    dev.sort(key=lambda release: (str(release.get("created_at", "")), release.get("id", 0)), reverse=True)
+    return dev[keep:]
+
+
+def prune_dev_releases(repository: str, keep: int) -> None:
+    for release in select_prune(list_releases(repository), keep):
+        tag = release["tag_name"]
+        print(f"pruning dev pre-release {tag}", flush=True)
+        # A concurrent run may already have deleted it; that is the desired end state.
+        for command in (
+            ["gh", "api", "--method", "DELETE", f"repos/{repository}/releases/{release['id']}"],
+            ["gh", "api", "--method", "DELETE", f"repos/{repository}/git/refs/tags/{tag}"],
+        ):
+            try:
+                run(command, capture=True)
+            except subprocess.CalledProcessError as error:
+                print(f"warning: {' '.join(command[4:])} failed: {error.stderr.strip()}", flush=True)
+
+
+def changed_paths(base: str | None, head: str, *, merge_base: bool) -> list[str] | None:
+    """Paths changed since `base`, or None when the base is unknown (treated as code)."""
+    if not base or set(base) == {"0"}:
+        return None
+    try:
+        return git("diff", "--name-only", f"{base}...{head}" if merge_base else f"{base}..{head}").splitlines()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def write_outputs(values: dict[str, str]) -> None:
+    for key, value in values.items():
+        print(f"{key}={value}")
+    destination = os.environ.get("GITHUB_OUTPUT")
+    if destination:
+        with open(destination, "a", encoding="utf-8", newline="\n") as stream:
+            stream.writelines(f"{key}={value}\n" for key, value in values.items())
+
+
+def plan_dev() -> None:
+    """Decide what a push to dev or a pull request runs; inputs come from the environment."""
+    environment = os.environ
+    event = environment["EVENT_NAME"]
+    repository = environment["GITHUB_REPOSITORY"]
+    sha = git_head()
+    name, version = manifest()
+    tag = expected_tag("dev", version, sha, commit_time(sha))
+    paths = changed_paths(environment.get("BASE_SHA"), sha, merge_base=event == "pull_request")
+    fork = event == "pull_request" and environment["HEAD_REPO"] != repository
+    duplicate = False
+    if event == "push":
+        # A push to a branch with an open pull request also triggers that pull
+        # request's run; let the pull request cover the commit.
+        owner = repository.split("/")[0]
+        pulls = json.loads(run(
+            ["gh", "api", "--method", "GET", f"repos/{repository}/pulls",
+             "-f", "state=open", "-f", f"head={owner}:{environment['BRANCH']}"],
+            capture=True,
+        ).stdout)
+        duplicate = bool(pulls)
+    docs = paths is not None and docs_only(paths)
+    released = False
+    if not duplicate and not docs and not fork:
+        released = any(
+            release.get("tag_name") == tag and not release.get("draft") for release in list_releases(repository)
+        )
+    validate, release, reason = decide_dev(docs=docs, duplicate=duplicate, fork=fork, released=released)
+    print(f"{name} {tag}: {reason}")
+    write_outputs({"validate": str(validate).lower(), "release": str(release).lower(), "sha": sha, "tag": tag})
+
+
+def plan_stable() -> None:
+    environment = os.environ
+    repository = environment["GITHUB_REPOSITORY"]
+    sha = git_head()
+    _, version = manifest()
+    tag = f"v{version}"
+    tags = git("tag", "--list", "v*").splitlines()
+    tag_commit = None
+    if tag in tags:
+        tag_commit = git("rev-parse", f"refs/tags/{tag}^{{commit}}")
+    published = tag_commit is not None and any(
+        release.get("tag_name") == tag and not release.get("draft") for release in list_releases(repository)
+    )
+    skip, reason = decide_stable(version, sha, tag_commit, published, tags)
+    print(f"{tag}: {reason}")
+    write_outputs({"skip": str(skip).lower(), "sha": sha, "tag": tag})
+
+
+def check_version() -> None:
+    """Gate for a pull request into main: dev as the source, a ZeroVer bump as the content."""
+    environment = os.environ
+    check_pr_source(environment["HEAD_REF"], environment["HEAD_REPO"], environment["GITHUB_REPOSITORY"])
+    _, version = manifest()
+    check_version_bump(version, git("tag", "--list", "v*").splitlines())
+    print(f"version {version} is a valid ZeroVer bump")
+
+
+def check_variants() -> None:
+    assert list(VARIANTS) == ["x64", "x64-baseline", "arm64"], "x86 and arm64-baseline must stay out"
+    assert {variant: spec.cpu for variant, spec in VARIANTS.items()} == {
+        "x64": "x86-64-v3", "x64-baseline": "x86-64-v2", "arm64": None,
+    }
+    assert all(spec.architecture in TARGETS for spec in VARIANTS.values())
+    ambient = {"PATH": "p", "RUSTFLAGS": "-C target-cpu=native", "CARGO_ENCODED_RUSTFLAGS": "x"}
+    assert variant_environment("x64", ambient) == {
+        "PATH": "p", "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS": "-C target-cpu=x86-64-v3",
+    }, "x64 must get its CPU level on its own target and drop ambient RUSTFLAGS"
+    assert variant_environment("x64-baseline", {})["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS"] == "-C target-cpu=x86-64-v2"
+    assert variant_environment("arm64", {}) == {"CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS": ""}, "arm64 keeps the default CPU"
+
+
+def check_dev_tags() -> None:
+    sha = "50eb54a8d6a7b950bcca5406f250de6d3fac9eda"
+    committed = 1794314702  # 2026-11-10 12:45:02 UTC
+    tag = expected_tag("dev", "0.1.0", sha, committed)
+    assert tag == "v0.1.0-dev.2026-11-10.12-45-02.g50eb54a"
+    assert tag == expected_tag("dev", "0.1.0", sha.upper(), committed), "the same commit must yield the same tag"
+    assert DEV_TAG.fullmatch(tag) and is_dev_tag(tag) and is_dev_tag("v0.0.2-dev-0663029")
+    assert validate_tag("dev", "0.1.0", sha, committed, tag) == tag
+    for invalid in (
+        lambda: validate_tag("dev", "0.1.0", sha, committed, "v0.1.0-dev-50eb54a"),
+        lambda: expected_tag("dev", "0.1.0", sha),
+        lambda: expected_tag("dev", "0.1.0", "50eb5", committed),
+        lambda: expected_tag("dev", "0.1.0+build", sha, committed),
+        lambda: dev_suffix(sha, 10**12),
+    ):
+        try:
+            invalid()
+        except ValueError:
+            continue
+        raise AssertionError("an invalid dev tag input was accepted")
+    assert not any(is_dev_tag(stable) for stable in ("v0.1.0", "v0.1.0-rc.1", "v0.1.0-dev", "v0.1.0-dev.x"))
+
+    def precedence(tag: str) -> tuple:
+        """SemVer 2.0 precedence: numeric identifiers below alphanumeric ones, ASCII order."""
+        core, _, prerelease = tag.removeprefix("v").partition("-")
+        numbers = tuple(int(part) for part in core.split("."))
+        if not prerelease:
+            return numbers, (1,)
+        identifiers = tuple((0, int(part), "") if part.isdigit() else (1, 0, part) for part in prerelease.split("."))
+        return numbers, (0, identifiers)
+
+    times = [
+        datetime(2025, 12, 31, 23, 59, 59), datetime(2026, 1, 1, 0, 0, 0), datetime(2026, 1, 1, 0, 0, 1),
+        datetime(2026, 2, 28, 23, 59, 59), datetime(2026, 9, 9, 9, 9, 9), datetime(2026, 9, 30, 23, 0, 0),
+        datetime(2026, 10, 1, 0, 0, 0), datetime(2026, 11, 9, 23, 59, 59), datetime(2026, 11, 10, 9, 5, 7),
+        datetime(2026, 11, 10, 10, 0, 0), datetime(2026, 11, 10, 12, 45, 2), datetime(2027, 1, 2, 3, 4, 5),
+    ]
+    epochs = [int(moment.replace(tzinfo=timezone.utc).timestamp()) for moment in times]
+    # Hash prefixes run opposite to time, so only the date and time can explain the order.
+    tags = [
+        expected_tag("dev", "0.1.0", f"{255 - index:02x}" * 4, epoch) for index, epoch in enumerate(epochs)
+    ]
+    assert all(DEV_TAG.fullmatch(tag) for tag in tags)
+    shuffled = sorted(tags, key=lambda tag: tag[::-1])
+    assert sorted(shuffled, key=precedence) == tags, "semver precedence order must equal chronological order"
+    assert sorted(tags) == tags, "plain ASCII order must be chronological too"
+    # Releases of a version order between its dev builds and the next version.
+    ordered = [*tags[:3], "v0.1.0", "v0.1.1-dev.2026-01-01.00-00-00.gaaaaaaa", "v0.1.1", "v0.2.0"]
+    assert sorted(reversed(ordered), key=precedence) == ordered
+    assert precedence("v0.1.0-dev.2026-11-10.12-45-02.gabcdef0") < precedence("v0.1.0-dev.2026-11-10.12-45-02.gabcdef1")
+    assert sorted([*tags, "v0.1.0-dev-abcdef0"], key=precedence)  # legacy tags still sort without error
+
+
+def check_zerover() -> None:
+    assert require_zerover("0.1.0") == (0, 1, 0)
+    for invalid in ("1.0.0", "0.1", "0.01.0", "0.1.0-rc.1", "0.1.0+build", "00.1.0"):
+        try:
+            require_zerover(invalid)
+        except ValueError:
+            continue
+        raise AssertionError(f"non-ZeroVer version accepted: {invalid}")
+    tags = ["v0.0.1", "v0.1.0-dev-abcdef0", "v0.1.0-dev.2026-11-10.12-45-02.g50eb54a", "untagged-8297", "v0.0.10", "v1.0.0-rc.1"]
+    assert stable_versions(tags) == [(0, 0, 1), (0, 0, 10)]
+    check_version_bump("0.0.11", tags)
+    check_version_bump("0.1.0", [])
+    for version in ("0.0.10", "0.0.9", "0.0.1", "1.0.0", "0.0.11-rc.1"):
+        try:
+            check_version_bump(version, tags)
+        except ValueError:
+            continue
+        raise AssertionError(f"version without a valid bump accepted: {version}")
+    check_pr_source("dev", "owner/repo", "owner/repo")
+    for head_ref, head_repo in (("feature", "owner/repo"), ("dev", "fork/repo"), ("main", "owner/repo")):
+        try:
+            check_pr_source(head_ref, head_repo, "owner/repo")
+        except ValueError:
+            continue
+        raise AssertionError(f"pull request into main from {head_repo}:{head_ref} accepted")
+
+
+def check_plans() -> None:
+    assert docs_only(["README.md"]) and docs_only(["docs/a/b.png", "LICENSE", "crates/x/NOTES.md"])
+    assert not docs_only([]), "an unknown or empty diff must run the full validation"
+    assert not docs_only(["README.md", "crates/chkdsk/src/main.rs"])
+    assert not docs_only([".github/workflows/dev.yml"]) and not docs_only(["scripts/release.py"])
+    assert not docs_only(["Cargo.toml"]) and not docs_only(["LICENSE.txt"])
+    assert changed_paths(None, "HEAD", merge_base=True) is None
+    assert changed_paths("0" * 40, "HEAD", merge_base=False) is None
+    assert decide_dev(docs=False, duplicate=False, fork=False, released=False) == (True, True, "new commit")
+    assert decide_dev(docs=False, duplicate=False, fork=False, released=True)[:2] == (True, False), "a released commit is built once"
+    assert decide_dev(docs=False, duplicate=False, fork=True, released=False)[:2] == (True, False), "forks get no pre-release"
+    assert decide_dev(docs=True, duplicate=False, fork=False, released=False)[:2] == (False, False)
+    assert decide_dev(docs=False, duplicate=True, fork=False, released=False)[:2] == (False, False)
+    sha, other = "a" * 40, "b" * 40
+    tags = ["v0.0.1", "v0.1.0"]
+    assert decide_stable("0.2.0", sha, None, False, tags)[0] is False
+    assert decide_stable("0.1.0", sha, sha, True, tags)[0] is True, "a published release is not repeated"
+    assert decide_stable("0.1.0", sha, sha, False, tags)[0] is False, "an incomplete release resumes"
+    for version, tag_commit in (("0.1.0", other), ("0.0.5", None), ("1.0.0", None), ("0.1.0", None)):
+        try:
+            decide_stable(version, sha, tag_commit, False, tags)
+        except ValueError:
+            continue
+        raise AssertionError(f"stable release of {version} (tag at {tag_commit}) was not refused")
+
+
+def check_prune() -> None:
+    def release(tag: str, created: str, number: int, *, prerelease: bool = True) -> dict:
+        return {"id": number, "tag_name": tag, "created_at": created, "prerelease": prerelease, "draft": False}
+
+    dev = [
+        release(f"v0.1.0-dev.2026-11-{day:02d}.10-00-00.g{day:07x}", f"2026-11-{day:02d}T10:00:00Z", day)
+        for day in range(1, 13)
+    ]
+    legacy = [release("v0.0.1-dev-14c9d73", "2026-10-05T10:00:00Z", 100), release("v0.1.0-dev-449e7e2", "2026-10-06T10:00:00Z", 101)]
+    stable = [release("v0.0.1", "2026-10-01T00:00:00Z", 200, prerelease=False), release("v0.2.0", "2020-01-01T00:00:00Z", 201, prerelease=False)]
+    lookalike = release("v0.3.0-dev-abcdef0", "2019-01-01T00:00:00Z", 202, prerelease=False)
+    other = release("untagged-8297a20833e1b75c0756", "2019-01-01T00:00:00Z", 203)
+    everything = [*stable, lookalike, other, *reversed(dev), *legacy]
+    pruned = select_prune(everything, KEEP_DEV_RELEASES)
+    assert [item["id"] for item in pruned] == [2, 1, 101, 100], "the oldest dev pre-releases go, legacy ones included"
+    assert not {200, 201, 202, 203} & {item["id"] for item in pruned}, "stable and unrelated releases are never pruned"
+    assert select_prune(everything, 0)[0]["id"] == 12 and len(select_prune(everything, 0)) == 14
+    assert select_prune(everything, 14) == [] and select_prune([], 10) == []
+    same_time = [release("v0.1.0-dev-1111111", "2026-10-01T00:00:00Z", 1), release("v0.1.0-dev-2222222", "2026-10-01T00:00:00Z", 2)]
+    assert [item["id"] for item in select_prune(same_time, 1)] == [1], "equal creation dates fall back to the newer id"
+
+    global run
+    original_run = run
+    commands: list[list[str]] = []
+
+    def fake_run(command, *, env=None, capture=False):
+        commands.append(command)
+        if command[:3] == ["gh", "api", "--paginate"]:
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps([everything[:20], everything[20:]]), stderr="")
+        if command[-1].endswith("/git/refs/tags/v0.1.0-dev.2026-11-02.10-00-00.g0000002"):
+            raise subprocess.CalledProcessError(422, command, stderr="Reference does not exist")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    try:
+        run = fake_run
+        prune_dev_releases("owner/repo", KEEP_DEV_RELEASES)
+    finally:
+        run = original_run
+    deletions = [command[-1] for command in commands[1:]]
+    assert len(deletions) == 8 and deletions[:2] == [
+        "repos/owner/repo/releases/2", "repos/owner/repo/git/refs/tags/v0.1.0-dev.2026-11-02.10-00-00.g0000002",
+    ]
+    assert all("/releases/20" not in path for path in deletions)
+
+
 def self_check() -> None:
     with tempfile.TemporaryDirectory() as directory:
         fixture = Path(directory)
@@ -526,27 +970,34 @@ def self_check() -> None:
     }
     assert len(set(TARGETS.values())) == len(TARGETS)
     sha = "abcdef0123456789"
-    assert expected_tag("dev", "1.2.3", sha) == "v1.2.3-dev-abcdef0"
-    assert expected_tag("dev", "1.2.3-rc.2", sha) == "v1.2.3-rc.2-dev-abcdef0"
-    assert expected_tag("stable", "1.2.3", sha) == "v1.2.3"
-    environment = {"GITHUB_SHA": sha, "GITHUB_REF_NAME": "v1.2.3"}
-    assert release_inputs("stable", None, None, environment) == (sha, "v1.2.3")
-    assert release_inputs("dev", None, None, {**environment, "GITHUB_REF_NAME": "main"}) == (sha, None)
-    assert release_inputs("stable", "1234567", "v9.9.9", environment) == ("1234567", "v9.9.9")
+    committed = 1778417102  # 2026-05-10 12:45:02 UTC
+    assert expected_tag("dev", "0.2.3", sha, committed) == "v0.2.3-dev.2026-05-10.12-45-02.gabcdef0"
+    assert expected_tag("stable", "0.2.3", sha) == "v0.2.3"
+    assert release_inputs(None, None, sha, {}) == (sha, None)
+    assert release_inputs(sha[:7].upper() + sha[7:], "v0.2.3", sha, {"RELEASE_SHA": "x"}) == (sha, "v0.2.3")
+    assert release_inputs(None, None, sha, {"RELEASE_SHA": sha, "RELEASE_TAG": "v0.2.3"}) == (sha, "v0.2.3")
     try:
-        release_inputs("dev", None, None, {})
+        release_inputs("1234567", None, sha, {})
     except ValueError:
         pass
     else:
-        raise AssertionError("a missing commit SHA was accepted")
-    assert release_asset_names("chkdsk", "1.2.3", "dev", sha) == [
-        "chkdsk-1.2.3-dev-abcdef0-windows-x64-baseline.exe",
-        "chkdsk-1.2.3-dev-abcdef0-windows-arm64.exe",
+        raise AssertionError("a release commit other than the checked-out HEAD was accepted")
+    assert release_asset_names("chkdsk", "v0.2.3-dev.2026-05-10.12-45-02.gabcdef0") == [
+        "chkdsk-0.2.3-dev.2026-05-10.12-45-02.gabcdef0-windows-x64.exe",
+        "chkdsk-0.2.3-dev.2026-05-10.12-45-02.gabcdef0-windows-x64-baseline.exe",
+        "chkdsk-0.2.3-dev.2026-05-10.12-45-02.gabcdef0-windows-arm64.exe",
     ]
-    assert release_asset_names("chkdsk", "1.2.3", "stable", sha) == [
-        "chkdsk-1.2.3-windows-x64-baseline.exe",
-        "chkdsk-1.2.3-windows-arm64.exe",
+    assert release_asset_names("chkdsk", "v0.2.3") == [
+        "chkdsk-0.2.3-windows-x64.exe",
+        "chkdsk-0.2.3-windows-x64-baseline.exe",
+        "chkdsk-0.2.3-windows-arm64.exe",
     ]
+    assert [path.name for path in expected_assets("v0.2.3", "chkdsk", Path("out"))][-1] == "SHA256SUMS.txt"
+    check_variants()
+    check_dev_tags()
+    check_zerover()
+    check_plans()
+    check_prune()
     for invalid in ("01.2.3", "1.2", "1.2.3-01"):
         try:
             version_parts(invalid)
@@ -554,13 +1005,7 @@ def self_check() -> None:
             continue
         raise AssertionError(f"invalid SemVer accepted: {invalid}")
     try:
-        expected_tag("stable", "1.2.3-rc.1", sha)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("stable mode accepted a prerelease Cargo version")
-    try:
-        validate_tag("stable", "1.2.3", sha, "v1.2.4")
+        validate_tag("stable", "0.2.3", sha, None, "v0.2.4")
     except ValueError:
         pass
     else:
@@ -593,7 +1038,7 @@ def self_check() -> None:
                 raise AssertionError("invalid PE header was accepted")
 
     with tempfile.TemporaryDirectory() as directory:
-        binaries = [Path(directory) / f"test-{architecture}.exe" for architecture in TARGETS]
+        binaries = [Path(directory) / f"test-{variant}.exe" for variant in VARIANTS]
         original_name, original_subprocess_run = os.name, subprocess.run
         calls = []
         original_verify_pe_machine = globals()["verify_pe_machine"]
@@ -610,15 +1055,24 @@ def self_check() -> None:
 
             subprocess.run = smoke_run
             with mock.patch.dict(os.environ, {"GH_TOKEN": "secret", "GITHUB_TOKEN": "secret", "KEEP": "1"}):
-                verify_executables(binaries, "chkdsk", "1.2.3")
+                verify_executables(binaries, "chkdsk", "1.2.3", smoke=True)
                 assert smoke_environment().get("KEEP") == "1"
-            assert calls == [[str(binaries[0]), "--version"]]
+            assert calls == [[str(binaries[0]), "--version"], [str(binaries[1]), "--version"]], "both x64 variants are smoke-tested, ARM64 is not"
+            calls.clear()
+            verify_executables(binaries, "chkdsk", "1.2.3", smoke=False)
+            assert not calls, "a publisher without Windows must not execute the binaries"
             try:
-                verify_executables(binaries, "chkdsk", "9.9.9")
+                verify_executables(binaries, "chkdsk", "9.9.9", smoke=True)
             except ValueError:
                 pass
             else:
                 raise AssertionError("incorrect executable version was accepted")
+            try:
+                verify_executables(binaries[:2], "chkdsk", "1.2.3", smoke=False)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("an incomplete executable set was accepted")
         finally:
             os.name = original_name
             subprocess.run = original_subprocess_run
@@ -866,30 +1320,35 @@ def self_check() -> None:
             pass
         else:
             raise AssertionError("published release with a rewritten tag was accepted")
-        print("release self-check passed: lookup recovery, draft identity/prerelease repair, asset content, and publication verification")
+        print("release self-check passed: dev tags and ordering, ZeroVer bump, planning, pruning, variants, lookup recovery, draft repair, asset content, and publication verification")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("self-check", help="check release names, assets, and target/linker mapping")
+    subparsers.add_parser("self-check", help="check release naming, planning, pruning and target/linker mapping")
     subparsers.add_parser("linker-check", help="verify architecture-specific MSVC environments and linkers")
-    clippy = subparsers.add_parser("clippy", help="lint all targets and features for every MSVC target")
-    tests = subparsers.add_parser("tests", help="run the x64 Windows test suite")
-    compile_parser = subparsers.add_parser("compile", help="compile all Cargo targets for every MSVC target")
-    build = subparsers.add_parser("build", help="build one architecture's optimized executable")
-    package_parser = subparsers.add_parser("package", help="build and package the complete Windows release asset set")
+    subparsers.add_parser("clippy", help="lint all targets and features for every MSVC target")
+    subparsers.add_parser("xwin-clippy", help="lint every Windows target from Linux with cargo-xwin")
+    subparsers.add_parser("tests", help="run the x64 Windows test suite")
+    subparsers.add_parser("compile", help="compile all Cargo targets for every MSVC target")
+    subparsers.add_parser("plan-dev", help="decide what a push to dev or a pull request validates and releases")
+    subparsers.add_parser("plan-stable", help="decide whether a push to main releases, and refuse conflicting tags")
+    subparsers.add_parser("check-version", help="verify a pull request into main comes from dev with a ZeroVer bump")
+    prune_parser = subparsers.add_parser("prune", help="delete dev pre-releases and tags beyond the newest N")
+    build_parser = subparsers.add_parser("build", help="build one variant's optimized executable as a release asset")
+    checksums_parser = subparsers.add_parser("checksums", help="verify the three executables and write SHA256SUMS.txt")
     publish_parser = subparsers.add_parser("publish", help="create draft, verify assets, then publish")
     cargo = subparsers.add_parser("cargo", help="run one Cargo command in an architecture-specific MSVC environment")
 
-    build.add_argument("--architecture", choices=TARGETS, required=True)
-    package_parser.add_argument("--mode", choices=("dev", "stable"), required=True)
-    package_parser.add_argument("--sha", help="commit SHA; defaults to GITHUB_SHA")
-    package_parser.add_argument("--tag", help="stable tag; defaults to GITHUB_REF_NAME")
-    package_parser.add_argument("--output", type=Path, default=Path("dist/release"))
-    publish_parser.add_argument("--mode", choices=("dev", "stable"), required=True)
-    publish_parser.add_argument("--sha", help="commit SHA; defaults to GITHUB_SHA")
-    publish_parser.add_argument("--tag", help="stable tag; defaults to GITHUB_REF_NAME")
+    prune_parser.add_argument("--keep", type=int, default=KEEP_DEV_RELEASES)
+    build_parser.add_argument("--variant", choices=VARIANTS, required=True)
+    build_parser.add_argument("--output", type=Path, default=Path("dist/release"))
+    for command in (build_parser, checksums_parser, publish_parser):
+        command.add_argument("--mode", choices=("dev", "stable"), required=True)
+        command.add_argument("--sha", help="release commit; defaults to RELEASE_SHA, else the checked-out HEAD")
+        command.add_argument("--tag", help="expected tag; defaults to RELEASE_TAG, else it is derived")
+    checksums_parser.add_argument("--assets-dir", type=Path, default=Path("dist/release"))
     publish_parser.add_argument("--assets-dir", type=Path, default=Path("dist/release"))
     cargo.add_argument("--architecture", choices=TARGETS, required=True)
     cargo.add_argument("arguments", nargs=argparse.REMAINDER)
@@ -902,20 +1361,26 @@ def main() -> int:
             check_linkers()
         elif args.command == "clippy":
             clippy_all()
+        elif args.command == "xwin-clippy":
+            xwin_clippy_all()
         elif args.command == "tests":
             cargo_for("x64", ["test", "--workspace", "--all-targets", "--all-features", "--target", TARGETS["x64"]])
         elif args.command == "compile":
             compile_all()
+        elif args.command == "plan-dev":
+            plan_dev()
+        elif args.command == "plan-stable":
+            plan_stable()
+        elif args.command == "check-version":
+            check_version()
+        elif args.command == "prune":
+            prune_dev_releases(os.environ["GITHUB_REPOSITORY"], args.keep)
         elif args.command == "build":
-            name, _ = manifest()
-            output = build_target(args.architecture, name)
-            print(f"built {output}")
-        elif args.command == "package":
-            sha, tag = release_inputs(args.mode, args.sha, args.tag)
-            package(args.mode, sha, tag, (ROOT / args.output).resolve())
+            print(f"built {build(args.mode, args.variant, args.sha, args.tag, ROOT / args.output)}")
+        elif args.command == "checksums":
+            checksums(args.mode, args.sha, args.tag, (ROOT / args.assets_dir).resolve())
         elif args.command == "publish":
-            sha, tag = release_inputs(args.mode, args.sha, args.tag)
-            publish(args.mode, sha, tag, (ROOT / args.assets_dir).resolve())
+            publish(args.mode, args.sha, args.tag, (ROOT / args.assets_dir).resolve())
         else:
             arguments = args.arguments
             if arguments[:1] == ["--"]:
