@@ -1,0 +1,70 @@
+{
+  "id": "assignment-0mwald51l-m8xv",
+  "intentId": "intent-0mwald4wp-vtaa",
+  "intentRevision": 1,
+  "roleTask": "Worker.implementation",
+  "slug": "port-the-valuable-non-tui-changes-of-the",
+  "objective": "Port the valuable non-TUI changes of the author's two open PRs onto the current rune-based chkdsk, so the backend/health improvements they carry are not lost when the PRs are closed.",
+  "state": "Running",
+  "scope": [
+    "Worktree /home/user/chkdsk-port, branch port-smart-fixes from origin/main 50eb54a (chkdsk 0.1.0, rune window UI from PR #5: src/ui.rs, src/ui/tests.rs, src/present.rs, src/collector.rs, src/fixtures.rs, src/main.rs; backend in src/backend.rs, src/health.rs, src/history.rs, src/model.rs, src/parse.rs)",
+    "Source PR #2: branch origin/release-0.0.2 (head 969e6ec), 20 commits from merge-base eb1d698: ATA SMART support (new src/ata.rs), UAC elevation (new src/elevation.rs), health.rs scoring changes (SATA health, conservative ATA endurance, evidence boundaries, ambiguous ATA rows rejected), model.rs, parse.rs, backend.rs fixes (ATA threshold requests, legacy SMART error handling, malformed threshold retry), Crucial MX500 wear recognition, release.py exact-commit release gating, validation.yml and mise.toml changes, README",
+    "Source PR #3: branch origin/codex/checkpoint/chkdsk-redesign-20261008 (head 0b7dd71) stacked on #2; non-UI additions: e1cb966 'Infer NVMe kind from successful health telemetry', 374f95b 'Exclude checkpoint branches from automatic development releases'",
+    "Inspect with git -C /home/user/chkdsk-port log/show/diff eb1d698..origin/release-0.0.2 and origin/release-0.0.2..origin/codex/checkpoint/chkdsk-redesign-20261008; read each commit message to understand intent"
+  ],
+  "constraints": [
+    "Port: ata.rs, elevation.rs, and the backend/health/model/parse/history changes, NVMe kind inference, the release.py and CI/mise hardening, the dev.yml checkpoint-branch exclusion, and README content about scoring/telemetry/elevation that stays true. Use the PR versions as the source of truth for these modules, then adapt to the current tree",
+    "Do not port: anything about the r3bl_tui terminal UI (themes, TokyoNight/Mocha, layout, tabs, notifications rendering, ui/presentation.rs, ui/redesign_tests.rs, render proofs). Do not reintroduce r3bl_tui, tokio or the i686/x86 target (dropped by user decision), and keep the version at 0.1.0",
+    "Elevation: the app is now a GUI (windows_subsystem = windows, rune window). Adapt the UAC relaunch so it works with the GUI subsystem (no console assumptions), relaunches only when needed as the PR intended, and never loops; keep it cfg(windows) with a non-Windows no-op so the crate still builds and tests on Linux",
+    "Surface new model data in the rune UI only where the current present.rs/ui.rs design has a natural place (e.g. ATA-derived wear/lifetime rows, new status texts in pt_BR); keep the existing visual style, sentence-case copy, recovery hints, and contrast; update the fixtures/scenes if the model changes. If the UI changes visibly, re-render the affected captures with /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/capture.sh into /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/captures-port/ and inspect them",
+    "Keep every existing test passing; bring over the PRs' tests for the ported modules (ata, elevation, health, parse, backend, model) and adapt them; tests that only cover TUI rendering stay out",
+    "Gates in the worktree: cargo fmt --check; cargo test; cargo test --all-features; cargo clippy --all-targets --all-features -- -D warnings; cargo xwin clippy --all-targets --all-features -- -D warnings for x86_64-pc-windows-msvc and aarch64-pc-windows-msvc; python3 scripts/release.py self-check",
+    "Make no git writes (no commits, branches, checkouts); the root commits",
+    "Report in under 600 words: per source commit or area, ported / adapted / skipped with the reason; changed paths; gate commands with exit codes and test counts; anything you judged risky; put the full diff at /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/port.diff and logs in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/logs/"
+  ],
+  "criteria": [
+    {
+      "text": "ata.rs, elevation.rs and the backend/health/model/parse fixes from PR #2 plus NVMe inference from PR #3 are ported and wired into the current app, or each skipped piece has a stated reason",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "No TUI code, r3bl_tui, tokio or i686 target reintroduced; version stays 0.1.0; elevation works under the GUI subsystem without relaunch loops",
+      "blocking": true,
+      "dimension": "scope"
+    },
+    {
+      "text": "Ported modules carry their tests; all gates listed pass with exit codes and counts",
+      "blocking": true,
+      "dimension": "tests"
+    },
+    {
+      "text": "Report lists every source commit or area as ported, adapted or skipped with reason",
+      "blocking": true,
+      "dimension": "behavior"
+    }
+  ],
+  "evidence": [
+    "checks-run",
+    "changed-paths",
+    "diff-file",
+    "port-map"
+  ],
+  "ownershipPaths": [
+    "src",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "mise.toml",
+    "scripts",
+    ".github"
+  ],
+  "dependencies": [],
+  "independentFrom": [],
+  "specialist": {
+    "model": "sonnet",
+    "effort": "high",
+    "startedAt": "2026-11-10T11:13:11.626Z"
+  },
+  "createdAt": "2026-11-10T11:13:11.626Z"
+}
