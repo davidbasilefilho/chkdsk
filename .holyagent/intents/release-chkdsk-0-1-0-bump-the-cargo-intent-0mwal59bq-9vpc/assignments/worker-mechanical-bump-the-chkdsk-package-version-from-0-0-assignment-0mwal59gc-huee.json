@@ -1,0 +1,48 @@
+{
+  "id": "assignment-0mwal59gc-huee",
+  "intentId": "intent-0mwal59bq-9vpc",
+  "intentRevision": 1,
+  "roleTask": "Worker.mechanical",
+  "slug": "bump-the-chkdsk-package-version-from-0-0",
+  "objective": "Bump the chkdsk package version from 0.0.1 to 0.1.0 so tag v0.1.0 passes the stable release validation.",
+  "state": "Running",
+  "scope": [
+    "Worktree /home/user/chkdsk-release (branch release-0.1.0 from origin/main): Cargo.toml [package] version, Cargo.lock entry for package chkdsk; grep README.md, mise.toml, scripts/release.py, .github for any other hard-coded 0.0.1 that is the app version (test fixtures like 1.2.3 stay)"
+  ],
+  "constraints": [
+    "Change only the chkdsk version to 0.1.0; no dependency changes: after editing Cargo.toml run cargo metadata --offline --format-version 1 >/dev/null (or cargo update -p chkdsk --offline) and confirm git diff Cargo.lock touches only the chkdsk version line",
+    "Run python3 scripts/release.py self-check and confirm expected stable tag: python3 -c 'import sys;sys.path.insert(0,\"scripts\");import release;print(release.validate_tag(\"stable\",release.manifest()[1],\"0\"*40,\"v0.1.0\"))' prints v0.1.0",
+    "Run cargo fmt --check and cargo test --offline (reuse the default target dir)",
+    "Make no git writes",
+    "Report in under 150 words: files changed, commands with exit codes"
+  ],
+  "criteria": [
+    {
+      "text": "Cargo.toml and Cargo.lock show version 0.1.0 for chkdsk and nothing else changed in Cargo.lock",
+      "blocking": true,
+      "dimension": "scope"
+    },
+    {
+      "text": "release.py self-check passes and stable tag validation for v0.1.0 succeeds; cargo test passes",
+      "blocking": true,
+      "dimension": "tests"
+    }
+  ],
+  "evidence": [
+    "changed-paths",
+    "checks-run"
+  ],
+  "ownershipPaths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md"
+  ],
+  "dependencies": [],
+  "independentFrom": [],
+  "specialist": {
+    "model": "haiku",
+    "effort": "medium",
+    "startedAt": "2026-11-10T11:07:04.092Z"
+  },
+  "createdAt": "2026-11-10T11:07:04.092Z"
+}
