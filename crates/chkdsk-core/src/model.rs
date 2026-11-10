@@ -17,6 +17,16 @@ pub struct DiskIdentity {
     pub kind: DiskKind,
 }
 
+impl DiskIdentity {
+    /// Whether the disk sits behind a USB bridge. The bus label is a free-form
+    /// string, so it is compared without regard to case.
+    pub fn is_usb(&self) -> bool {
+        self.bus
+            .as_deref()
+            .is_some_and(|bus| bus.eq_ignore_ascii_case("USB"))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiskKind {
@@ -118,6 +128,10 @@ pub struct Telemetry {
     /// Manufacturer/model profile used to decode or interpret ATA attributes.
     #[serde(default)]
     pub ata_profile: Option<String>,
+    /// Vendor-independent ATA counters, decoded once for a drive with no model
+    /// profile; `None` for a profiled drive or before an ATA reading.
+    #[serde(default)]
+    pub generic_ata: Option<crate::ata::GenericAta>,
     pub power_on_hours: Option<u64>,
     pub temperature_c: Option<i16>,
     /// SMART/NVMe device-reported overall failure state.
@@ -167,8 +181,9 @@ impl Telemetry {
             .or_else(|| hdd_profile.map(|profile| profile.family.to_owned()));
         // A model match decodes its own layouts; a drive with none gets the
         // vendor-independent smartmontools DEFAULT layouts instead.
-        let generic = (profile.is_none() && hdd_profile.is_none())
+        self.generic_ata = (profile.is_none() && hdd_profile.is_none())
             .then(|| crate::ata::generic_decode(&health));
+        let generic = self.generic_ata;
         self.power_on_hours = self
             .power_on_hours
             .or_else(|| crate::ata::hdd_power_on_hours(model, &health))
@@ -437,6 +452,41 @@ mod tests {
             bus: None,
             kind: DiskKind::Unknown,
         }
+    }
+
+    #[test]
+    fn usb_bus_is_recognized_without_regard_to_case() {
+        let on_bus = |bus: Option<&str>| DiskIdentity {
+            bus: bus.map(str::to_owned),
+            ..unknown_disk(None)
+        };
+        for usb in ["USB", "usb", "Usb"] {
+            assert!(on_bus(Some(usb)).is_usb(), "{usb}");
+        }
+        for other in [Some("SATA"), Some("NVMe"), Some("USB3"), Some(""), None] {
+            assert!(!on_bus(other).is_usb(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn unprofiled_ata_decodes_its_generic_counters_once_and_a_profiled_one_has_none() {
+        let health = AtaHealth {
+            attributes: vec![AtaAttribute {
+                id: 12,
+                flags: 0,
+                current: 100,
+                worst: 100,
+                threshold: None,
+                raw: [0x32, 0x08, 0, 0, 0, 0],
+            }],
+            thresholds_available: false,
+        };
+        let mut generic = Telemetry::default();
+        generic.apply_ata(health.clone(), Some("MACROVIP MV240GB"));
+        assert_eq!(generic.generic_ata.unwrap().power_cycles, Some(0x832));
+        let mut profiled = Telemetry::default();
+        profiled.apply_ata(health, Some("WDC WD10EZEX-00WN4A0"));
+        assert_eq!(profiled.generic_ata, None);
     }
 
     #[test]

@@ -3,6 +3,8 @@
 //! Raw values remain opaque unless a standard HDD signal is applicable or an
 //! exact vendor/model profile is supported by authoritative documentation.
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModelProfile {
     pub family: &'static str,
@@ -195,7 +197,7 @@ pub(crate) fn scored_counter(
             if raw[2..].iter().any(|byte| *byte != 0) {
                 return None;
             }
-            u64::from(u16::from_le_bytes([raw[0], raw[1]]))
+            raw_u16(raw)
         }
         _ => raw_u48(raw),
     };
@@ -210,7 +212,7 @@ pub(crate) fn scored_counter(
 /// ignored), 5 and 196 raw16, 194/190 the low byte only (min/max bytes follow
 /// it), everything else raw48. SSD life attributes (169, 173, 177, 202, 231,
 /// 232, 233, 0xA4-0xA8) are vendor-defined and deliberately not decoded here.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenericAta {
     pub power_on_hours: Option<u64>,
     pub power_cycles: Option<u64>,
@@ -227,7 +229,7 @@ pub struct GenericAta {
 pub fn generic_decode(health: &crate::model::AtaHealth) -> GenericAta {
     let raw = |id| unique_attribute(health, id).map(|attribute| attribute.raw);
     let raw48 = |id| raw(id).map(raw_u48);
-    let raw16 = |id| raw(id).map(|raw| u64::from(u16::from_le_bytes([raw[0], raw[1]])));
+    let raw16 = |id| raw(id).map(raw_u16);
     // 194 wins over 190 (airflow); an implausible byte is not a temperature.
     let temperature = |id| {
         raw(id)
@@ -397,6 +399,11 @@ pub(crate) fn raw_attribute_name_pt_br(model: Option<&str>, id: u8) -> Option<&'
         return profile(model).map(|profile| profile.lifetime_used_label_pt_br);
     }
     attribute_name_pt_br(model, id)
+}
+
+/// The low word of a raw field: the primary count of a `raw16(raw16)` layout.
+pub(crate) fn raw_u16(raw: [u8; 6]) -> u64 {
+    u64::from(u16::from_le_bytes([raw[0], raw[1]]))
 }
 
 pub(crate) fn raw_u48(raw: [u8; 6]) -> u64 {

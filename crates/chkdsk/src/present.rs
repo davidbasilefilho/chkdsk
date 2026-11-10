@@ -4,7 +4,6 @@
 
 use crate::collector::{DISCOVERY_INTERVAL, DiskSnapshot, Reading, Ready};
 use chkdsk_core::{
-    ata::generic_decode,
     health::{HealthOutcome, HealthScore, score_health},
     model::{
         AtaAttribute, AtaHealth, DiskIdentity, DiskKind, HealthWarningReason, QueryState, Telemetry,
@@ -98,7 +97,7 @@ impl Card {
             Reading::Ready(ready) => ready.telemetry.effective_kind(identity),
             Reading::Pending | Reading::Failed(_) => identity.kind,
         };
-        let usb = is_usb(identity);
+        let usb = identity.is_usb();
         let kind_label = match kind {
             DiskKind::Hdd => "HD",
             DiskKind::Ssd => "SSD",
@@ -152,7 +151,8 @@ impl Card {
 impl Health {
     fn new(identity: &DiskIdentity, ready: &Ready, now: u64) -> Self {
         let telemetry = &ready.telemetry;
-        let health = score_health(telemetry.effective_kind(identity), telemetry);
+        let kind = telemetry.effective_kind(identity);
+        let health = score_health(kind, telemetry);
         // Soft signals keep a passing disk from reading as plainly healthy, and
         // a score with no wear source behind it is not called healthy at all.
         let (label, tone) = match health.outcome {
@@ -167,7 +167,7 @@ impl Health {
         };
         let score = (health.outcome != HealthOutcome::Unknown).then(|| health.score.to_string());
         // A USB bridge that forwards nothing leaves identity and capacity only.
-        let bridge_blocks_smart = is_usb(identity)
+        let bridge_blocks_smart = identity.is_usb()
             && health.outcome == HealthOutcome::Unknown
             && !any_permission_failure(telemetry)
             && !matches!(&telemetry.nvme, QueryState::Success(_))
@@ -209,7 +209,7 @@ impl Health {
                 .map(|timestamp| format!("há {}", format_duration(now.saturating_sub(timestamp))))
                 .unwrap_or_else(|| "indisponível".into()),
             warnings: warning_lines(&health, telemetry),
-            advice: advice(&health, tone),
+            advice: advice(&health, tone, kind),
             details: details(telemetry),
             attributes: match &telemetry.ata {
                 QueryState::Success(ata) => ata.attributes.iter().map(attribute_row).collect(),
@@ -219,24 +219,14 @@ impl Health {
     }
 }
 
-fn is_usb(identity: &DiskIdentity) -> bool {
-    identity
-        .bus
-        .as_deref()
-        .is_some_and(|bus| bus.eq_ignore_ascii_case("USB"))
-}
-
 /// Counts every ATA drive without a model profile reports the same way
 /// (smartmontools' default layouts). A profiled drive's raw fields are decoded
 /// by its profile, so they stay out of this list.
 fn details(telemetry: &Telemetry) -> Vec<Detail> {
-    let QueryState::Success(ata) = &telemetry.ata else {
+    // Set by `apply_ata` only for a drive with no model profile.
+    let (QueryState::Success(_), Some(generic)) = (&telemetry.ata, telemetry.generic_ata) else {
         return Vec::new();
     };
-    if telemetry.ata_profile.is_some() {
-        return Vec::new();
-    }
-    let generic = generic_decode(ata);
     [
         ("Ciclos de energia", generic.power_cycles),
         ("Setores realocados", generic.reallocated_sectors),
@@ -264,7 +254,7 @@ fn details(telemetry: &Telemetry) -> Vec<Detail> {
 
 /// What to do next: back up on a verdict of Atenção, check the cable when that
 /// is the only cause, and where to find the wear when the disk does not say.
-fn advice(health: &HealthScore, tone: Tone) -> Option<&'static str> {
+fn advice(health: &HealthScore, tone: Tone, kind: DiskKind) -> Option<&'static str> {
     match tone {
         Tone::Attention
             if health.outcome == HealthOutcome::Pass
@@ -273,6 +263,7 @@ fn advice(health: &HealthScore, tone: Tone) -> Option<&'static str> {
             Some(CABLE_ADVICE)
         }
         Tone::Attention => Some(BACKUP_ADVICE),
+        Tone::Unknown if health.limited && kind == DiskKind::Ssd => Some(LIMITED_SSD_ADVICE),
         Tone::Unknown if health.limited => Some(LIMITED_ADVICE),
         Tone::Healthy | Tone::Unknown => None,
     }
@@ -281,8 +272,11 @@ fn advice(health: &HealthScore, tone: Tone) -> Option<&'static str> {
 const BACKUP_ADVICE: &str = "Faça backup dos dados importantes.";
 const CABLE_ADVICE: &str =
     "Troque o cabo de dados ou a porta e confira se o número de erros continua subindo.";
-const LIMITED_ADVICE: &str =
+const LIMITED_SSD_ADVICE: &str =
     "Use o programa do fabricante do SSD para ver o desgaste, que este disco não informa.";
+/// A drive of unknown kind may not be an SSD, so the advice names no media.
+const LIMITED_ADVICE: &str =
+    "Use o programa do fabricante do disco para ver o desgaste, que este disco não informa.";
 
 /// Failures the device declared, then the softer signals behind the score.
 fn warning_lines(health: &HealthScore, telemetry: &Telemetry) -> Vec<String> {
@@ -499,7 +493,7 @@ const USB_SMART_UNAVAILABLE: &str = "SMART indisponível por este adaptador USB"
 /// A USB bridge that does not forward SMART leaves only the identity: say so
 /// and what to try, instead of calling the disk incompatible.
 pub fn query_error_message_for(identity: &DiskIdentity, state: QueryErrorState) -> String {
-    if state == QueryErrorState::Unsupported && is_usb(identity) {
+    if state == QueryErrorState::Unsupported && identity.is_usb() {
         format!(
             "{USB_SMART_UNAVAILABLE}. O disco foi encontrado, mas o adaptador não repassa os dados de saúde. Para ver o SMART, conecte-o direto à porta SATA ou NVMe."
         )
@@ -1230,7 +1224,7 @@ mod tests {
             health.status,
             "Avaliação limitada: o disco não informa desgaste"
         );
-        assert_eq!(health.advice, Some(LIMITED_ADVICE));
+        assert_eq!(health.advice, Some(LIMITED_SSD_ADVICE));
         assert!(health.warnings.is_empty());
         let detail = |label: &str| {
             health
@@ -1246,6 +1240,20 @@ mod tests {
             None,
             "absent rows are not invented"
         );
+    }
+
+    #[test]
+    fn limited_advice_names_ssd_only_for_an_ssd() {
+        let rows = || vec![row(0x05, 0), row(0x09, 0x423C), row(0x0C, 0x832)];
+        let ssd = health_of(unprofiled(rows()), DiskKind::Ssd);
+        assert_eq!(ssd.advice, Some(LIMITED_SSD_ADVICE));
+        assert!(LIMITED_SSD_ADVICE.contains("SSD"));
+
+        // An unclassified drive (a bridge hides the media) gets neutral advice.
+        let unknown = health_of(unprofiled(rows()), DiskKind::Unknown);
+        assert_eq!(unknown.label, "Limitada");
+        assert_eq!(unknown.advice, Some(LIMITED_ADVICE));
+        assert!(!LIMITED_ADVICE.contains("SSD"));
     }
 
     #[test]

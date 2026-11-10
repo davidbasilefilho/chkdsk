@@ -987,6 +987,18 @@ mod windows {
         fallback::parse_temperature_descriptor(&bytes)
     }
 
+    /// Whether the bridge refused the command (CHECK CONDITION, or the driver
+    /// calling the request unsupported), so another CDB form may be accepted. A
+    /// timeout or other I/O failure is not a refusal: the bridge is slow or
+    /// gone, and a second attempt would only repeat the wait.
+    fn sat_rejected(error: &AtaCommandError) -> bool {
+        match error {
+            AtaCommandError::Device { .. } => true,
+            AtaCommandError::Io(code) => classify(*code) == QueryErrorState::Unsupported,
+            _ => false,
+        }
+    }
+
     /// One SCSI pass-through exchange. The CDB is the 16-byte ATA PASS-THROUGH
     /// first and the 12-byte form when the bridge rejects it, since many USB
     /// bridges implement only one of them.
@@ -1004,16 +1016,16 @@ mod windows {
         let attempt = |cdb: &[u8]| -> Result<fallback::SatReply, AtaCommandError> {
             let mut request = fallback::SatRequest::new(cdb, transfer, data_len)
                 .ok_or(AtaCommandError::Io(87))?;
-            let input_length = request.buffer.len();
+            let input_length = request.bytes().len();
             let returned = ioctl_inout(
                 device,
                 IOCTL_SCSI_PASS_THROUGH,
-                &mut request.buffer,
+                request.bytes_mut(),
                 input_length,
             )
             .map_err(AtaCommandError::Io)?;
             request
-                .finish(&request.buffer, returned)
+                .finish(request.bytes(), returned)
                 .map_err(|error| match error {
                     fallback::SatError::ShortResponse => AtaCommandError::ShortResponse,
                     fallback::SatError::ScsiStatus(status) => {
@@ -1021,8 +1033,13 @@ mod windows {
                     }
                 })
         };
-        attempt(&fallback::sat_cdb16(regs, transfer))
-            .or_else(|_| attempt(&fallback::sat_cdb12(regs, transfer)))
+        attempt(&fallback::sat_cdb16(regs, transfer)).or_else(|error| {
+            if sat_rejected(&error) {
+                attempt(&fallback::sat_cdb12(regs, transfer))
+            } else {
+                Err(error)
+            }
+        })
     }
 
     fn sat_sector_validated(
@@ -1073,7 +1090,7 @@ mod windows {
                 }
             }
         }
-        let usb = identity.bus.as_deref() == Some("USB");
+        let usb = identity.is_usb();
         match ata_health(&device, usb) {
             Ok(health) => telemetry.apply_ata(health, identity.model.as_deref()),
             Err(code) => {
@@ -1183,6 +1200,23 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn sat_retries_the_other_cdb_only_when_the_bridge_refused_the_first() {
+            assert!(sat_rejected(&AtaCommandError::Device {
+                status: 2,
+                error: 0
+            }));
+            // ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION.
+            for code in [87, 50, 1] {
+                assert!(sat_rejected(&AtaCommandError::Io(code)), "{code}");
+            }
+            // ERROR_SEM_TIMEOUT, ERROR_TIMEOUT, ERROR_GEN_FAILURE, access denied.
+            for code in [121, 1460, 31, 5] {
+                assert!(!sat_rejected(&AtaCommandError::Io(code)), "{code}");
+            }
+            assert!(!sat_rejected(&AtaCommandError::ShortResponse));
+        }
 
         #[test]
         fn smart_data_and_return_status_task_file_fixtures_are_distinct() {

@@ -160,12 +160,23 @@ const SAT_TIMEOUT_SECONDS: u32 = 5;
 /// the 8-byte descriptor-format header.
 pub(crate) const SAT_SENSE_LEN: usize = 32;
 /// Adapters may require an aligned data buffer; 64 covers every common mask.
-const SAT_DATA_ALIGNMENT: usize = 64;
+/// The storage is a vector of blocks of this alignment, so the start of the
+/// buffer and every multiple of it is aligned in memory, not just in offset.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Block([u8; 64]);
+
+const SAT_DATA_ALIGNMENT: usize = align_of::<Block>();
+const _: () = {
+    assert!(size_of::<Block>() == SAT_DATA_ALIGNMENT);
+    assert!(align_of::<ScsiPassThrough>() <= SAT_DATA_ALIGNMENT);
+};
 
 /// One SCSI pass-through request: the header, a sense area and the data
-/// buffer in a single buffer, as IOCTL_SCSI_PASS_THROUGH wants it.
+/// buffer in a single zeroed buffer, as IOCTL_SCSI_PASS_THROUGH wants it.
 pub(crate) struct SatRequest {
-    pub buffer: Vec<u8>,
+    storage: Vec<Block>,
+    len: usize,
     sense_offset: usize,
     data_offset: usize,
     data_len: usize,
@@ -196,37 +207,52 @@ impl SatRequest {
         let data_offset = (sense_offset + SAT_SENSE_LEN).next_multiple_of(SAT_DATA_ALIGNMENT);
         let total = data_offset.checked_add(data_len)?;
         u32::try_from(total).ok()?;
+        let length = u16::try_from(header).ok()?;
+        let transfer_length = u32::try_from(data_len).ok()?;
+        let sense_info_offset = u32::try_from(sense_offset).ok()?;
         let mut request_cdb = [0u8; 16];
         request_cdb[..cdb.len()].copy_from_slice(cdb);
-        let pass = ScsiPassThrough {
-            length: u16::try_from(header).ok()?,
-            scsi_status: 0,
-            path_id: 0,
-            target_id: 0,
-            lun: 0,
-            cdb_length: cdb.len() as u8,
-            sense_info_length: SAT_SENSE_LEN as u8,
-            data_in: match transfer {
+        let mut storage = vec![Block([0; SAT_DATA_ALIGNMENT]); total.div_ceil(SAT_DATA_ALIGNMENT)];
+        let pass = storage.as_mut_ptr().cast::<ScsiPassThrough>();
+        // The only ABI cast is to the repr(C) header at the start of the buffer,
+        // which is aligned for it. The fields are written one by one so the
+        // padding stays zero; the zero ones (status, path, target, lun) are
+        // already set.
+        unsafe {
+            (&raw mut (*pass).length).write(length);
+            (&raw mut (*pass).cdb_length).write(cdb.len() as u8);
+            (&raw mut (*pass).sense_info_length).write(SAT_SENSE_LEN as u8);
+            (&raw mut (*pass).data_in).write(match transfer {
                 SatTransfer::DataIn => SCSI_IOCTL_DATA_IN,
                 SatTransfer::NoData => SCSI_IOCTL_DATA_UNSPECIFIED,
-            },
-            data_transfer_length: u32::try_from(data_len).ok()?,
-            timeout_value: SAT_TIMEOUT_SECONDS,
-            data_buffer_offset: if data_len == 0 { 0 } else { data_offset },
-            sense_info_offset: u32::try_from(sense_offset).ok()?,
-            cdb: request_cdb,
-        };
-        let mut buffer = vec![0u8; total];
-        // The only ABI cast is to the repr(C) header at the start of the buffer.
-        unsafe {
-            std::ptr::write_unaligned(buffer.as_mut_ptr().cast::<ScsiPassThrough>(), pass);
+            });
+            (&raw mut (*pass).data_transfer_length).write(transfer_length);
+            (&raw mut (*pass).timeout_value).write(SAT_TIMEOUT_SECONDS);
+            (&raw mut (*pass).data_buffer_offset).write(if data_len == 0 {
+                0
+            } else {
+                data_offset
+            });
+            (&raw mut (*pass).sense_info_offset).write(sense_info_offset);
+            (&raw mut (*pass).cdb).write(request_cdb);
         }
         Some(Self {
-            buffer,
+            storage,
+            len: total,
             sense_offset,
             data_offset,
             data_len,
         })
+    }
+
+    /// The request bytes, `total` long.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // `Block` is plain bytes without padding and `len` fits the storage.
+        unsafe { std::slice::from_raw_parts(self.storage.as_ptr().cast::<u8>(), self.len) }
+    }
+
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.storage.as_mut_ptr().cast::<u8>(), self.len) }
     }
 
     /// Check the buffer the driver filled in. A data-in command must succeed and
@@ -234,7 +260,7 @@ impl SatRequest {
     /// is how SAT returns the ATA registers, so its sense data is handed back.
     pub(crate) fn finish(&self, filled: &[u8], returned: usize) -> Result<SatReply, SatError> {
         let header = size_of::<ScsiPassThrough>();
-        if returned < header || filled.len() < self.buffer.len() || returned > filled.len() {
+        if returned < header || filled.len() < self.len || returned > filled.len() {
             return Err(SatError::ShortResponse);
         }
         let pass = unsafe { std::ptr::read_unaligned(filled.as_ptr().cast::<ScsiPassThrough>()) };
@@ -262,12 +288,27 @@ impl SatRequest {
     }
 }
 
-/// SMART RETURN STATUS from descriptor-format sense data: the output registers
-/// sit in the ATA status return descriptor (code 09h). LBA mid/high of 4Fh/C2h
-/// is "no threshold exceeded", F4h/2Ch is "threshold exceeded"; anything else
-/// is not an answer.
+const SENSE_KEY_NO_SENSE: u8 = 0x00;
+const SENSE_KEY_RECOVERED_ERROR: u8 = 0x01;
+/// ASC/ASCQ 00h/1Dh: ATA PASS THROUGH INFORMATION AVAILABLE.
+const ASC_ATA_PASS_THROUGH_INFORMATION: (u8, u8) = (0x00, 0x1d);
+const SAT_ATA_STATUS_RETURN_DESCRIPTOR: u8 = 0x09;
+const ATA_STATUS_ERROR: u8 = 0x01;
+
+/// SMART RETURN STATUS from descriptor-format sense data. The output registers
+/// are an answer only when the sense says ATA PASS THROUGH INFORMATION
+/// AVAILABLE (key NO SENSE or RECOVERED ERROR) and the ATA status return
+/// descriptor (code 09h) reports no ERR: any other sense is a real failure
+/// whose registers mean nothing. LBA mid/high of 4Fh/C2h is "no threshold
+/// exceeded", F4h/2Ch is "threshold exceeded"; anything else is not an answer.
 pub(crate) fn parse_sat_return_status(sense: &[u8]) -> Option<bool> {
-    if !matches!(sense.first()? & 0x7f, 0x72 | 0x73) {
+    if !matches!(sense.first()? & 0x7f, 0x72 | 0x73)
+        || !matches!(
+            sense.get(1)? & 0x0f,
+            SENSE_KEY_NO_SENSE | SENSE_KEY_RECOVERED_ERROR
+        )
+        || (*sense.get(2)?, *sense.get(3)?) != ASC_ATA_PASS_THROUGH_INFORMATION
+    {
         return None;
     }
     let declared = usize::from(*sense.get(7)?);
@@ -280,7 +321,10 @@ pub(crate) fn parse_sat_return_status(sense: &[u8]) -> Option<bool> {
         if next > end {
             return None;
         }
-        if code == 0x09 && length >= 0x0c {
+        if code == SAT_ATA_STATUS_RETURN_DESCRIPTOR && length >= 0x0c {
+            if sense[offset + 13] & ATA_STATUS_ERROR != 0 {
+                return None;
+            }
             return match (sense[offset + 9], sense[offset + 11]) {
                 (0x4f, 0xc2) => Some(false),
                 (0xf4, 0x2c) => Some(true),
@@ -422,7 +466,7 @@ mod tests {
     }
 
     fn filled(request: &SatRequest, status: u8, transferred: u32) -> Vec<u8> {
-        let mut bytes = request.buffer.clone();
+        let mut bytes = request.bytes().to_vec();
         bytes[2] = status;
         bytes[12..16].copy_from_slice(&transferred.to_le_bytes());
         bytes
@@ -436,9 +480,9 @@ mod tests {
         assert_eq!(request.sense_offset, header);
         assert_eq!(request.data_offset % SAT_DATA_ALIGNMENT, 0);
         assert!(request.data_offset >= header + SAT_SENSE_LEN);
-        assert_eq!(request.buffer.len(), request.data_offset + 512);
+        assert_eq!(request.bytes().len(), request.data_offset + 512);
         let pass =
-            unsafe { std::ptr::read_unaligned(request.buffer.as_ptr().cast::<ScsiPassThrough>()) };
+            unsafe { std::ptr::read_unaligned(request.bytes().as_ptr().cast::<ScsiPassThrough>()) };
         assert_eq!(usize::from(pass.length), header);
         assert_eq!(pass.cdb_length, 16);
         assert_eq!(pass.data_in, SCSI_IOCTL_DATA_IN);
@@ -455,7 +499,7 @@ mod tests {
         )
         .unwrap();
         let pass =
-            unsafe { std::ptr::read_unaligned(short.buffer.as_ptr().cast::<ScsiPassThrough>()) };
+            unsafe { std::ptr::read_unaligned(short.bytes().as_ptr().cast::<ScsiPassThrough>()) };
         assert_eq!(pass.cdb_length, 12);
         assert_eq!(&pass.cdb[12..], &[0; 4]);
 
@@ -465,10 +509,35 @@ mod tests {
     }
 
     #[test]
+    fn sat_request_memory_is_aligned_and_header_padding_is_zero() {
+        let cdb = sat_cdb16(SMART_READ_DATA, SatTransfer::DataIn);
+        for data_len in [0, 1, 512, 4096] {
+            let transfer = if data_len == 0 {
+                SatTransfer::NoData
+            } else {
+                SatTransfer::DataIn
+            };
+            let request = SatRequest::new(&cdb, transfer, data_len).unwrap();
+            let start = request.bytes().as_ptr() as usize;
+            assert_eq!(start % SAT_DATA_ALIGNMENT, 0, "{data_len}");
+            assert_eq!((start + request.data_offset) % SAT_DATA_ALIGNMENT, 0);
+            assert_eq!(request.bytes().len(), request.data_offset + data_len);
+            // Padding after `data_in` and before `data_transfer_length`.
+            assert_eq!(&request.bytes()[9..12], &[0; 3]);
+            // Sense and data areas start zeroed.
+            assert!(
+                request.bytes()[size_of::<ScsiPassThrough>() + 8..]
+                    .iter()
+                    .all(|byte| *byte == 0)
+            );
+        }
+    }
+
+    #[test]
     fn sat_response_requires_good_status_and_the_whole_sector() {
         let cdb = sat_cdb16(SMART_READ_DATA, SatTransfer::DataIn);
         let request = SatRequest::new(&cdb, SatTransfer::DataIn, 512).unwrap();
-        let total = request.buffer.len();
+        let total = request.bytes().len();
 
         let mut ok = filled(&request, SCSI_STATUS_GOOD, 512);
         ok[request.data_offset..].fill(0x5a);
@@ -507,7 +576,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let total = request.buffer.len();
+        let total = request.bytes().len();
         let reply = request
             .finish(&filled(&request, SCSI_STATUS_CHECK_CONDITION, 0), total)
             .unwrap();
@@ -527,6 +596,7 @@ mod tests {
         let mut sense = vec![0u8; SAT_SENSE_LEN];
         sense[0] = 0x72;
         sense[1] = 0x01; // Recovered error: ATA PASS THROUGH INFORMATION AVAILABLE.
+        sense[3] = 0x1d;
         sense[7] = 14;
         sense[8] = 0x09;
         sense[9] = 0x0c;
@@ -564,6 +634,7 @@ mod tests {
         // Another descriptor can come first; a truncated one stops the scan.
         let mut other_first = vec![0u8; SAT_SENSE_LEN];
         other_first[0] = 0x72;
+        other_first[3] = 0x1d;
         other_first[7] = 4 + 14;
         other_first[8] = 0x02;
         other_first[9] = 2;
@@ -572,6 +643,26 @@ mod tests {
         other_first[21] = 0x4f;
         other_first[23] = 0xc2;
         assert_eq!(parse_sat_return_status(&other_first), Some(false));
+        // Only ATA PASS THROUGH INFORMATION AVAILABLE says the registers are
+        // an answer: key NO SENSE works too, other keys, ASC or ASCQ do not.
+        let mut no_sense = sense_with_ata_descriptor(0x4f, 0xc2);
+        no_sense[1] = 0x00;
+        assert_eq!(parse_sat_return_status(&no_sense), Some(false));
+        for (index, value) in [(1, 0x05), (1, 0x03), (2, 0x20), (3, 0x00), (3, 0x1c)] {
+            let mut other = sense_with_ata_descriptor(0x4f, 0xc2);
+            other[index] = value;
+            assert_eq!(parse_sat_return_status(&other), None, "{index}: {value:#x}");
+        }
+        // A failed ATA command (ERR set in the descriptor's status) is no answer
+        // even with the signature in the registers; other status bits are fine.
+        let mut failed = sense_with_ata_descriptor(0x4f, 0xc2);
+        failed[21] = 0x51;
+        assert_eq!(parse_sat_return_status(&failed), None);
+        let mut busy = sense_with_ata_descriptor(0xf4, 0x2c);
+        busy[21] = 0xd0;
+        assert_eq!(parse_sat_return_status(&busy), Some(true));
+        // Sense cut before the ASC/ASCQ bytes.
+        assert_eq!(parse_sat_return_status(&[0x72, 0x01, 0x00]), None);
         let mut cut = sense_with_ata_descriptor(0x4f, 0xc2);
         cut.truncate(15);
         assert_eq!(parse_sat_return_status(&cut), None);
