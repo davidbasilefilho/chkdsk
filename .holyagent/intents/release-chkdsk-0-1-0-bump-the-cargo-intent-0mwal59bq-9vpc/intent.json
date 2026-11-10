@@ -1,0 +1,12 @@
+{
+  "id": "intent-0mwal59bq-9vpc",
+  "slug": "release-chkdsk-0-1-0-bump-the-cargo",
+  "objective": "Release chkdsk 0.1.0: bump the Cargo version to 0.1.0 on main and push tag v0.1.0, which triggers the stable release workflow.",
+  "requirements": [
+    "User words: \"bump to 0.1.0 and create tag\"",
+    "Tag format per scripts/release.py stable mode: v{Cargo version} on the commit that carries that version"
+  ],
+  "revision": 1,
+  "state": "Open",
+  "createdAt": "2026-11-10T11:07:03.927Z"
+}
