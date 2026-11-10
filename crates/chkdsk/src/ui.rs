@@ -463,6 +463,27 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
             BODY,
         ));
 
+    // Counters the drive reports in the same way as every other drive.
+    let facts = health
+        .details
+        .iter()
+        .enumerate()
+        .fold(facts, |facts, (index, detail)| {
+            facts.child(
+                row()
+                    .key(format!("detalhe-{index}"))
+                    .gap(16.0)
+                    .child(
+                        text(detail.label)
+                            .font(BODY)
+                            .color(t.text_secondary)
+                            .w(144.0)
+                            .wrap(),
+                    )
+                    .child(text(detail.value.clone()).font(BODY).color(t.text).wrap()),
+            )
+        });
+
     let status = text(health.status).key("situacao").wrap().mt(24.0);
     let status = match health.status_tone {
         Some(Tone::Attention) => status.font(BODY_STRONG).color(palette.attention),

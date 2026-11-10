@@ -4,6 +4,8 @@
 //! device buffers are owned byte vectors and decoded with checked offsets.
 
 // The Win32 half below uses most of these; other platforms only get the stubs.
+#[cfg(windows)]
+use crate::fallback;
 #[cfg_attr(not(windows), allow(unused_imports))]
 use chkdsk_core::{
     model::{DiskIdentity, DiskKind, QueryState, Telemetry},
@@ -126,10 +128,12 @@ mod windows {
     const IOCTL_DISK_GET_LENGTH_INFO: u32 = ctl_code(0x07, 0x0017, 0, 1);
     const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = ctl_code(0x2d, 0x0420, 0, 0);
     const IOCTL_ATA_PASS_THROUGH: u32 = ctl_code(0x04, 0x040b, 0, 3);
+    const IOCTL_SCSI_PASS_THROUGH: u32 = ctl_code(0x04, 0x0401, 0, 3);
     const IOCTL_SMART_RCV_DRIVE_DATA: u32 = ctl_code(0x07, 0x0022, 0, 3);
     const IOCTL_STORAGE_PREDICT_FAILURE: u32 = ctl_code(0x2d, 0x0440, 0, 1);
     const STORAGE_DEVICE_PROPERTY: u32 = 0;
     const STORAGE_DEVICE_SEEK_PENALTY_PROPERTY: u32 = 7;
+    const STORAGE_DEVICE_TEMPERATURE_PROPERTY: u32 = 12;
     const STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY: u32 = 49;
     const STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY: u32 = 50;
     const PROPERTY_STANDARD_QUERY: u32 = 0;
@@ -144,6 +148,9 @@ mod windows {
     const ATA_SMART_READ_DATA: u8 = 0xd0;
     const ATA_SMART_READ_THRESHOLDS: u8 = 0xd1;
     const ATA_SMART_RETURN_STATUS: u8 = 0xda;
+    const BUS_TYPE_USB: u32 = 7;
+    /// STORAGE_TEMPERATURE_DATA_DESCRIPTOR header plus a few sensors.
+    const TEMPERATURE_OUTPUT_LEN: usize = 24 + 16 * 8;
 
     const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
         (device_type << 16) | (access << 14) | (function << 2) | method
@@ -379,7 +386,7 @@ mod windows {
         match bus {
             1 => "SCSI",
             3 => "ATA",
-            7 => "USB",
+            BUS_TYPE_USB => "USB",
             8 => "RAID",
             9 => "iSCSI",
             11 => "SATA",
@@ -900,7 +907,10 @@ mod windows {
             .map_err(|error| AtaCommandError::InvalidSmartThresholds(error.to_string()))
     }
 
-    fn ata_health(device: &Device) -> Result<chkdsk_core::model::AtaHealth, AtaCommandError> {
+    fn ata_health(
+        device: &Device,
+        sat_fallback: bool,
+    ) -> Result<chkdsk_core::model::AtaHealth, AtaCommandError> {
         let sector = ata_data_sector_validated(
             || {
                 ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_DATA, true)
@@ -908,18 +918,42 @@ mod windows {
             },
             || legacy_smart_sector(device, ATA_SMART_READ_DATA),
             validate_ata_smart_data_sector,
-        )?;
+        );
+        // A USB bridge usually rejects both Windows ATA paths but may translate
+        // SCSI/ATA (SAT) commands. The earlier error stays the reported one.
+        let (sector, via_sat) = match sector {
+            Ok(sector) => (sector, false),
+            Err(error) if sat_fallback => (
+                sat_sector_validated(device, ATA_SMART_READ_DATA, validate_ata_smart_data_sector)
+                    .map_err(|_| error)?,
+                true,
+            ),
+            Err(error) => return Err(error),
+        };
         let mut health = parse::parse_ata_smart_data(&sector)
             .map_err(|error| AtaCommandError::InvalidSmartData(error.to_string()))?;
 
-        let _ = read_ata_smart_thresholds_with(
-            &mut health,
-            || {
-                ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_THRESHOLDS, true)
-                    .map(|(sector, _)| sector)
-            },
-            || legacy_smart_sector(device, ATA_SMART_READ_THRESHOLDS),
-        ); // Optional failure must not invalidate a checksummed READ DATA sector.
+        // Optional failure must not invalidate a checksummed READ DATA sector.
+        let _ = if via_sat {
+            sat_sector_validated(
+                device,
+                ATA_SMART_READ_THRESHOLDS,
+                validate_ata_smart_thresholds_sector,
+            )
+            .and_then(|sector| {
+                parse::apply_ata_smart_thresholds(&mut health, &sector)
+                    .map_err(|error| AtaCommandError::InvalidSmartThresholds(error.to_string()))
+            })
+        } else {
+            read_ata_smart_thresholds_with(
+                &mut health,
+                || {
+                    ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_THRESHOLDS, true)
+                        .map(|(sector, _)| sector)
+                },
+                || legacy_smart_sector(device, ATA_SMART_READ_THRESHOLDS),
+            )
+        };
         Ok(health)
     }
 
@@ -935,12 +969,97 @@ mod windows {
     fn legacy_failure_status(device: &Device) -> Result<bool, u32> {
         let mut buffer = [0u8; 516];
         let returned = ioctl(device, IOCTL_STORAGE_PREDICT_FAILURE, &[], &mut buffer)?;
-        if returned < 4 {
-            return Err(13);
-        }
         // VendorSpecific is opaque IOCTL_STORAGE_PREDICT_FAILURE data, not
         // guaranteed to be an ATA SMART sector. Preserve only its coarse flag.
-        Ok(get_u32(&buffer, 0).ok_or(13u32)? != 0)
+        fallback::parse_predict_failure(&buffer, returned).ok_or(13)
+    }
+
+    /// StorageDeviceTemperatureProperty, for drives with no ATA or NVMe
+    /// temperature. An unreported (zero) or implausible value is not a reading.
+    fn storage_temperature(device: &Device) -> Option<i16> {
+        let bytes = query_storage_property(
+            device,
+            STORAGE_DEVICE_TEMPERATURE_PROPERTY,
+            &[0; 1],
+            TEMPERATURE_OUTPUT_LEN,
+        )
+        .ok()?;
+        fallback::parse_temperature_descriptor(&bytes)
+    }
+
+    /// Whether the bridge refused the command (CHECK CONDITION, or the driver
+    /// calling the request unsupported), so another CDB form may be accepted. A
+    /// timeout or other I/O failure is not a refusal: the bridge is slow or
+    /// gone, and a second attempt would only repeat the wait.
+    fn sat_rejected(error: &AtaCommandError) -> bool {
+        match error {
+            AtaCommandError::Device { .. } => true,
+            AtaCommandError::Io(code) => classify(*code) == QueryErrorState::Unsupported,
+            _ => false,
+        }
+    }
+
+    /// One SCSI pass-through exchange. The CDB is the 16-byte ATA PASS-THROUGH
+    /// first and the 12-byte form when the bridge rejects it, since many USB
+    /// bridges implement only one of them.
+    fn sat_exchange(
+        device: &Device,
+        feature: u8,
+        transfer: fallback::SatTransfer,
+    ) -> Result<fallback::SatReply, AtaCommandError> {
+        let regs = fallback::smart_registers(feature);
+        let data_len = if transfer == fallback::SatTransfer::DataIn {
+            512
+        } else {
+            0
+        };
+        let attempt = |cdb: &[u8]| -> Result<fallback::SatReply, AtaCommandError> {
+            let mut request = fallback::SatRequest::new(cdb, transfer, data_len)
+                .ok_or(AtaCommandError::Io(87))?;
+            let input_length = request.bytes().len();
+            let returned = ioctl_inout(
+                device,
+                IOCTL_SCSI_PASS_THROUGH,
+                request.bytes_mut(),
+                input_length,
+            )
+            .map_err(AtaCommandError::Io)?;
+            request
+                .finish(request.bytes(), returned)
+                .map_err(|error| match error {
+                    fallback::SatError::ShortResponse => AtaCommandError::ShortResponse,
+                    fallback::SatError::ScsiStatus(status) => {
+                        AtaCommandError::Device { status, error: 0 }
+                    }
+                })
+        };
+        attempt(&fallback::sat_cdb16(regs, transfer)).or_else(|error| {
+            if sat_rejected(&error) {
+                attempt(&fallback::sat_cdb12(regs, transfer))
+            } else {
+                Err(error)
+            }
+        })
+    }
+
+    fn sat_sector_validated(
+        device: &Device,
+        feature: u8,
+        validate: impl Fn(&[u8]) -> Result<(), AtaCommandError>,
+    ) -> Result<Vec<u8>, AtaCommandError> {
+        let sector = sat_exchange(device, feature, fallback::SatTransfer::DataIn)?.data;
+        validate(&sector)?;
+        Ok(sector)
+    }
+
+    /// SMART RETURN STATUS through SAT: the answer is in the returned registers.
+    fn sat_failure_status(device: &Device) -> Result<bool, AtaCommandError> {
+        let reply = sat_exchange(
+            device,
+            ATA_SMART_RETURN_STATUS,
+            fallback::SatTransfer::NoData,
+        )?;
+        fallback::parse_sat_return_status(&reply.sense).ok_or(AtaCommandError::ShortResponse)
     }
 
     pub fn query(identity: &DiskIdentity) -> Result<Telemetry, QueryError> {
@@ -971,7 +1090,8 @@ mod windows {
                 }
             }
         }
-        match ata_health(&device) {
+        let usb = identity.is_usb();
+        match ata_health(&device, usb) {
             Ok(health) => telemetry.apply_ata(health, identity.model.as_deref()),
             Err(code) => {
                 let state = classify(code.code());
@@ -988,7 +1108,14 @@ mod windows {
 
         match ata_failure_status(&device) {
             Ok(failed) => telemetry.overall_failure = QueryState::Success(failed),
-            Err(ata_error) => match legacy_failure_status(&device) {
+            Err(ata_error) => match legacy_failure_status(&device).or_else(|legacy_error| {
+                // Last resort for a USB bridge: SMART RETURN STATUS through SAT.
+                if usb {
+                    sat_failure_status(&device).map_err(|_| legacy_error)
+                } else {
+                    Err(legacy_error)
+                }
+            }) {
                 Ok(failed) => {
                     telemetry.overall_failure = QueryState::Success(failed);
                 }
@@ -1010,16 +1137,25 @@ mod windows {
             },
         }
 
-        let has_any = !matches!(
-            &telemetry.nvme,
-            QueryState::NotQueried | QueryState::Unsupported | QueryState::Failed { .. }
-        ) || !matches!(
-            &telemetry.ata,
-            QueryState::NotQueried | QueryState::Unsupported | QueryState::Failed { .. }
-        ) || !matches!(
-            &telemetry.overall_failure,
-            QueryState::NotQueried | QueryState::Unsupported | QueryState::Failed { .. }
-        );
+        // The Windows temperature property fills in only what SMART and the
+        // NVMe log left out.
+        if telemetry.temperature_c.is_none() {
+            telemetry.temperature_c = storage_temperature(&device);
+        }
+
+        let has_any = telemetry.temperature_c.is_some()
+            || !matches!(
+                &telemetry.nvme,
+                QueryState::NotQueried | QueryState::Unsupported | QueryState::Failed { .. }
+            )
+            || !matches!(
+                &telemetry.ata,
+                QueryState::NotQueried | QueryState::Unsupported | QueryState::Failed { .. }
+            )
+            || !matches!(
+                &telemetry.overall_failure,
+                QueryState::NotQueried | QueryState::Unsupported | QueryState::Failed { .. }
+            );
         if !has_any {
             // Query completed but every supported transport probe failed; retain
             // the per-probe states while making the aggregate partiality visible.
@@ -1064,6 +1200,23 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn sat_retries_the_other_cdb_only_when_the_bridge_refused_the_first() {
+            assert!(sat_rejected(&AtaCommandError::Device {
+                status: 2,
+                error: 0
+            }));
+            // ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION.
+            for code in [87, 50, 1] {
+                assert!(sat_rejected(&AtaCommandError::Io(code)), "{code}");
+            }
+            // ERROR_SEM_TIMEOUT, ERROR_TIMEOUT, ERROR_GEN_FAILURE, access denied.
+            for code in [121, 1460, 31, 5] {
+                assert!(!sat_rejected(&AtaCommandError::Io(code)), "{code}");
+            }
+            assert!(!sat_rejected(&AtaCommandError::ShortResponse));
+        }
 
         #[test]
         fn smart_data_and_return_status_task_file_fixtures_are_distinct() {
@@ -1234,6 +1387,14 @@ mod windows {
             assert!(message.contains("duplicate ATA SMART threshold ID"));
             assert_eq!(read_data, original_read_data);
             assert!(!read_data.thresholds_available);
+        }
+
+        #[test]
+        fn scsi_pass_through_ioctl_matches_the_documented_code() {
+            assert_eq!(IOCTL_SCSI_PASS_THROUGH, 0x0004_d004);
+            assert_eq!(STORAGE_DEVICE_TEMPERATURE_PROPERTY, 12);
+            let input = storage_property_input(STORAGE_DEVICE_TEMPERATURE_PROPERTY, &[0]).unwrap();
+            assert_query_header(&input, STORAGE_DEVICE_TEMPERATURE_PROPERTY);
         }
 
         #[test]
