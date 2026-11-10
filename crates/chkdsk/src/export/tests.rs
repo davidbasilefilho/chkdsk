@@ -25,6 +25,49 @@ fn rows(csv: &str) -> Vec<&str> {
 }
 
 #[test]
+fn a_generic_ssd_exports_its_counters_and_a_usb_stick_without_smart_exports_no_numbers() {
+    let disks = fixtures::disks();
+    let document = json_of(&disks, &History::default());
+    let listed = document["disks"].as_array().unwrap();
+
+    let ssd = &listed[7];
+    assert_eq!(ssd["status"], "Limitada");
+    assert_eq!(ssd["tone"], "unknown");
+    assert_eq!(ssd["score"], 100);
+    assert_eq!(
+        ssd["verdict"],
+        "Avaliação limitada: o disco não informa desgaste"
+    );
+    assert_eq!(ssd["telemetry"]["power_on_hours"], 0x423C);
+    assert_eq!(ssd["telemetry"]["generic_ata"]["power_cycles"], 0x832);
+    assert_eq!(ssd["telemetry"]["generic_ata"]["reallocated_sectors"], 0);
+    // A profiled drive carries no generic counters.
+    assert!(listed[1]["telemetry"]["generic_ata"].is_null());
+
+    let usb = &listed[8];
+    assert_eq!(usb["status"], "Indisponível");
+    assert!(usb["score"].is_null());
+    assert!(
+        usb["verdict"]
+            .as_str()
+            .unwrap()
+            .starts_with("SMART indisponível por este adaptador USB")
+    );
+    assert!(usb["telemetry"].is_null());
+
+    let csv = to_csv(&disks, NOW);
+    let lines = rows(&csv);
+    assert_eq!(lines.len(), disks.len() + 1);
+    assert!(
+        lines[8].contains("16956"),
+        "hours of the generic SSD: {}",
+        lines[8]
+    );
+    assert!(lines[8].contains("Limitada"));
+    assert!(lines[9].contains("Indisponível"));
+}
+
+#[test]
 fn json_lists_every_disk_with_identity_telemetry_attributes_and_history() {
     let disks = fixtures::disks();
     let document = json_of(&disks, &fixture_history());
@@ -72,9 +115,9 @@ fn json_lists_every_disk_with_identity_telemetry_attributes_and_history() {
     assert_eq!(reallocated["threshold"], 36);
     assert_eq!(reallocated["raw"], "0000000006C8");
     let vendor = attributes.iter().find(|a| a["id"] == 0xC2).unwrap();
-    assert!(
-        vendor["name"].is_null(),
-        "a vendor attribute has no shared name"
+    assert_eq!(
+        vendor["name"], "Temperatura",
+        "ID C2 is the shared temperature"
     );
     assert!(
         vendor["threshold"].is_null(),

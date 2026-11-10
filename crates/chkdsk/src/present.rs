@@ -72,8 +72,11 @@ pub struct Health {
     pub last_reading: String,
     /// Device-reported failures and softer signals behind the score, one line each.
     pub warnings: Vec<String>,
-    /// What to do about an Atenção or Crítico verdict; none otherwise.
+    /// What to do about an Atenção or Crítico verdict or a limited assessment.
     pub advice: Option<&'static str>,
+    /// Counters that SMART reports the same way on every drive, one row each,
+    /// for the Avançado section.
+    pub counters: Vec<Detail>,
     pub attributes: Vec<AttributeRow>,
 }
 
@@ -99,29 +102,38 @@ impl Card {
             .map(str::trim)
             .filter(|model| !model.is_empty());
         // Discovery may not know the kind; a successful reading can tell.
-        let kind = match match &snapshot.reading {
+        let kind = match &snapshot.reading {
             Reading::Ready(ready) => ready.telemetry.effective_kind(identity),
             Reading::Pending | Reading::Failed(_) => identity.kind,
-        } {
+        };
+        let usb = identity.is_usb();
+        let kind_label = match kind {
             DiskKind::Hdd => "HD",
             DiskKind::Ssd => "SSD",
             DiskKind::Nvme => "NVMe",
+            // A bridge often hides the media: the bus is still worth naming.
+            DiskKind::Unknown if usb => "USB",
             DiskKind::Unknown => "Tipo desconhecido",
         };
         let capacity = identity
             .capacity_bytes
             .map(format_bytes)
             .unwrap_or_else(|| "capacidade indisponível".into());
+        let subtitle = if usb && kind != DiskKind::Unknown {
+            format!("{kind_label}  ·  USB  ·  {capacity}")
+        } else {
+            format!("{kind_label}  ·  {capacity}")
+        };
         let body = match &snapshot.reading {
             Reading::Pending => Body::Loading,
-            Reading::Failed(state) => Body::Message(query_error_message(*state)),
+            Reading::Failed(state) => Body::Message(query_error_message_for(identity, *state)),
             Reading::Ready(ready) => Body::Health(Box::new(Health::new(identity, ready, now))),
         };
         Card {
             id: identity.id.clone(),
             list_name: model.unwrap_or("Disco").into(),
             title: model.unwrap_or("Modelo desconhecido").into(),
-            subtitle: format!("{kind}  ·  {capacity}"),
+            subtitle,
             details: details(identity, &snapshot.reading),
             body,
         }
@@ -133,7 +145,11 @@ impl Card {
             Body::Health(health) => health.attributes.len(),
             _ => 0,
         };
-        !self.details.is_empty() || attributes > 0
+        let counters = match &self.body {
+            Body::Health(health) => health.counters.len(),
+            _ => 0,
+        };
+        !self.details.is_empty() || counters > 0 || attributes > 0
     }
 
     /// The word next to the disk in the list, so color is never the only signal.
@@ -158,9 +174,14 @@ impl Card {
 impl Health {
     fn new(identity: &DiskIdentity, ready: &Ready, now: u64) -> Self {
         let telemetry = &ready.telemetry;
-        let health = score_health(telemetry.effective_kind(identity), telemetry);
-        // Soft signals keep a passing disk from reading as plainly healthy.
+        let kind = telemetry.effective_kind(identity);
+        let health = score_health(kind, telemetry);
+        // Soft signals keep a passing disk from reading as plainly healthy, and
+        // a score with no wear source behind it is not called healthy at all.
         let (label, tone) = match health.outcome {
+            HealthOutcome::Pass if health.limited && health.warnings.is_empty() => {
+                ("Limitada", Tone::Unknown)
+            }
             HealthOutcome::Pass if health.warnings.is_empty() && health.score > 50 => {
                 ("Saudável", Tone::Healthy)
             }
@@ -169,7 +190,18 @@ impl Health {
             HealthOutcome::Unknown => ("Indisponível", Tone::Unknown),
         };
         let score = (health.outcome != HealthOutcome::Unknown).then_some(health.score);
+        // A USB bridge that forwards nothing leaves identity and capacity only.
+        let bridge_blocks_smart = identity.is_usb()
+            && health.outcome == HealthOutcome::Unknown
+            && !any_permission_failure(telemetry)
+            && !matches!(&telemetry.nvme, QueryState::Success(_))
+            && !matches!(&telemetry.ata, QueryState::Success(_))
+            && !matches!(&telemetry.overall_failure, QueryState::Success(_));
         let status = match telemetry_status(telemetry) {
+            _ if bridge_blocks_smart => USB_SMART_UNAVAILABLE,
+            SMART_AVAILABLE | NO_GENERAL_FAILURE if tone == Tone::Unknown && health.limited => {
+                SMART_LIMITED
+            }
             SMART_AVAILABLE if health.outcome == HealthOutcome::Unknown => SMART_INSUFFICIENT,
             status => status,
         };
@@ -201,7 +233,8 @@ impl Health {
                 .map(|timestamp| format!("há {}", format_duration(now.saturating_sub(timestamp))))
                 .unwrap_or_else(|| "indisponível".into()),
             warnings: warning_lines(&health, telemetry),
-            advice: matches!(tone, Tone::Caution | Tone::Attention).then_some(BACKUP_ADVICE),
+            advice: advice(&health, tone, kind),
+            counters: counters(telemetry),
             attributes: match &telemetry.ata {
                 QueryState::Success(ata) => ata.attributes.iter().map(attribute_row).collect(),
                 _ => Vec::new(),
@@ -210,7 +243,64 @@ impl Health {
     }
 }
 
+/// Counts every ATA drive without a model profile reports the same way
+/// (smartmontools' default layouts). A profiled drive's raw fields are decoded
+/// by its profile, so they stay out of this list.
+fn counters(telemetry: &Telemetry) -> Vec<Detail> {
+    // Set by `apply_ata` only for a drive with no model profile.
+    let (QueryState::Success(_), Some(generic)) = (&telemetry.ata, telemetry.generic_ata) else {
+        return Vec::new();
+    };
+    [
+        ("Ciclos de energia", generic.power_cycles),
+        ("Setores realocados", generic.reallocated_sectors),
+        ("Eventos de realocação", generic.reallocated_events),
+        ("Setores pendentes", generic.pending_sectors),
+        (
+            "Setores incorrigíveis offline",
+            generic.offline_uncorrectable,
+        ),
+        (
+            "Erros incorrigíveis reportados",
+            generic.reported_uncorrectable,
+        ),
+        ("Erros de CRC na interface", generic.interface_crc_errors),
+    ]
+    .into_iter()
+    .filter_map(|(label, count)| {
+        count.map(|count| Detail {
+            label,
+            value: count.to_string(),
+        })
+    })
+    .collect()
+}
+
+/// What to do next: back up on a verdict of Atenção or Crítico, check the cable when that
+/// is the only cause, and where to find the wear when the disk does not say.
+fn advice(health: &HealthScore, tone: Tone, kind: DiskKind) -> Option<&'static str> {
+    match tone {
+        Tone::Caution
+            if health.outcome == HealthOutcome::Pass
+                && health.warnings == [HealthWarningReason::AtaInterfaceCrc] =>
+        {
+            Some(CABLE_ADVICE)
+        }
+        Tone::Caution | Tone::Attention => Some(BACKUP_ADVICE),
+        Tone::Unknown if health.limited && kind == DiskKind::Ssd => Some(LIMITED_SSD_ADVICE),
+        Tone::Unknown if health.limited => Some(LIMITED_ADVICE),
+        Tone::Healthy | Tone::Unknown => None,
+    }
+}
+
 const BACKUP_ADVICE: &str = "Faça backup dos dados importantes.";
+const CABLE_ADVICE: &str =
+    "Troque o cabo de dados ou a porta e confira se o número de erros continua subindo.";
+const LIMITED_SSD_ADVICE: &str =
+    "Use o programa do fabricante do SSD para ver o desgaste, que este disco não informa.";
+/// A drive of unknown kind may not be an SSD, so the advice names no media.
+const LIMITED_ADVICE: &str =
+    "Use o programa do fabricante do disco para ver o desgaste, que este disco não informa.";
 
 /// Failures the device declared, then the softer signals behind the score.
 fn warning_lines(health: &HealthScore, telemetry: &Telemetry) -> Vec<String> {
@@ -289,6 +379,14 @@ fn warning_lines(health: &HealthScore, telemetry: &Telemetry) -> Vec<String> {
             }
             HealthWarningReason::AtaRawEncodingAmbiguous => lines
                 .push("Codificação bruta SMART ambígua; nota de saúde do HD indisponível".into()),
+            HealthWarningReason::AtaInterfaceCrc => lines.push(
+                "Erros de CRC na interface: a falha costuma estar no cabo ou na conexão, não no disco"
+                    .into(),
+            ),
+            HealthWarningReason::AtaCountersCritical => lines.push(
+                "Quantidade alta de setores com defeito; copie seus dados e considere trocar o disco"
+                    .into(),
+            ),
             HealthWarningReason::NvmeMediaErrors => lines.push(match &telemetry.nvme {
                 QueryState::Success(nvme) => nvme
                     .media_errors
@@ -380,6 +478,9 @@ pub fn attribute_name(id: u8) -> Option<&'static str> {
         0x0A => "Tentativas de giro",
         0x0C => "Ciclos de energia",
         0xBB => "Erros incorrigíveis reportados",
+        0xBC => "Tempos limite de comando",
+        0xBE => "Temperatura do ar",
+        0xC2 => "Temperatura",
         0xC4 => "Eventos de realocação",
         0xC5 => "Setores pendentes",
         0xC6 => "Setores incorrigíveis offline",
@@ -474,6 +575,20 @@ pub fn query_error_message(state: QueryErrorState) -> String {
     }
 }
 
+const USB_SMART_UNAVAILABLE: &str = "SMART indisponível por este adaptador USB";
+
+/// A USB bridge that does not forward SMART leaves only the identity: say so
+/// and what to try, instead of calling the disk incompatible.
+pub fn query_error_message_for(identity: &DiskIdentity, state: QueryErrorState) -> String {
+    if state == QueryErrorState::Unsupported && identity.is_usb() {
+        format!(
+            "{USB_SMART_UNAVAILABLE}. O disco foi encontrado, mas o adaptador não repassa os dados de saúde. Para ver o SMART, conecte-o direto à porta SATA ou NVMe."
+        )
+    } else {
+        query_error_message(state)
+    }
+}
+
 /// The retry is the next discovery, so the promised wait is that interval.
 fn retry_message(interval: Duration) -> String {
     format!(
@@ -492,6 +607,8 @@ fn telemetry_has_usable_data(telemetry: &Telemetry) -> bool {
 }
 
 const SMART_AVAILABLE: &str = "Dados SMART disponíveis";
+const NO_GENERAL_FAILURE: &str = "Sem falha geral relatada pelo dispositivo";
+const SMART_LIMITED: &str = "Avaliação limitada: o disco não informa desgaste";
 const SMART_INSUFFICIENT: &str = "Dados SMART insuficientes para calcular a nota";
 
 fn telemetry_status(telemetry: &Telemetry) -> &'static str {
@@ -523,7 +640,7 @@ fn telemetry_status(telemetry: &Telemetry) -> &'static str {
         && !matches!(&telemetry.nvme, QueryState::Unsupported)
         && !matches!(&telemetry.ata, QueryState::Unsupported)
     {
-        return "Sem falha geral relatada pelo dispositivo";
+        return NO_GENERAL_FAILURE;
     }
     if matches!(
         &telemetry.nvme,
@@ -936,7 +1053,7 @@ mod tests {
             health.attributes,
             [AttributeRow {
                 id: "C2".into(),
-                name: "Específico do fabricante".into(),
+                name: "Temperatura".into(),
                 current: "71".into(),
                 worst: "53".into(),
                 threshold: "10".into(),
@@ -1150,6 +1267,219 @@ mod tests {
         assert_eq!(
             pending.subtitle,
             "Tipo desconhecido  ·  capacidade indisponível"
+        );
+    }
+
+    fn row(id: u8, raw: u64) -> AtaAttribute {
+        AtaAttribute {
+            id,
+            flags: 0,
+            current: 100,
+            worst: 100,
+            threshold: Some(0),
+            raw: u64::to_le_bytes(raw)[..6].try_into().unwrap(),
+        }
+    }
+
+    fn unprofiled(rows: Vec<AtaAttribute>) -> Telemetry {
+        let mut telemetry = Telemetry {
+            overall_failure: QueryState::Success(false),
+            ..Default::default()
+        };
+        telemetry.apply_ata(
+            AtaHealth {
+                attributes: rows,
+                thresholds_available: true,
+            },
+            Some("MACROVIP MV240GB"),
+        );
+        telemetry
+    }
+
+    #[test]
+    fn a_generic_sata_ssd_shows_hours_cycles_and_a_limited_assessment_not_a_healthy_100() {
+        // What the MV240GB reports: 09 = 0x423C, 0C = 0x832, no 194 and no wear.
+        let telemetry = unprofiled(vec![
+            row(0x01, 0),
+            row(0x05, 0),
+            row(0x09, 0x423C),
+            row(0x0C, 0x832),
+            row(0xA0, 0),
+        ]);
+        let health = health_of(telemetry, DiskKind::Ssd);
+        assert_eq!(health.power_on, "16956 h");
+        assert_eq!(health.temperature, "indisponível");
+        assert_eq!(health.wear, "indisponível");
+        assert_eq!((health.label, health.tone), ("Limitada", Tone::Unknown));
+        assert_ne!(health.label, "Saudável");
+        assert_eq!(health.score, Some(100));
+        assert_eq!(
+            health.status,
+            "Avaliação limitada: o disco não informa desgaste"
+        );
+        assert_eq!(health.advice, Some(LIMITED_SSD_ADVICE));
+        assert!(health.warnings.is_empty());
+        let detail = |label: &str| {
+            health
+                .counters
+                .iter()
+                .find(|detail| detail.label == label)
+                .map(|detail| detail.value.as_str())
+        };
+        assert_eq!(detail("Ciclos de energia"), Some("2098"));
+        assert_eq!(detail("Setores realocados"), Some("0"));
+        assert_eq!(
+            detail("Setores pendentes"),
+            None,
+            "absent rows are not invented"
+        );
+    }
+
+    #[test]
+    fn limited_advice_names_ssd_only_for_an_ssd() {
+        let rows = || vec![row(0x05, 0), row(0x09, 0x423C), row(0x0C, 0x832)];
+        let ssd = health_of(unprofiled(rows()), DiskKind::Ssd);
+        assert_eq!(ssd.advice, Some(LIMITED_SSD_ADVICE));
+        assert!(LIMITED_SSD_ADVICE.contains("SSD"));
+
+        // An unclassified drive (a bridge hides the media) gets neutral advice.
+        let unknown = health_of(unprofiled(rows()), DiskKind::Unknown);
+        assert_eq!(unknown.label, "Limitada");
+        assert_eq!(unknown.advice, Some(LIMITED_ADVICE));
+        assert!(!LIMITED_ADVICE.contains("SSD"));
+    }
+
+    #[test]
+    fn the_default_temperature_attribute_is_shown_and_a_profiled_disk_lists_no_generic_counters() {
+        let health = health_of(
+            unprofiled(vec![row(0x05, 0), row(0xC2, 0x0037_0014_0029)]),
+            DiskKind::Ssd,
+        );
+        assert_eq!(health.temperature, "41 °C");
+
+        let mut wd = Telemetry::default();
+        wd.apply_ata(
+            AtaHealth {
+                attributes: vec![row(0x05, 0), row(0x0C, 5)],
+                thresholds_available: false,
+            },
+            Some("WDC WD10EZEX-00WN4A0"),
+        );
+        assert!(health_of(wd, DiskKind::Hdd).counters.is_empty());
+    }
+
+    #[test]
+    fn raised_sector_counters_are_values_and_pt_br_warnings_with_a_next_step() {
+        let health = health_of(
+            unprofiled(vec![row(0x05, 3), row(0xC5, 1), row(0xBB, 2)]),
+            DiskKind::Ssd,
+        );
+        assert_eq!((health.label, health.tone), ("Atenção", Tone::Caution));
+        assert_eq!(
+            health.warnings,
+            [
+                "Setores realocados registrados na mídia",
+                "Setores pendentes aguardando remapeamento",
+                "Erros incorrigíveis reportados pelo dispositivo",
+            ]
+        );
+        assert_eq!(health.advice, Some(BACKUP_ADVICE));
+        let values: Vec<_> = health
+            .counters
+            .iter()
+            .map(|detail| (detail.label, detail.value.as_str()))
+            .collect();
+        assert_eq!(
+            values,
+            [
+                ("Setores realocados", "3"),
+                ("Setores pendentes", "1"),
+                ("Erros incorrigíveis reportados", "2"),
+            ]
+        );
+
+        let critical = health_of(unprofiled(vec![row(0x05, 150)]), DiskKind::Ssd);
+        assert_eq!(critical.label, "Crítico");
+        assert!(critical.warnings.contains(
+            &"Quantidade alta de setores com defeito; copie seus dados e considere trocar o disco"
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn interface_crc_errors_point_at_the_cable_not_the_drive() {
+        let health = health_of(unprofiled(vec![row(0x05, 0), row(0xC7, 12)]), DiskKind::Ssd);
+        assert_eq!((health.label, health.tone), ("Atenção", Tone::Caution));
+        assert_eq!(
+            health.warnings,
+            [
+                "Erros de CRC na interface: a falha costuma estar no cabo ou na conexão, não no disco"
+            ]
+        );
+        assert_eq!(health.advice, Some(CABLE_ADVICE));
+        assert_eq!(health.score, Some(100), "not drive wear");
+        assert!(
+            health
+                .counters
+                .iter()
+                .any(|detail| detail.label == "Erros de CRC na interface" && detail.value == "12")
+        );
+    }
+
+    #[test]
+    fn a_usb_disk_without_smart_shows_identity_a_clear_message_and_no_score() {
+        let mut stick = identity("usb");
+        stick.model = Some("Lexar USB Flash Drive".into());
+        stick.bus = Some("USB".into());
+        stick.capacity_bytes = Some(32_010_928_128);
+
+        // Nothing reachable: the whole query was refused as unsupported.
+        let unreachable = card(stick.clone(), Reading::Failed(QueryErrorState::Unsupported));
+        assert_eq!(unreachable.title, "Lexar USB Flash Drive");
+        assert_eq!(unreachable.subtitle, "USB  ·  29,8 GiB");
+        let Body::Message(message) = &unreachable.body else {
+            panic!("an unreadable disk shows a message");
+        };
+        assert!(
+            message.starts_with("SMART indisponível por este adaptador USB"),
+            "{message}"
+        );
+        assert!(message.contains("conecte-o direto"), "{message}");
+        assert_eq!(unreachable.status_label(), "Indisponível");
+        assert_eq!(unreachable.tone(), Some(Tone::Unknown));
+
+        // The same refusal on an internal disk keeps the generic wording.
+        let mut internal = stick.clone();
+        internal.bus = Some("SATA".into());
+        let internal = card(internal, Reading::Failed(QueryErrorState::Unsupported));
+        assert_eq!(
+            internal.body,
+            Body::Message(query_error_message(QueryErrorState::Unsupported))
+        );
+        // A transient failure over USB is still retried, not blamed on the adapter.
+        let retry = card(stick.clone(), Reading::Failed(QueryErrorState::Transient));
+        assert_eq!(
+            retry.body,
+            Body::Message(query_error_message(QueryErrorState::Transient))
+        );
+
+        // Only a temperature came back: still no score, and the status says why.
+        let only_temperature = Telemetry {
+            temperature_c: Some(34),
+            ..Default::default()
+        };
+        let Body::Health(health) = card(stick.clone(), ready(only_temperature)).body else {
+            panic!("a reading must produce a health body");
+        };
+        assert_eq!((health.label, health.score), ("Indisponível", None));
+        assert_eq!(health.status, "SMART indisponível por este adaptador USB");
+        assert_eq!(health.temperature, "34 °C");
+
+        // A known kind over USB keeps its kind and names the bus.
+        stick.kind = DiskKind::Ssd;
+        assert_eq!(
+            card(stick, Reading::Pending).subtitle,
+            "SSD  ·  USB  ·  29,8 GiB"
         );
     }
 }

@@ -1,7 +1,9 @@
 //! Fixture disks for headless captures and tests: one healthy NVMe with a
 //! lifetime estimate, one disk that needs attention, one whose health is
 //! unknown because the query was denied, one still loading, one that failed,
-//! one with too little data for a score and one that passes with soft warnings.
+//! one with too little data for a score, one that passes with soft warnings, a
+//! generic SATA SSD with no wear attribute and a USB stick whose adapter does
+//! not forward SMART.
 //! `chkdsk --snap out.png --scene saudavel` renders them without a disk.
 //! Two more scenes show Avançado open and the export confirmation.
 
@@ -29,6 +31,8 @@ pub const SCENES: &[Scene] = &[
     ("falha", |s| *s = dashboard(4)),
     ("dados-insuficientes", |s| *s = dashboard(5)),
     ("atencao-leve", |s| *s = dashboard(6)),
+    ("ssd-generico", |s| *s = dashboard(7)),
+    ("usb-sem-smart", |s| *s = dashboard(8)),
     ("avancado-aberto", |s| {
         *s = dashboard(1);
         s.advanced = true;
@@ -230,6 +234,54 @@ pub fn disks() -> Vec<DiskSnapshot> {
         ..Default::default()
     });
 
+    // A generic SATA SSD as the MACROVIP MV240GB reports it: hours in 09,
+    // cycles in 0C and no wear or temperature attribute at all.
+    let generic = identity(
+        "interface:sata-7",
+        "MACROVIP MV240GB",
+        DiskKind::Ssd,
+        "SATA",
+        240_057_409_536,
+    );
+    let generic_attributes = [
+        (0x01, 100, 100, Some(50), 0),
+        (0x05, 100, 100, Some(10), 0),
+        (0x09, 100, 100, Some(0), 0x423C),
+        (0x0C, 100, 100, Some(0), 0x832),
+        (0xA0, 100, 100, Some(50), 0),
+        (0xA1, 100, 100, Some(50), 0),
+        (0xA3, 100, 100, Some(50), 0),
+    ]
+    .map(|(id, current, worst, threshold, raw)| AtaAttribute {
+        id,
+        flags: 0,
+        current,
+        worst,
+        threshold,
+        raw: u64::to_le_bytes(raw)[..6].try_into().expect("six bytes"),
+    })
+    .to_vec();
+    let mut limited = Telemetry {
+        overall_failure: QueryState::Success(false),
+        ..Default::default()
+    };
+    limited.apply_ata(
+        AtaHealth {
+            attributes: generic_attributes,
+            thresholds_available: true,
+        },
+        generic.model.as_deref(),
+    );
+
+    // A USB stick behind an adapter that answers no SMART command: identity only.
+    let stick = identity(
+        "interface:usb-8",
+        "Lexar USB Flash Drive",
+        DiskKind::Unknown,
+        "USB",
+        32_010_928_128,
+    );
+
     vec![
         DiskSnapshot {
             reading: ready_reading(&nvme, healthy, &healthy_history),
@@ -258,6 +310,14 @@ pub fn disks() -> Vec<DiskSnapshot> {
         DiskSnapshot {
             reading: ready_reading(&worn, warned, &History::default()),
             identity: worn,
+        },
+        DiskSnapshot {
+            reading: ready_reading(&generic, limited, &History::default()),
+            identity: generic,
+        },
+        DiskSnapshot {
+            reading: Reading::Failed(chkdsk_windows::backend::QueryErrorState::Unsupported),
+            identity: stick,
         },
     ]
 }

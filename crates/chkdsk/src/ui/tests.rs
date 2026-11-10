@@ -306,7 +306,9 @@ fn fixtures_cover_every_state() {
             None,
             Some(Tone::Unknown),
             Some(Tone::Unknown),
-            Some(Tone::Caution)
+            Some(Tone::Caution),
+            Some(Tone::Unknown),
+            Some(Tone::Unknown)
         ]
     );
 }
@@ -493,7 +495,8 @@ fn list_rows_follow_the_disk_not_its_position() {
         state.deliver(Update::Disks(disks), NOW, tx);
     });
     settle(&mut rt);
-    assert_eq!(rt.state.selected, 6, "the selection follows its disk");
+    let last = rt.state.cards.len() - 1;
+    assert_eq!(rt.state.selected, last, "the selection follows its disk");
     click(&mut rt, "disco-interface:usb-2");
     assert_eq!(rt.state.cards[rt.state.selected].id, "interface:usb-2");
 }
@@ -881,7 +884,7 @@ fn avancado_starts_closed_and_opens_with_the_table_and_the_details() {
         "Limite",
         "Bruto",
         "0000000006C8",
-        "Específico do fabricante",
+        "Temperatura do ar",
     ] {
         assert!(shown.contains(text), "{text} is missing: {shown}");
     }
@@ -974,10 +977,11 @@ fn the_scroll_bar_shows_only_while_the_content_overflows_and_follows_it() {
     assert!(end[1] > moved[1]);
 
     // The list has its own bar, only once its rows overflow.
+    let rt = shell(1, (760.0, 900.0));
     assert_eq!(
         thumb_of(&rt, LIST_KEY),
         None,
-        "seven rows fit at this height"
+        "nine rows fit at this height"
     );
     let rt = shell(0, (760.0, 360.0));
     assert!(
@@ -1348,7 +1352,8 @@ fn the_export_button_asks_where_to_save_writes_the_file_and_confirms() {
             .split("\r\n")
             .filter(|l| !l.is_empty())
             .count(),
-        8
+        10,
+        "the header and the nine fixture disks"
     );
     std::fs::remove_file(&path).unwrap();
     assert!(rt.state.can_export(), "ready for the next one");
@@ -1481,7 +1486,7 @@ fn tab_goes_through_the_disks_then_avancado_and_exportar_and_wraps_around() {
 
 #[test]
 fn a_focused_avancado_and_exportar_press_with_space_and_return() {
-    let mut rt = shell(6, (1100.0, 720.0));
+    let mut rt = shell(8, (1100.0, 720.0));
     rt.state.picker = None;
     plain(&mut rt, Key::Tab);
     assert_eq!(focused_key(&rt), "avancado", "the last disk's Tab stop");
@@ -1500,10 +1505,10 @@ fn a_focused_avancado_and_exportar_press_with_space_and_return() {
     );
     // Arrows leave the controls and go back to the disks.
     plain(&mut rt, Key::Left);
-    assert_eq!(rt.state.selected, 5);
+    assert_eq!(rt.state.selected, 7);
     assert_eq!(
         focus(&rt),
-        Some((row_key(&rt.state.cards[5].id.clone()), true))
+        Some((row_key(&rt.state.cards[7].id.clone()), true))
     );
 }
 
@@ -1568,6 +1573,38 @@ fn the_export_status_keeps_clear_of_the_caption_buttons_and_the_action() {
                 "{size:?} {outcome:?}: and starts after the wordmark"
             );
         }
+    }
+}
+
+#[test]
+fn a_generic_ssd_shows_hours_and_cycles_and_a_limited_assessment() {
+    for size in [(1100.0, 720.0), (760.0, 560.0)] {
+        let mut state = fixtures::dashboard(7);
+        // The counters every drive reports live in Avançado, closed until asked.
+        state.advanced = true;
+        let rt = runtime(state, size);
+        let shown = screen(&rt);
+        for text in [
+            "MACROVIP MV240GB",
+            "SSD  ·  223,6 GiB",
+            "Limitada",
+            "Tempo ligado",
+            "16956 h",
+            "Ciclos de energia",
+            "2098",
+            "Avaliação limitada: o disco não informa desgaste",
+            "Use o programa do fabricante do SSD",
+        ] {
+            assert!(shown.contains(text), "{size:?}: {text} is missing: {shown}");
+        }
+        let Body::Health(health) = &rt.state.cards[7].body else {
+            panic!("the generic SSD has a reading");
+        };
+        assert_eq!((health.label, health.tone), ("Limitada", Tone::Unknown));
+        assert!(
+            !shown.contains("backup"),
+            "{size:?}: no verdict, no backup advice"
+        );
     }
 }
 
@@ -1640,7 +1677,13 @@ fn the_attribute_table_at_the_narrow_size_keeps_names_on_few_lines_with_room_aro
 
 #[test]
 fn tabbing_to_avancado_brings_it_into_view_in_a_short_window() {
-    let mut rt = shell(6, (760.0, 560.0));
+    // The soft-warning disk as the last one: its panel is long, and Tab from it
+    // lands on Avançado (the two disks after it are short).
+    let mut state = fixtures::dashboard(6);
+    state.cards.truncate(7);
+    let mut rt = runtime(state, (760.0, 560.0));
+    rt.poll = Some(poll);
+    settle(&mut rt);
     assert!(
         rect(&rt, "avancado")[1] > 560.0 - 48.0 || rt.presented("avancado").is_none(),
         "Avançado starts below the fold"
@@ -1652,4 +1695,21 @@ fn tabbing_to_avancado_brings_it_into_view_in_a_short_window() {
         header[1] >= 0.0 && header[1] + header[3] <= 560.0 - 12.0,
         "the focused header is visible: {header:?}"
     );
+}
+
+#[test]
+fn a_usb_stick_without_smart_shows_identity_and_the_adapter_message_but_no_score() {
+    for size in [(1100.0, 720.0), (760.0, 560.0)] {
+        let rt = runtime(fixtures::dashboard(8), size);
+        let shown = screen(&rt);
+        for text in [
+            "Lexar USB Flash Drive",
+            "USB  ·  29,8 GiB",
+            "SMART indisponível por este adaptador USB",
+        ] {
+            assert!(shown.contains(text), "{size:?}: {text} is missing: {shown}");
+        }
+        assert!(!shown.contains("Tipo desconhecido"), "{size:?}: {shown}");
+        assert!(rt.find("nota").is_none(), "{size:?}: no hero number");
+    }
 }

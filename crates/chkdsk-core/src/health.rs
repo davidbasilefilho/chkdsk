@@ -5,6 +5,12 @@
 //! documented, model-gated ATA/NVMe signals; correlated counters are heuristic
 //! evidence, not independent probabilities. Missing or blocked telemetry is
 //! Unknown, never an invented healthy 100%.
+//!
+//! Drives with no model profile are scored only from the vendor-independent
+//! ATA counters (smartmontools' DEFAULT entry). SSD life attributes (169, 173,
+//! 177, 202, 231, 232, 233, 0xA4-0xA8) mean different things per vendor, so
+//! they are scored only where a model profile maps them; power-on hours,
+//! power cycles and command timeouts (9, 12, 188) are never scored.
 
 use crate::model::{AtaHealth, DiskKind, HealthWarningReason, NvmeHealth, QueryState, Telemetry};
 use serde::{Deserialize, Serialize};
@@ -26,7 +32,19 @@ pub struct HealthScore {
     /// Structured warning causes for UI presentation; absent in older JSON.
     #[serde(default)]
     pub warnings: Vec<HealthWarningReason>,
+    /// A passing, clean reading of a non-HDD that reports no wear: the score
+    /// only says that no problem counter is raised, not how worn the drive is.
+    #[serde(default)]
+    pub limited: bool,
 }
+
+/// Confidence ceiling for a limited reading: no wear source was measured.
+const LIMITED_CONFIDENCE: f64 = 0.35;
+
+/// Project-defined counts at which a drive with no model profile is critical,
+/// not merely warned about. Smaller nonzero counts only lower the score.
+const CRITICAL_REALLOCATED_SECTORS: u64 = 100;
+const CRITICAL_PENDING_OR_OFFLINE_SECTORS: u64 = 10;
 
 #[derive(Default)]
 struct Evidence {
@@ -130,6 +148,21 @@ pub fn score_health(kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
         provenance.push("no health telemetry available".to_owned());
     }
     confidence = confidence.min(1.0);
+    let wear_source =
+        matches!(&telemetry.nvme, QueryState::Success(_)) || telemetry.endurance_percent.is_some();
+    let limited = kind != DiskKind::Hdd
+        && matches!(&telemetry.ata, QueryState::Success(_))
+        && !wear_source
+        && evidence.available
+        && !evidence.indeterminate
+        && !evidence.critical_failure
+        && warnings
+            .iter()
+            .all(|reason| *reason == HealthWarningReason::AtaInterfaceCrc);
+    if limited {
+        confidence = confidence.min(LIMITED_CONFIDENCE);
+        provenance.push("limited assessment: the drive reports no wear source".to_owned());
+    }
     let has_usable_index = evidence.available && !evidence.indeterminate;
     let score = if has_usable_index || evidence.critical_failure {
         clamp_score(score.min(cap))
@@ -153,6 +186,7 @@ pub fn score_health(kind: DiskKind, telemetry: &Telemetry) -> HealthScore {
         confidence,
         provenance,
         warnings,
+        limited,
     }
 }
 
@@ -188,7 +222,8 @@ fn add_ata_evidence(
             // Duplicate health counters or duplicate rows with declared
             // thresholds can affect the index. Duplicates of informational
             // or unrecognized vendor attributes only reduce display coverage.
-            if (kind == DiskKind::Hdd && matches!(attribute.id, 5 | 10 | 187 | 197 | 198))
+            if crate::ata::counter_applies(kind, profile_family, attribute.id)
+                .is_some_and(crate::ata::AtaCounter::is_drive_wear)
                 || ((1..=254).contains(&attribute.current)
                     && attribute.threshold.is_some_and(|value| value > 0))
             {
@@ -203,37 +238,50 @@ fn add_ata_evidence(
         // evidence channels. Decode a supported raw count even when its
         // current normalized value has no threshold record.
         if let Some((counter, count)) =
-            crate::ata::hdd_counter(kind, profile_family, attribute.id, attribute.raw)
+            crate::ata::scored_counter(kind, profile_family, attribute.id, attribute.raw)
         {
             let id = usize::from(counter.id());
             if !seen_counters[id] {
                 seen_counters[id] = true;
-                mapped_count += 1;
-                let penalty = hdd_counter_penalty(counter, count);
-                // Multiplicative combination is a heuristic way to bound
-                // combined deterioration. It does not claim independence.
-                *score *= f64::from(100 - penalty) / 100.0;
-                if count > 0 {
-                    add_warning(warnings, hdd_warning(counter));
-                }
-                let source = if profile_family == Some(crate::ata::WD10EZEX_PROFILE) {
-                    crate::ata::WD10EZEX_PROFILE
+                let model_profile = profile_family.is_some();
+                if counter.is_drive_wear() {
+                    mapped_count += 1;
+                    let penalty = counter_penalty(counter, count, model_profile);
+                    // Multiplicative combination is a heuristic way to bound
+                    // combined deterioration. It does not claim independence.
+                    *score *= f64::from(100 - penalty) / 100.0;
+                    if !model_profile && counter_is_critical(counter, count) {
+                        *cap = cap.min(20.0);
+                        evidence.critical_failure = true;
+                        add_warning(warnings, HealthWarningReason::AtaCountersCritical);
+                    }
+                    provenance.push(format!(
+                        "health index v1: {}, ATA ID {} ({}), raw count {count}, penalty {penalty}%",
+                        counter_source(profile_family),
+                        counter.id(),
+                        counter.label()
+                    ));
                 } else {
-                    "common HDD SMART default mapping"
-                };
-                provenance.push(format!(
-                    "health index v1: {source}, ATA ID {} ({}), raw count {count}, penalty {penalty}%",
-                    counter.id(), counter.label()
-                ));
+                    provenance.push(format!(
+                        "ATA ID {} ({}), raw count {count}; not drive wear, not scored",
+                        counter.id(),
+                        counter.label()
+                    ));
+                }
+                if count > 0 {
+                    add_warning(warnings, counter_warning(counter));
+                }
             }
-        } else if kind == DiskKind::Hdd && matches!(attribute.id, 5 | 10 | 187 | 197 | 198) {
+        } else if crate::ata::counter_applies(kind, profile_family, attribute.id)
+            .is_some_and(crate::ata::AtaCounter::is_drive_wear)
+        {
             // E.g. ID 5 carries nonzero optional raw16(raw16) subfields. Do
             // not drop those bytes and score just the low word.
             evidence.indeterminate = true;
             *confidence = (*confidence - 0.05).max(0.0);
             add_warning(warnings, HealthWarningReason::AtaRawEncodingAmbiguous);
             provenance.push(format!(
-                "ATA ID {} raw encoding is ambiguous or unsupported; retained but not decoded; overall HDD index is unavailable to avoid a false recovery",
+                "ATA ID {} raw encoding is ambiguous or unsupported; retained but not decoded; overall index is unavailable to avoid a false recovery",
                 attribute.id
             ));
         }
@@ -253,9 +301,14 @@ fn add_ata_evidence(
         if attribute.current <= threshold {
             *cap = cap.min(20.0);
             threshold_reached = true;
-            if attribute.flags & 1 != 0 {
+            // A sector counter at its declared limit is critical on a drive
+            // with no model profile even without the pre-failure flag.
+            if attribute.flags & 1 != 0
+                || (profile_family.is_none() && matches!(attribute.id, 5 | 197 | 198))
+            {
                 evidence.critical_failure = true;
-            } else {
+            }
+            if attribute.flags & 1 == 0 {
                 add_warning(warnings, HealthWarningReason::AtaThresholdReached);
             }
             provenance.push(format!(
@@ -306,8 +359,13 @@ fn add_ata_evidence(
         *confidence += if model_profile { 0.16 } else { 0.10 };
         *confidence += mapped_count as f64 * if model_profile { 0.14 } else { 0.12 };
         evidence.available = true;
+        let (supported, noun) = if kind == DiskKind::Hdd {
+            (5, "HDD")
+        } else {
+            (4, "ATA")
+        };
         provenance.push(format!(
-            "health index v1: {mapped_count}/5 supported HDD counters mapped; weights are deterministic heuristic deductions, not independent probabilities"
+            "health index v1: {mapped_count}/{supported} supported {noun} counters mapped; weights are deterministic heuristic deductions, not independent probabilities"
         ));
     }
 }
@@ -386,7 +444,14 @@ fn add_nvme_evidence(
     }
 }
 
-fn hdd_counter_penalty(counter: crate::ata::HddCounter, count: u64) -> u8 {
+fn counter_source(profile_family: Option<&str>) -> &'static str {
+    match profile_family {
+        Some(family) if family == crate::ata::WD10EZEX_PROFILE => crate::ata::WD10EZEX_PROFILE,
+        _ => "common ATA SMART default mapping",
+    }
+}
+
+fn counter_penalty(counter: crate::ata::AtaCounter, count: u64, model_profile: bool) -> u8 {
     if count == 0 {
         return 0;
     }
@@ -395,13 +460,16 @@ fn hdd_counter_penalty(counter: crate::ata::HddCounter, count: u64) -> u8 {
     // risk start higher than historical remaps/retries; each decimal order
     // adds a bounded increment so gigantic raw counters cannot overflow or
     // dominate linearly. The separate penalties compound as a deterministic
-    // heuristic, not as independent probabilities.
+    // heuristic, not as independent probabilities. Without a model profile,
+    // ID 187 only warns mildly: drives disagree on what it counts.
     let (base, per_decimal_order, maximum) = match counter {
-        crate::ata::HddCounter::ReallocatedSectors => (4u8, 3u8, 25u8),
-        crate::ata::HddCounter::SpinRetries => (10, 4, 35),
-        crate::ata::HddCounter::ReportedUncorrectable => (20, 8, 55),
-        crate::ata::HddCounter::PendingSectors => (25, 10, 65),
-        crate::ata::HddCounter::OfflineUncorrectable => (30, 10, 70),
+        crate::ata::AtaCounter::ReallocatedSectors => (4u8, 3u8, 25u8),
+        crate::ata::AtaCounter::SpinRetries => (10, 4, 35),
+        crate::ata::AtaCounter::ReportedUncorrectable if !model_profile => (5, 3, 20),
+        crate::ata::AtaCounter::ReportedUncorrectable => (20, 8, 55),
+        crate::ata::AtaCounter::PendingSectors => (25, 10, 65),
+        crate::ata::AtaCounter::OfflineUncorrectable => (30, 10, 70),
+        crate::ata::AtaCounter::InterfaceCrc => return 0,
     };
     let mut decimal_orders = 0u8;
     let mut threshold = 10u64;
@@ -413,17 +481,30 @@ fn hdd_counter_penalty(counter: crate::ata::HddCounter, count: u64) -> u8 {
         .min(maximum)
 }
 
-fn hdd_warning(counter: crate::ata::HddCounter) -> HealthWarningReason {
+/// Large sector counters put data at risk, not just the score. Only applied to
+/// drives with no model profile, whose raw counters are the whole assessment.
+fn counter_is_critical(counter: crate::ata::AtaCounter, count: u64) -> bool {
     match counter {
-        crate::ata::HddCounter::ReallocatedSectors => HealthWarningReason::AtaReallocatedSectors,
-        crate::ata::HddCounter::SpinRetries => HealthWarningReason::AtaSpinRetries,
-        crate::ata::HddCounter::ReportedUncorrectable => {
+        crate::ata::AtaCounter::ReallocatedSectors => count >= CRITICAL_REALLOCATED_SECTORS,
+        crate::ata::AtaCounter::PendingSectors | crate::ata::AtaCounter::OfflineUncorrectable => {
+            count >= CRITICAL_PENDING_OR_OFFLINE_SECTORS
+        }
+        _ => false,
+    }
+}
+
+fn counter_warning(counter: crate::ata::AtaCounter) -> HealthWarningReason {
+    match counter {
+        crate::ata::AtaCounter::ReallocatedSectors => HealthWarningReason::AtaReallocatedSectors,
+        crate::ata::AtaCounter::SpinRetries => HealthWarningReason::AtaSpinRetries,
+        crate::ata::AtaCounter::ReportedUncorrectable => {
             HealthWarningReason::AtaReportedUncorrectable
         }
-        crate::ata::HddCounter::PendingSectors => HealthWarningReason::AtaPendingSectors,
-        crate::ata::HddCounter::OfflineUncorrectable => {
+        crate::ata::AtaCounter::PendingSectors => HealthWarningReason::AtaPendingSectors,
+        crate::ata::AtaCounter::OfflineUncorrectable => {
             HealthWarningReason::AtaOfflineUncorrectable
         }
+        crate::ata::AtaCounter::InterfaceCrc => HealthWarningReason::AtaInterfaceCrc,
     }
 }
 
@@ -934,8 +1015,16 @@ mod tests {
             );
             previous = score;
         }
-        assert_eq!(score_for(1, DiskKind::Ssd, None), 0);
-        assert_eq!(score_for(1, DiskKind::Unknown, None), 0);
+        // The vendor-independent counters score any non-NVMe ATA drive with no
+        // model profile; a profile gates the counters to the drives it names.
+        assert_eq!(score_for(1, DiskKind::Ssd, None), 75);
+        assert_eq!(score_for(1, DiskKind::Unknown, None), 75);
+        assert_eq!(score_for(1, DiskKind::Nvme, None), 0);
+        assert_eq!(
+            score_for(1, DiskKind::Ssd, Some(crate::ata::WD10EZEX_PROFILE)),
+            0
+        );
+        assert_eq!(score_for(1, DiskKind::Ssd, Some("Crucial MX500")), 0);
     }
 
     #[test]
@@ -1101,5 +1190,234 @@ mod tests {
         )
         .unwrap();
         assert!(score.warnings.is_empty());
+    }
+
+    fn ssd_with(attributes: Vec<crate::model::AtaAttribute>, model: &str) -> HealthScore {
+        let mut telemetry = Telemetry {
+            overall_failure: QueryState::Success(false),
+            ..Default::default()
+        };
+        telemetry.apply_ata(
+            AtaHealth {
+                attributes,
+                thresholds_available: true,
+            },
+            Some(model),
+        );
+        score_health(DiskKind::Ssd, &telemetry)
+    }
+
+    fn counter(id: u8, count: u64) -> crate::model::AtaAttribute {
+        ata_attribute(id, count.to_le_bytes()[..6].try_into().unwrap())
+    }
+
+    /// The attributes the MACROVIP MV240GB reported on real hardware: no wear
+    /// attribute, no temperature, hours in 09 and cycles in 0C.
+    fn mv240gb_attributes() -> Vec<crate::model::AtaAttribute> {
+        let attribute = |id, raw: [u8; 6]| {
+            let mut row = ata_attribute(id, raw);
+            row.threshold = Some(0);
+            row
+        };
+        vec![
+            attribute(0x01, [0; 6]),
+            attribute(0x05, [0; 6]),
+            attribute(0x09, [0x3C, 0x42, 0, 0, 0, 0]),
+            attribute(0x0C, [0x32, 0x08, 0, 0, 0, 0]),
+            attribute(0xA0, [0; 6]),
+            attribute(0xA1, [0; 6]),
+            attribute(0xA3, [0; 6]),
+        ]
+    }
+
+    #[test]
+    fn a_clean_reading_without_a_wear_source_is_limited_not_a_confident_100() {
+        let mut telemetry = Telemetry {
+            overall_failure: QueryState::Success(false),
+            ..Default::default()
+        };
+        telemetry.apply_ata(
+            AtaHealth {
+                attributes: mv240gb_attributes(),
+                thresholds_available: true,
+            },
+            Some("MACROVIP MV240GB"),
+        );
+        assert_eq!(telemetry.power_on_hours, Some(16_956));
+        assert_eq!(telemetry.temperature_c, None);
+        let result = score_health(DiskKind::Ssd, &telemetry);
+        assert!(result.limited);
+        assert_eq!(result.outcome, HealthOutcome::Pass);
+        assert_eq!(result.score, 100);
+        assert!(result.confidence <= LIMITED_CONFIDENCE, "{result:?}");
+        assert!(result.warnings.is_empty());
+
+        // The same reading of an HDD is not limited: a spindle has no wear gauge.
+        assert!(!score_health(DiskKind::Hdd, &telemetry).limited);
+
+        // Any wear source lifts the limit.
+        telemetry.endurance_percent = Some(10.0);
+        assert!(!score_health(DiskKind::Ssd, &telemetry).limited);
+
+        // So does a raised counter: that is evidence, and it lowers the score.
+        let worn = ssd_with(vec![counter(5, 2)], "MACROVIP MV240GB");
+        assert!(!worn.limited);
+
+        // A mapped Crucial profile measures wear.
+        let crucial = ssd_with(
+            vec![counter(5, 0), counter(202, 20)],
+            "Crucial CT500MX500SSD1",
+        );
+        assert!(!crucial.limited);
+        assert_eq!(crucial.score, 80);
+    }
+
+    #[test]
+    fn unprofiled_sector_counters_warn_lower_the_score_and_escalate_when_large() {
+        let model = "MACROVIP MV240GB";
+        for (id, count, score, reason) in [
+            (5, 3, 96, HealthWarningReason::AtaReallocatedSectors),
+            (197, 1, 75, HealthWarningReason::AtaPendingSectors),
+            (198, 1, 70, HealthWarningReason::AtaOfflineUncorrectable),
+            (187, 1, 95, HealthWarningReason::AtaReportedUncorrectable),
+        ] {
+            let result = ssd_with(vec![counter(id, count)], model);
+            assert_eq!(result.score, score, "id {id}");
+            assert_eq!(result.outcome, HealthOutcome::Pass, "id {id}: a warning");
+            assert_eq!(result.warnings, vec![reason], "id {id}");
+            assert!(!result.limited, "id {id}");
+        }
+        for (id, count) in [(5, 100), (197, 10), (198, 10), (5, 65_535)] {
+            let result = ssd_with(vec![counter(id, count)], model);
+            assert_eq!(result.outcome, HealthOutcome::Fail, "id {id}: {count}");
+            assert!(result.score <= 20, "id {id}: {count}");
+            assert!(
+                result
+                    .warnings
+                    .contains(&HealthWarningReason::AtaCountersCritical),
+                "id {id}: {count}"
+            );
+        }
+        for (id, count) in [(5, 99), (197, 9), (198, 9), (187, 1_000_000)] {
+            let result = ssd_with(vec![counter(id, count)], model);
+            assert_eq!(result.outcome, HealthOutcome::Pass, "id {id}: {count}");
+        }
+        // The profiled WD path keeps its own, unchanged rules.
+        let wd = |attributes| {
+            let mut telemetry = Telemetry::default();
+            telemetry.apply_ata(
+                AtaHealth {
+                    attributes,
+                    thresholds_available: false,
+                },
+                Some("WDC WD10EZEX-00WN4A0"),
+            );
+            score_health(DiskKind::Hdd, &telemetry)
+        };
+        let wd_many = wd(vec![counter(197, 500)]);
+        assert_eq!(wd_many.outcome, HealthOutcome::Pass);
+        assert!(
+            !wd_many
+                .warnings
+                .contains(&HealthWarningReason::AtaCountersCritical)
+        );
+    }
+
+    #[test]
+    fn a_sector_counter_at_its_declared_threshold_is_critical_without_the_prefail_flag() {
+        for id in [5, 197, 198] {
+            let mut row = ata_attribute(id, [0; 6]);
+            row.current = 10;
+            row.threshold = Some(10);
+            row.flags = 0;
+            let result = ssd_with(vec![row.clone()], "MACROVIP MV240GB");
+            assert_eq!(result.outcome, HealthOutcome::Fail, "id {id}");
+            assert!(result.score <= 20, "id {id}");
+            // Other attributes at their threshold stay a warning without the flag.
+            row.id = 1;
+            let other = ssd_with(vec![row], "MACROVIP MV240GB");
+            assert_eq!(other.outcome, HealthOutcome::Pass);
+            assert!(
+                other
+                    .warnings
+                    .contains(&HealthWarningReason::AtaThresholdReached)
+            );
+        }
+    }
+
+    #[test]
+    fn interface_crc_errors_warn_about_the_cable_but_are_not_drive_wear() {
+        let clean = ssd_with(vec![counter(5, 0)], "MACROVIP MV240GB");
+        let crc = ssd_with(vec![counter(5, 0), counter(199, 4_000)], "MACROVIP MV240GB");
+        assert_eq!(crc.score, clean.score);
+        assert_eq!(crc.outcome, HealthOutcome::Pass);
+        assert_eq!(crc.warnings, vec![HealthWarningReason::AtaInterfaceCrc]);
+        assert_eq!(crc.confidence, clean.confidence.min(LIMITED_CONFIDENCE));
+        // On its own it is no evidence about the drive, and a duplicate row
+        // cannot make the whole assessment unavailable.
+        let alone = ssd_with(vec![counter(199, 4_000)], "MACROVIP MV240GB");
+        assert_eq!(alone.outcome, HealthOutcome::Unknown);
+        let duplicated = ssd_with(
+            vec![counter(5, 0), counter(199, 1), counter(199, 2)],
+            "MACROVIP MV240GB",
+        );
+        assert_eq!(duplicated.outcome, HealthOutcome::Pass);
+    }
+
+    #[test]
+    fn hours_cycles_timeouts_and_ssd_life_attributes_are_never_scored_without_a_profile() {
+        let clean = ssd_with(vec![counter(5, 0)], "MACROVIP MV240GB");
+        let mut noisy = vec![counter(5, 0)];
+        noisy.extend(
+            [
+                1, 9, 12, 188, 169, 173, 177, 202, 231, 232, 233, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8,
+            ]
+            .into_iter()
+            .map(|id| counter(id, 0x0000_ffff_ffff_ffff)),
+        );
+        let result = ssd_with(noisy, "MACROVIP MV240GB");
+        assert_eq!(result.score, clean.score);
+        assert_eq!(result.outcome, clean.outcome);
+        assert_eq!(result.warnings, clean.warnings);
+    }
+
+    #[test]
+    fn duplicate_or_ambiguous_generic_counters_make_the_unprofiled_index_unavailable() {
+        for attributes in [
+            vec![counter(197, 0), counter(197, 5)],
+            vec![counter(5, 0x0001_0000)],
+        ] {
+            let result = ssd_with(attributes, "MACROVIP MV240GB");
+            assert_eq!(result.outcome, HealthOutcome::Unknown);
+            assert!(!result.limited);
+        }
+    }
+
+    #[test]
+    fn a_failing_smart_status_is_critical_for_an_unprofiled_drive() {
+        let mut telemetry = Telemetry {
+            overall_failure: QueryState::Success(true),
+            ..Default::default()
+        };
+        telemetry.apply_ata(
+            AtaHealth {
+                attributes: mv240gb_attributes(),
+                thresholds_available: true,
+            },
+            Some("MACROVIP MV240GB"),
+        );
+        let result = score_health(DiskKind::Ssd, &telemetry);
+        assert_eq!(result.outcome, HealthOutcome::Fail);
+        assert!(result.score <= 20);
+        assert!(!result.limited);
+    }
+
+    #[test]
+    fn older_score_json_defaults_limited_to_false() {
+        let score: HealthScore = serde_json::from_str(
+            r#"{"score":100,"outcome":"pass","confidence":0.1,"provenance":[]}"#,
+        )
+        .unwrap();
+        assert!(!score.limited);
     }
 }

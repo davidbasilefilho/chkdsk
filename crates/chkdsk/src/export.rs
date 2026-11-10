@@ -310,6 +310,8 @@ fn telemetry_json(telemetry: &Telemetry) -> Value {
         "wear_percent": telemetry.endurance_percent,
         "device_reported_failure": overall_failure,
         "ata_profile": telemetry.ata_profile,
+        // The counters every drive reports alike; null for a profiled drive.
+        "generic_ata": telemetry.generic_ata,
         "nvme_health_log": nvme,
     })
 }

@@ -3,6 +3,8 @@
 //! Raw values remain opaque unless a standard HDD signal is applicable or an
 //! exact vendor/model profile is supported by authoritative documentation.
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModelProfile {
     pub family: &'static str,
@@ -55,16 +57,19 @@ const HDD_MODEL_PROFILES: &[HddModelProfile] = &[HddModelProfile {
     temperature_encoding: TemperatureEncoding::TempMinMaxCurrentByte,
 }];
 
+/// Raw problem counters shared by every ATA drive (smartmontools DEFAULT entry).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HddCounter {
+pub(crate) enum AtaCounter {
     ReallocatedSectors,
     SpinRetries,
     ReportedUncorrectable,
     PendingSectors,
     OfflineUncorrectable,
+    /// UDMA CRC errors count transfers corrupted on the cable, not media wear.
+    InterfaceCrc,
 }
 
-impl HddCounter {
+impl AtaCounter {
     pub(crate) const fn id(self) -> u8 {
         match self {
             Self::ReallocatedSectors => 5,
@@ -72,6 +77,7 @@ impl HddCounter {
             Self::ReportedUncorrectable => 187,
             Self::PendingSectors => 197,
             Self::OfflineUncorrectable => 198,
+            Self::InterfaceCrc => 199,
         }
     }
 
@@ -82,6 +88,25 @@ impl HddCounter {
             Self::ReportedUncorrectable => "reported uncorrectable errors",
             Self::PendingSectors => "pending sectors",
             Self::OfflineUncorrectable => "offline uncorrectable sectors",
+            Self::InterfaceCrc => "interface CRC errors",
+        }
+    }
+
+    /// Whether the counter measures the drive itself. Interface CRC errors
+    /// point at the cable or bridge and never lower the score.
+    pub(crate) const fn is_drive_wear(self) -> bool {
+        !matches!(self, Self::InterfaceCrc)
+    }
+
+    const fn from_id(id: u8) -> Option<Self> {
+        match id {
+            5 => Some(Self::ReallocatedSectors),
+            10 => Some(Self::SpinRetries),
+            187 => Some(Self::ReportedUncorrectable),
+            197 => Some(Self::PendingSectors),
+            198 => Some(Self::OfflineUncorrectable),
+            199 => Some(Self::InterfaceCrc),
+            _ => None,
         }
     }
 }
@@ -119,15 +144,40 @@ pub(crate) fn hdd_profile(model: Option<&str>) -> Option<&'static HddModelProfil
         .find(|profile| model.starts_with(profile.model_prefix))
 }
 
-pub(crate) fn hdd_counter(
+/// The counter an ATA ID is scored as for this disk, or `None` when the ID is
+/// not scored. A drive with no model match gets the vendor-independent
+/// counters whatever its kind (NVMe aside); spin retries only make sense for
+/// a spindle. The WD profile keeps its HDD-only set, and 199 is never scored
+/// there.
+pub(crate) fn counter_applies(
+    kind: crate::model::DiskKind,
+    profile_family: Option<&str>,
+    id: u8,
+) -> Option<AtaCounter> {
+    let counter = AtaCounter::from_id(id)?;
+    let applies = match profile_family {
+        Some(family) => {
+            kind == crate::model::DiskKind::Hdd
+                && counter != AtaCounter::InterfaceCrc
+                && HDD_MODEL_PROFILES
+                    .iter()
+                    .any(|profile| profile.family == family)
+        }
+        None => match counter {
+            AtaCounter::SpinRetries => kind == crate::model::DiskKind::Hdd,
+            _ => kind != crate::model::DiskKind::Nvme,
+        },
+    };
+    applies.then_some(counter)
+}
+
+pub(crate) fn scored_counter(
     kind: crate::model::DiskKind,
     profile_family: Option<&str>,
     id: u8,
     raw: [u8; 6],
-) -> Option<(HddCounter, u64)> {
-    if kind != crate::model::DiskKind::Hdd {
-        return None;
-    }
+) -> Option<(AtaCounter, u64)> {
+    let counter = counter_applies(kind, profile_family, id)?;
     let raw5_encoding = match profile_family {
         Some(family) => {
             HDD_MODEL_PROFILES
@@ -135,37 +185,70 @@ pub(crate) fn hdd_counter(
                 .find(|profile| profile.family == family)?
                 .raw5_encoding
         }
-        None => {
-            // Common smartmontools DEFAULT conventions for widely used HDD
-            // problem counters. This is a decoding fallback only, not a
-            // guessed vendor health baseline or normalized-value threshold.
-            Raw5Encoding::Raw16PrimaryOnly
-        }
+        // The smartmontools DEFAULT entry, shared by drives with no profile.
+        None => Raw5Encoding::Raw16PrimaryOnly,
     };
-    let counter = match id {
-        5 => {
-            let value = match raw5_encoding {
-                Raw5Encoding::Raw16PrimaryOnly => {
-                    // The smartmontools DEFAULT convention is raw16(raw16):
-                    // bytes 0..2 are the primary value and 2..6 are optional
-                    // extra words. Accept only an unambiguous primary count.
-                    // This avoids interpreting packed fields or silently
-                    // truncating them.
-                    if raw[2..].iter().any(|byte| *byte != 0) {
-                        return None;
-                    }
-                    u64::from(u16::from_le_bytes([raw[0], raw[1]]))
-                }
-            };
-            (HddCounter::ReallocatedSectors, value)
+    let value = match (counter, raw5_encoding) {
+        // ID 5 follows raw16(raw16): the low word is the count and the upper
+        // words are optional subfields. Accept only an unambiguous primary
+        // count, so packed fields are neither interpreted nor silently
+        // truncated.
+        (AtaCounter::ReallocatedSectors, Raw5Encoding::Raw16PrimaryOnly) => {
+            if raw[2..].iter().any(|byte| *byte != 0) {
+                return None;
+            }
+            raw_u16(raw)
         }
-        10 => (HddCounter::SpinRetries, raw_u48(raw)),
-        187 => (HddCounter::ReportedUncorrectable, raw_u48(raw)),
-        197 => (HddCounter::PendingSectors, raw_u48(raw)),
-        198 => (HddCounter::OfflineUncorrectable, raw_u48(raw)),
-        _ => return None,
+        _ => raw_u48(raw),
     };
-    Some(counter)
+    Some((counter, value))
+}
+
+/// Vendor-independent reading of the ATA attributes that have the same meaning
+/// on (nearly) every drive: smartmontools' DEFAULT drivedb entry. Each field is
+/// absent when its ID is missing or appears more than once, since a duplicated
+/// row has no authoritative value. Raw fields are decoded as that entry
+/// declares: 9 raw24 (the upper bytes may hold a vendor sub-unit and are
+/// ignored), 5 and 196 raw16, 194/190 the low byte only (min/max bytes follow
+/// it), everything else raw48. SSD life attributes (169, 173, 177, 202, 231,
+/// 232, 233, 0xA4-0xA8) are vendor-defined and deliberately not decoded here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenericAta {
+    pub power_on_hours: Option<u64>,
+    pub power_cycles: Option<u64>,
+    pub temperature_c: Option<i16>,
+    pub reallocated_sectors: Option<u64>,
+    pub reallocated_events: Option<u64>,
+    pub pending_sectors: Option<u64>,
+    pub offline_uncorrectable: Option<u64>,
+    pub interface_crc_errors: Option<u64>,
+    pub reported_uncorrectable: Option<u64>,
+    pub command_timeouts: Option<u64>,
+}
+
+pub fn generic_decode(health: &crate::model::AtaHealth) -> GenericAta {
+    let raw = |id| unique_attribute(health, id).map(|attribute| attribute.raw);
+    let raw48 = |id| raw(id).map(raw_u48);
+    let raw16 = |id| raw(id).map(raw_u16);
+    // 194 wins over 190 (airflow); an implausible byte is not a temperature.
+    let temperature = |id| {
+        raw(id)
+            .map(|raw| raw[0])
+            .filter(|celsius| (1..=100).contains(celsius))
+            .map(i16::from)
+    };
+    GenericAta {
+        power_on_hours: raw(9).map(|raw| raw_u48(raw) & 0x00ff_ffff),
+        power_cycles: raw48(12),
+        temperature_c: temperature(194).or_else(|| temperature(190)),
+        reallocated_sectors: raw16(5),
+        reallocated_events: raw16(196),
+        pending_sectors: raw48(197),
+        offline_uncorrectable: raw48(198),
+        interface_crc_errors: raw48(199),
+        reported_uncorrectable: raw48(187),
+        command_timeouts: raw48(188),
+    }
 }
 
 /// Decode the common SATA HDD temperature/hour fields only for a registered
@@ -318,6 +401,11 @@ pub(crate) fn raw_attribute_name_pt_br(model: Option<&str>, id: u8) -> Option<&'
     attribute_name_pt_br(model, id)
 }
 
+/// The low word of a raw field: the primary count of a `raw16(raw16)` layout.
+pub(crate) fn raw_u16(raw: [u8; 6]) -> u64 {
+    u64::from(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
 pub(crate) fn raw_u48(raw: [u8; 6]) -> u64 {
     u64::from_le_bytes([raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], 0, 0])
 }
@@ -374,36 +462,36 @@ mod tests {
 
         let raw_65_536 = [0, 0, 1, 0, 0, 0];
         assert_eq!(
-            hdd_counter(
+            scored_counter(
                 crate::model::DiskKind::Hdd,
                 Some(WD10EZEX_PROFILE),
                 197,
                 raw_65_536,
             ),
-            Some((HddCounter::PendingSectors, 65_536))
+            Some((AtaCounter::PendingSectors, 65_536))
         );
         assert_eq!(
-            hdd_counter(
+            scored_counter(
                 crate::model::DiskKind::Hdd,
                 Some(WD10EZEX_PROFILE),
                 197,
                 [255; 6],
             ),
-            Some((HddCounter::PendingSectors, 0x0000_ffff_ffff_ffff))
+            Some((AtaCounter::PendingSectors, 0x0000_ffff_ffff_ffff))
         );
         assert_eq!(
-            hdd_counter(
+            scored_counter(
                 crate::model::DiskKind::Hdd,
                 Some(WD10EZEX_PROFILE),
                 5,
                 [3, 0, 0, 0, 0, 0],
             ),
-            Some((HddCounter::ReallocatedSectors, 3))
+            Some((AtaCounter::ReallocatedSectors, 3))
         );
         // ID 5 follows raw16(raw16), so extra words are ambiguous and cannot
         // be silently dropped to a falsely small primary count.
         assert_eq!(
-            hdd_counter(
+            scored_counter(
                 crate::model::DiskKind::Hdd,
                 Some(WD10EZEX_PROFILE),
                 5,
@@ -412,7 +500,7 @@ mod tests {
             None
         );
         assert_eq!(
-            hdd_counter(
+            scored_counter(
                 crate::model::DiskKind::Ssd,
                 Some(WD10EZEX_PROFILE),
                 197,
@@ -423,7 +511,7 @@ mod tests {
         // Vendor-packed read/seek rates and unrecognized attributes stay out.
         for id in [1, 7, 9, 177, 202] {
             assert_eq!(
-                hdd_counter(
+                scored_counter(
                     crate::model::DiskKind::Hdd,
                     Some(WD10EZEX_PROFILE),
                     id,
@@ -434,8 +522,8 @@ mod tests {
             );
         }
         assert_eq!(
-            hdd_counter(crate::model::DiskKind::Hdd, None, 197, raw_65_536,),
-            Some((HddCounter::PendingSectors, 65_536)),
+            scored_counter(crate::model::DiskKind::Hdd, None, 197, raw_65_536,),
+            Some((AtaCounter::PendingSectors, 65_536)),
             "documented common HDD defaults apply without assuming a model profile"
         );
     }
@@ -549,5 +637,148 @@ mod tests {
             endurance_used_percent(Some("CT250MX500SSD1"), 177, [23; 6]),
             None
         );
+    }
+
+    fn health_of(rows: &[(u8, [u8; 6])]) -> crate::model::AtaHealth {
+        crate::model::AtaHealth {
+            attributes: rows
+                .iter()
+                .map(|(id, raw)| crate::model::AtaAttribute {
+                    id: *id,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    threshold: None,
+                    raw: *raw,
+                })
+                .collect(),
+            thresholds_available: false,
+        }
+    }
+
+    #[test]
+    fn generic_decode_reads_the_smartmontools_default_layouts() {
+        // 9 is raw24: the upper bytes are ignored. 0x423C is the MV240GB's.
+        let hours = generic_decode(&health_of(&[(9, [0x3C, 0x42, 0, 0xAA, 0xBB, 0xCC])]));
+        assert_eq!(hours.power_on_hours, Some(16_956));
+        let hours = generic_decode(&health_of(&[(9, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])]));
+        assert_eq!(hours.power_on_hours, Some(0x00ff_ffff));
+
+        // 12 is raw48; 0x832 is the MV240GB's.
+        let cycles = generic_decode(&health_of(&[(12, [0x32, 0x08, 0, 0, 0, 0])]));
+        assert_eq!(cycles.power_cycles, Some(2_098));
+        let cycles = generic_decode(&health_of(&[(12, [0, 0, 0, 0, 0, 1])]));
+        assert_eq!(cycles.power_cycles, Some(1 << 40));
+
+        // 194 and 190 keep the temperature in byte 0; min and max follow it.
+        let with_min_max = [40, 0, 20, 0, 55, 0];
+        let temperature = generic_decode(&health_of(&[(194, with_min_max)]));
+        assert_eq!(temperature.temperature_c, Some(40));
+        let airflow = generic_decode(&health_of(&[(190, [33, 0, 0, 0, 0, 0])]));
+        assert_eq!(airflow.temperature_c, Some(33));
+        // 194 wins over 190; a bad or duplicated 194 falls back to 190.
+        let both = generic_decode(&health_of(&[
+            (190, [33, 0, 0, 0, 0, 0]),
+            (194, with_min_max),
+        ]));
+        assert_eq!(both.temperature_c, Some(40));
+        let bad_194 = generic_decode(&health_of(&[
+            (194, [0, 0, 0, 0, 0, 0]),
+            (190, [33, 0, 0, 0, 0, 0]),
+        ]));
+        assert_eq!(bad_194.temperature_c, Some(33));
+        let duplicate_194 = generic_decode(&health_of(&[
+            (194, with_min_max),
+            (194, [41, 0, 0, 0, 0, 0]),
+            (190, [33, 0, 0, 0, 0, 0]),
+        ]));
+        assert_eq!(duplicate_194.temperature_c, Some(33));
+        for implausible in [0u8, 101, 200, 255] {
+            let none = generic_decode(&health_of(&[(194, [implausible, 0, 20, 0, 55, 0])]));
+            assert_eq!(none.temperature_c, None, "{implausible} degrees");
+        }
+        assert_eq!(
+            generic_decode(&health_of(&[(194, [100, 0, 0, 0, 0, 0])])).temperature_c,
+            Some(100)
+        );
+
+        // 5 and 196 are raw16; the upper words are not part of the count.
+        let raw16 = [3, 1, 9, 9, 9, 9];
+        let reallocated = generic_decode(&health_of(&[(5, raw16), (196, raw16)]));
+        assert_eq!(reallocated.reallocated_sectors, Some(259));
+        assert_eq!(reallocated.reallocated_events, Some(259));
+
+        // The rest are raw48.
+        let wide = [1, 2, 3, 4, 5, 6];
+        let expected = 0x0605_0403_0201;
+        let counters = generic_decode(&health_of(&[
+            (197, wide),
+            (198, wide),
+            (199, wide),
+            (187, wide),
+            (188, wide),
+        ]));
+        assert_eq!(counters.pending_sectors, Some(expected));
+        assert_eq!(counters.offline_uncorrectable, Some(expected));
+        assert_eq!(counters.interface_crc_errors, Some(expected));
+        assert_eq!(counters.reported_uncorrectable, Some(expected));
+        assert_eq!(counters.command_timeouts, Some(expected));
+    }
+
+    #[test]
+    fn generic_decode_leaves_missing_and_duplicated_rows_absent() {
+        assert_eq!(generic_decode(&health_of(&[])), GenericAta::default());
+        let duplicated = generic_decode(&health_of(&[
+            (9, [1, 0, 0, 0, 0, 0]),
+            (9, [2, 0, 0, 0, 0, 0]),
+            (12, [5, 0, 0, 0, 0, 0]),
+            (197, [1, 0, 0, 0, 0, 0]),
+            (197, [1, 0, 0, 0, 0, 0]),
+        ]));
+        assert_eq!(duplicated.power_on_hours, None);
+        assert_eq!(duplicated.pending_sectors, None);
+        assert_eq!(duplicated.power_cycles, Some(5));
+        // Vendor-defined SSD life attributes are not decoded here.
+        let ssd = generic_decode(&health_of(&[(177, [9; 6]), (202, [9; 6]), (231, [9; 6])]));
+        assert_eq!(ssd, GenericAta::default());
+    }
+
+    #[test]
+    fn generic_counters_score_any_non_nvme_drive_without_a_profile_and_nothing_else() {
+        use crate::model::DiskKind::{Hdd, Nvme, Ssd, Unknown};
+        for kind in [Hdd, Ssd, Unknown] {
+            for (id, counter) in [
+                (5, AtaCounter::ReallocatedSectors),
+                (187, AtaCounter::ReportedUncorrectable),
+                (197, AtaCounter::PendingSectors),
+                (198, AtaCounter::OfflineUncorrectable),
+                (199, AtaCounter::InterfaceCrc),
+            ] {
+                assert_eq!(
+                    scored_counter(kind, None, id, [2, 0, 0, 0, 0, 0]),
+                    Some((counter, 2)),
+                    "{kind:?} {id}"
+                );
+            }
+        }
+        // Spin retries describe a spindle.
+        assert!(counter_applies(Hdd, None, 10).is_some());
+        assert_eq!(counter_applies(Ssd, None, 10), None);
+        assert_eq!(counter_applies(Nvme, None, 197), None);
+        // Hours, cycles, timeouts, reallocation events, and the SSD life and
+        // normalized-rate attributes are never counters.
+        for id in [
+            1, 9, 12, 188, 196, 169, 173, 177, 202, 231, 232, 233, 0xA4, 0xA8,
+        ] {
+            assert_eq!(counter_applies(Ssd, None, id), None, "{id}");
+        }
+        // A WD profile keeps its HDD-only set; a profile on another kind, or
+        // one with no counters of its own (Crucial), scores nothing.
+        assert!(counter_applies(Hdd, Some(WD10EZEX_PROFILE), 197).is_some());
+        assert_eq!(counter_applies(Hdd, Some(WD10EZEX_PROFILE), 199), None);
+        assert_eq!(counter_applies(Ssd, Some(WD10EZEX_PROFILE), 197), None);
+        assert_eq!(counter_applies(Ssd, Some("Crucial MX500"), 197), None);
+        // ID 5 is ambiguous with a nonzero upper word on either path.
+        assert_eq!(scored_counter(Ssd, None, 5, [1, 0, 0, 1, 0, 0]), None);
     }
 }

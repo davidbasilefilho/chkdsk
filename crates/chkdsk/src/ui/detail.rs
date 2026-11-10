@@ -284,9 +284,9 @@ fn verdict(health: &Health, palette: &Palette) -> El {
 /// and the ATA attribute table.
 fn advanced(state: &Dashboard, card: &Card, palette: &Palette, narrow: bool) -> Option<El> {
     let t = palette.theme;
-    let attributes: &[AttributeRow] = match &card.body {
-        Body::Health(health) => &health.attributes,
-        _ => &[],
+    let (attributes, counters): (&[AttributeRow], &[Detail]) = match &card.body {
+        Body::Health(health) => (&health.attributes, &health.counters),
+        _ => (&[], &[]),
     };
     if !card.has_advanced() {
         return None;
@@ -331,8 +331,8 @@ fn advanced(state: &Dashboard, card: &Card, palette: &Palette, narrow: bool) -> 
             .gap(S6)
             .pt(S2)
             .transition(Transition::reveal(Edge::Bottom).combined(Transition::opacity()));
-        if !card.details.is_empty() {
-            body = body.child(details(&card.details, palette, narrow));
+        if !card.details.is_empty() || !counters.is_empty() {
+            body = body.child(details(&card.details, counters, palette, narrow));
         }
         if !attributes.is_empty() {
             body = body.child(attribute_table(attributes, palette, narrow));
@@ -342,10 +342,12 @@ fn advanced(state: &Dashboard, card: &Card, palette: &Palette, narrow: bool) -> 
     Some(section)
 }
 
-fn details(details: &[Detail], palette: &Palette, narrow: bool) -> El {
+/// Where the disk sits and where the numbers came from, then the counters every
+/// drive reports the same way, in one aligned grid.
+fn details(details: &[Detail], counters: &[Detail], palette: &Palette, narrow: bool) -> El {
     let width = label_width(narrow);
     let mut grid = col().key("tecnico");
-    for (index, detail) in details.iter().enumerate() {
+    for (index, detail) in details.iter().chain(counters).enumerate() {
         grid = grid.child(grid_row(
             &format!("tecnico-{index}"),
             detail.label,
