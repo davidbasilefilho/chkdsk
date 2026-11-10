@@ -3,6 +3,7 @@ name = "chkdsk"
 version = "0.1.0"
 edition = "2024"
 publish = false
+license = "MIT"
 
 [dependencies]
 # Rune has no crates.io release; pin the exact `dev` commit.
