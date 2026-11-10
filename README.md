@@ -93,3 +93,7 @@ chkdsk-{versão}[-dev-{sha7}]-windows-arm64.exe
 ```
 
 `mise run release-check` valida localmente regras SemVer, nomes dos artefatos e mapeamentos de arquitetura sem publicar.
+
+## Licença
+
+Este projeto é distribuído sob a licença MIT. Veja o arquivo [LICENSE](LICENSE).
