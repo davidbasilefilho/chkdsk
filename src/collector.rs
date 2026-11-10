@@ -195,11 +195,14 @@ fn record_reading(history: &mut History, identity: &DiskIdentity, telemetry: &Te
     let Some(timestamp_unix_secs) = next_timestamp(history, &identity.id) else {
         return false;
     };
-    let score = score_health(identity.kind, telemetry);
+    // Discovery may not know the kind; the telemetry can. Only the recorded
+    // sample uses it, so the identity stays stable for topology comparisons.
+    let kind = telemetry.effective_kind(identity);
+    let score = score_health(kind, telemetry);
     let sample = HealthSample {
         disk_id: identity.id.clone(),
         timestamp_unix_secs,
-        kind: identity.kind,
+        kind,
         endurance_percent: telemetry.endurance_percent,
         power_on_hours: telemetry.power_on_hours,
         score: (score.outcome != HealthOutcome::Unknown).then_some(score.score),
@@ -399,7 +402,7 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::DiskKind;
+    use crate::model::{DiskKind, NvmeHealth};
 
     fn identity(id: &str, index: u32) -> DiskIdentity {
         DiskIdentity {
@@ -563,6 +566,50 @@ mod tests {
             panic!("discovery must produce disks");
         };
         assert_eq!(changed[0].reading, Reading::Pending);
+    }
+
+    #[test]
+    fn telemetry_restores_an_unknown_kind_for_history_and_the_estimate() {
+        let disk = identity("nvme-fallback", 0);
+        assert_eq!(disk.kind, DiskKind::Unknown);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut history = History::default();
+        history
+            .record(HealthSample {
+                disk_id: disk.id.clone(),
+                timestamp_unix_secs: now - 86_400,
+                kind: DiskKind::Nvme,
+                endurance_percent: Some(11.0),
+                power_on_hours: None,
+                score: Some(89),
+            })
+            .unwrap();
+        let mut collector = Collector::new(history, None);
+        collector.discovered(vec![disk.clone()]);
+        let (generation, queried) = collector.scheduler.begin_next().unwrap();
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_nvme(NvmeHealth {
+            percentage_used: Some(12),
+            ..Default::default()
+        });
+        let Some(Update::Disks(done)) = collector.finished(generation, &queried, Ok(telemetry))
+        else {
+            panic!("a current result must be delivered");
+        };
+
+        let sample = collector.history.samples.last().unwrap();
+        assert_eq!(sample.kind, DiskKind::Nvme);
+        assert_eq!(sample.endurance_percent, Some(12.0));
+        assert_eq!(sample.score, Some(88));
+        let Reading::Ready(ready) = &done[0].reading else {
+            panic!("a reading must be ready");
+        };
+        assert!(ready.remaining_seconds.is_some());
+        // Discovery identity stays stable for scheduler and hotplug comparisons.
+        assert_eq!(done[0].identity, disk);
     }
 
     #[test]

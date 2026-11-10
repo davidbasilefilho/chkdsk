@@ -126,6 +126,7 @@ mod windows {
     const IOCTL_DISK_GET_LENGTH_INFO: u32 = ctl_code(0x07, 0x0017, 0, 1);
     const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = ctl_code(0x2d, 0x0420, 0, 0);
     const IOCTL_ATA_PASS_THROUGH: u32 = ctl_code(0x04, 0x040b, 0, 3);
+    const IOCTL_SMART_RCV_DRIVE_DATA: u32 = ctl_code(0x07, 0x0022, 0, 3);
     const IOCTL_STORAGE_PREDICT_FAILURE: u32 = ctl_code(0x2d, 0x0440, 0, 1);
     const STORAGE_DEVICE_PROPERTY: u32 = 0;
     const STORAGE_DEVICE_SEEK_PENALTY_PROPERTY: u32 = 7;
@@ -141,6 +142,7 @@ mod windows {
     const ATA_STATUS_DF: u8 = 0x20;
     const ATA_SMART_COMMAND: u8 = 0xb0;
     const ATA_SMART_READ_DATA: u8 = 0xd0;
+    const ATA_SMART_READ_THRESHOLDS: u8 = 0xd1;
     const ATA_SMART_RETURN_STATUS: u8 = 0xda;
 
     const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
@@ -197,9 +199,9 @@ mod windows {
         fn SetupDiDestroyDeviceInfoList(device_info_set: *mut c_void) -> i32;
     }
 
-    // The crate intentionally does not enable windows-sys' Win32_Security
-    // feature, which is required merely for CreateFileW's optional attributes
-    // type. This identical ABI declaration keeps that capability unnecessary.
+    // CreateFileW is declared here with an opaque security-attributes pointer,
+    // so this module does not depend on windows-sys' Win32_Security types (the
+    // elevation module enables that feature for its own token query).
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateFileW(
@@ -590,29 +592,58 @@ mod windows {
         current_task_file: [u8; 8],
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     enum AtaCommandError {
         Io(u32),
         ShortResponse,
-        Device { status: u8, error: u8 },
+        Device {
+            status: u8,
+            error: u8,
+        },
+        InvalidSmartData(String),
+        InvalidSmartThresholds(String),
+        FallbackFailed {
+            primary: Box<AtaCommandError>,
+            legacy: Box<AtaCommandError>,
+        },
     }
 
     impl AtaCommandError {
-        fn code(self) -> u32 {
+        fn code(&self) -> u32 {
             match self {
-                Self::Io(code) => code,
+                Self::Io(code) => *code,
                 Self::ShortResponse => 13,
                 Self::Device { .. } => 31,
+                Self::InvalidSmartData(_) => 13,
+                Self::InvalidSmartThresholds(_) => 13,
+                Self::FallbackFailed { primary, legacy } => {
+                    if classify(primary.code()) == QueryErrorState::Permission {
+                        primary.code()
+                    } else {
+                        legacy.code()
+                    }
+                }
             }
         }
 
-        fn message(self) -> String {
+        fn message(&self) -> String {
             match self {
-                Self::Io(code) => io::Error::from_raw_os_error(code as i32).to_string(),
+                Self::Io(code) => io::Error::from_raw_os_error(*code as i32).to_string(),
                 Self::ShortResponse => "ATA pass-through returned an incomplete response".into(),
                 Self::Device { status, error } => {
                     format!("ATA command failed (status 0x{status:02x}, error 0x{error:02x})")
                 }
+                Self::InvalidSmartData(reason) => {
+                    format!("ATA SMART READ DATA was malformed: {reason}")
+                }
+                Self::InvalidSmartThresholds(reason) => {
+                    format!("ATA SMART READ THRESHOLDS was malformed: {reason}")
+                }
+                Self::FallbackFailed { primary, legacy } => format!(
+                    "ATA pass-through failed: {}; SMART_RCV_DRIVE_DATA fallback failed: {}",
+                    primary.message(),
+                    legacy.message()
+                ),
             }
         }
     }
@@ -634,14 +665,19 @@ mod windows {
         task_file[0] = feature;
         if read_sector {
             task_file[1] = 1;
+            task_file[2] = smart_sector_number(feature);
         }
-        // SMART READ DATA does not use the sector-number/LBA-low register.
-        // Leave it zero for conservative device compatibility.
         task_file[3] = 0x4f;
         task_file[4] = 0xc2;
         task_file[5] = 0xa0;
         task_file[6] = command;
         task_file
+    }
+
+    fn smart_sector_number(feature: u8) -> u8 {
+        // Use sector number 1 for D1 threshold reads, but 0 for D0 data reads.
+        // Keep the command-specific inputs aligned across both Windows IOCTLs.
+        u8::from(feature == ATA_SMART_READ_THRESHOLDS)
     }
 
     fn ata_command(
@@ -757,9 +793,134 @@ mod windows {
         parse::parse_nvme_health_log(&output[start..end]).map_err(|_| 13)
     }
 
+    fn legacy_smart_input(feature: u8) -> [u8; 32] {
+        // WDK packs SENDCMDINPARAMS to 33 bytes; sizeof - 1 is this 32-byte input.
+        // Its bDriveNumber field is opaque and ignored by Windows; the caller's
+        // handle, opened from this disk's interface path, selects the device.
+        let mut input = [0u8; 32];
+        put_u32(&mut input, 0, 512);
+        input[4] = feature;
+        input[5] = 1; // SMART READ DATA / THRESHOLDS sector count.
+        input[6] = smart_sector_number(feature); // Sector Number / LBA Low.
+        input[7] = 0x4f;
+        input[8] = 0xc2;
+        input[9] = 0xa0;
+        input[10] = ATA_SMART_COMMAND;
+        input
+    }
+
+    fn legacy_smart_sector_with<T>(
+        device: &T,
+        feature: u8,
+        send: impl FnOnce(&T, u32, &[u8], &mut [u8]) -> Result<usize, u32>,
+    ) -> Result<Vec<u8>, AtaCommandError> {
+        // The packed 16-byte SENDCMDOUTPARAMS header is followed by one sector.
+        let input = legacy_smart_input(feature);
+        let mut output = [0u8; 16 + 512];
+        let returned = send(device, IOCTL_SMART_RCV_DRIVE_DATA, &input, &mut output)
+            .map_err(AtaCommandError::Io)?;
+        legacy_smart_response(&output, returned).map(|sector| sector.to_vec())
+    }
+
+    fn legacy_smart_sector(device: &Device, feature: u8) -> Result<Vec<u8>, AtaCommandError> {
+        legacy_smart_sector_with(device, feature, |device, code, input, output| {
+            ioctl(device, code, input, output)
+        })
+    }
+
+    fn legacy_smart_response(output: &[u8], returned: usize) -> Result<&[u8], AtaCommandError> {
+        if returned < 16 + 512 || output.len() < 16 + 512 || get_u32(output, 0).unwrap_or(0) < 512 {
+            return Err(AtaCommandError::ShortResponse);
+        }
+        // DRIVERSTATUS.bDriverError reports command/driver failure. bIDEError
+        // is only the ATA IDE Error register and is not an ATA Status register.
+        let driver_error = output[4];
+        if driver_error != 0 {
+            return Err(AtaCommandError::Device {
+                status: 0,
+                error: driver_error,
+            });
+        }
+        Ok(&output[16..16 + 512])
+    }
+
+    fn ata_data_sector_validated(
+        pass_through: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
+        legacy: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
+        validate: impl Fn(&[u8]) -> Result<(), AtaCommandError>,
+    ) -> Result<Vec<u8>, AtaCommandError> {
+        let primary_error = match pass_through() {
+            Ok(sector) => match validate(&sector) {
+                Ok(()) => return Ok(sector),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        let legacy_error = match legacy() {
+            Ok(sector) => match validate(&sector) {
+                Ok(()) => return Ok(sector),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        Err(AtaCommandError::FallbackFailed {
+            primary: Box::new(primary_error),
+            legacy: Box::new(legacy_error),
+        })
+    }
+
+    fn validate_ata_smart_data_sector(sector: &[u8]) -> Result<(), AtaCommandError> {
+        let health = parse::parse_ata_smart_data(sector)
+            .map_err(|error| AtaCommandError::InvalidSmartData(error.to_string()))?;
+        if health.attributes.is_empty() {
+            return Err(AtaCommandError::InvalidSmartData(
+                "valid sector contains no SMART attributes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_ata_smart_thresholds_sector(sector: &[u8]) -> Result<(), AtaCommandError> {
+        // Parse into a throwaway value before selecting the pass-through
+        // response. Duplicate IDs or a bad checksum must permit the existing
+        // legacy IOCTL to retry, without mutating the valid READ DATA result.
+        let mut scratch = crate::model::AtaHealth::default();
+        parse::apply_ata_smart_thresholds(&mut scratch, sector)
+            .map_err(|error| AtaCommandError::InvalidSmartThresholds(error.to_string()))
+    }
+
+    fn read_ata_smart_thresholds_with(
+        health: &mut crate::model::AtaHealth,
+        pass_through: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
+        legacy: impl FnOnce() -> Result<Vec<u8>, AtaCommandError>,
+    ) -> Result<(), AtaCommandError> {
+        let sector =
+            ata_data_sector_validated(pass_through, legacy, validate_ata_smart_thresholds_sector)?;
+        parse::apply_ata_smart_thresholds(health, &sector)
+            .map_err(|error| AtaCommandError::InvalidSmartThresholds(error.to_string()))
+    }
+
     fn ata_health(device: &Device) -> Result<crate::model::AtaHealth, AtaCommandError> {
-        let (sector, _) = ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_DATA, true)?;
-        parse::parse_ata_smart_data(&sector).map_err(|_| AtaCommandError::ShortResponse)
+        let sector = ata_data_sector_validated(
+            || {
+                ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_DATA, true)
+                    .map(|(sector, _)| sector)
+            },
+            || legacy_smart_sector(device, ATA_SMART_READ_DATA),
+            validate_ata_smart_data_sector,
+        )?;
+        let mut health = parse::parse_ata_smart_data(&sector)
+            .map_err(|error| AtaCommandError::InvalidSmartData(error.to_string()))?;
+
+        let _ = read_ata_smart_thresholds_with(
+            &mut health,
+            || {
+                ata_command(device, ATA_SMART_COMMAND, ATA_SMART_READ_THRESHOLDS, true)
+                    .map(|(sector, _)| sector)
+            },
+            || legacy_smart_sector(device, ATA_SMART_READ_THRESHOLDS),
+        ); // Optional failure must not invalidate a checksummed READ DATA sector.
+        Ok(health)
     }
 
     fn ata_failure_status(device: &Device) -> Result<bool, AtaCommandError> {
@@ -811,7 +972,7 @@ mod windows {
             }
         }
         match ata_health(&device) {
-            Ok(health) => telemetry.ata = QueryState::Success(health),
+            Ok(health) => telemetry.apply_ata(health, identity.model.as_deref()),
             Err(code) => {
                 let state = classify(code.code());
                 probe_errors.push(state);
@@ -914,6 +1075,392 @@ mod windows {
                 ata_task_file(ATA_SMART_RETURN_STATUS, ATA_SMART_COMMAND, false),
                 [0xda, 0, 0, 0x4f, 0xc2, 0xa0, 0xb0, 0]
             );
+            assert_eq!(
+                ata_task_file(ATA_SMART_READ_THRESHOLDS, ATA_SMART_COMMAND, true),
+                [0xd1, 1, 1, 0x4f, 0xc2, 0xa0, 0xb0, 0]
+            );
+        }
+
+        fn finish_smart_checksum(sector: &mut [u8; 512]) {
+            sector[511] = 0;
+            sector[511] = 0u8.wrapping_sub(
+                sector[..511]
+                    .iter()
+                    .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+            );
+        }
+
+        fn valid_smart_data_sector() -> Vec<u8> {
+            let mut sector = [0u8; 512];
+            sector[2..7].copy_from_slice(&[197, 1, 0, 100, 100]);
+            finish_smart_checksum(&mut sector);
+            sector.to_vec()
+        }
+
+        fn smart_threshold_sector(entries: &[(u8, u8)]) -> Vec<u8> {
+            let mut sector = [0u8; 512];
+            for (slot, (id, threshold)) in entries.iter().copied().enumerate() {
+                let offset = 2 + slot * 12;
+                sector[offset] = id;
+                sector[offset + 1] = threshold;
+            }
+            finish_smart_checksum(&mut sector);
+            sector.to_vec()
+        }
+
+        #[test]
+        fn malformed_pass_through_sector_retries_legacy_and_preserves_both_errors_if_needed() {
+            let valid = valid_smart_data_sector();
+            let io_fallback = ata_data_sector_validated(
+                || Err(AtaCommandError::Io(5)),
+                || Ok(valid.clone()),
+                validate_ata_smart_data_sector,
+            )
+            .unwrap();
+            assert_eq!(io_fallback, valid);
+
+            let mut bad_checksum = valid.clone();
+            bad_checksum[511] ^= 1;
+            let read = ata_data_sector_validated(
+                || Ok(bad_checksum),
+                || Ok(valid.clone()),
+                validate_ata_smart_data_sector,
+            )
+            .unwrap();
+            assert_eq!(read, valid);
+
+            let read = ata_data_sector_validated(
+                || Ok(vec![0; 512]), // Checksummed-but-empty is not mapped data.
+                || Ok(valid.clone()),
+                validate_ata_smart_data_sector,
+            )
+            .unwrap();
+            assert_eq!(read, valid);
+
+            let error = ata_data_sector_validated(
+                || Ok(vec![0; 511]),
+                || Ok(vec![0; 512]),
+                validate_ata_smart_data_sector,
+            )
+            .unwrap_err();
+            let message = error.message();
+            assert!(message.contains("pass-through failed"));
+            assert!(message.contains("SMART_RCV_DRIVE_DATA fallback failed"));
+            assert!(message.contains("expected 512-byte sector, got 511"));
+            assert!(message.contains("valid sector contains no SMART attributes"));
+            assert_eq!(error.code(), 13);
+        }
+
+        #[test]
+        fn malformed_pass_through_threshold_page_retries_legacy_and_joins_valid_thresholds() {
+            let valid_legacy = smart_threshold_sector(&[(197, 10)]);
+            let mut bad_pass = valid_legacy.clone();
+            bad_pass[511] ^= 1;
+            let mut legacy_called = false;
+            let mut health = crate::model::AtaHealth {
+                attributes: vec![crate::model::AtaAttribute {
+                    id: 197,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    threshold: None,
+                    raw: [0; 6],
+                }],
+                thresholds_available: false,
+            };
+            read_ata_smart_thresholds_with(
+                &mut health,
+                || Ok(bad_pass),
+                || {
+                    legacy_called = true;
+                    Ok(valid_legacy.clone())
+                },
+            )
+            .unwrap();
+            assert!(legacy_called);
+            assert!(health.thresholds_available);
+            assert_eq!(health.attributes[0].threshold, Some(10));
+        }
+
+        #[test]
+        fn valid_pass_through_threshold_page_skips_legacy_and_both_invalid_leave_read_data_usable()
+        {
+            let valid = smart_threshold_sector(&[(197, 10)]);
+            let mut threshold_health = crate::model::AtaHealth {
+                attributes: vec![crate::model::AtaAttribute {
+                    id: 197,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    threshold: None,
+                    raw: [0; 6],
+                }],
+                thresholds_available: false,
+            };
+            read_ata_smart_thresholds_with(
+                &mut threshold_health,
+                || Ok(valid.clone()),
+                || panic!("valid pass-through threshold page must not use legacy"),
+            )
+            .unwrap();
+            assert_eq!(threshold_health.attributes[0].threshold, Some(10));
+
+            let mut bad_checksum = smart_threshold_sector(&[(197, 10)]);
+            bad_checksum[511] ^= 1;
+            let duplicate = smart_threshold_sector(&[(197, 10), (197, 5)]);
+            let mut read_data = crate::model::AtaHealth {
+                attributes: vec![crate::model::AtaAttribute {
+                    id: 197,
+                    flags: 0,
+                    current: 100,
+                    worst: 100,
+                    threshold: None,
+                    raw: [1, 0, 0, 0, 0, 0],
+                }],
+                thresholds_available: false,
+            };
+            let original_read_data = read_data.clone();
+            let error = read_ata_smart_thresholds_with(
+                &mut read_data,
+                || Ok(bad_checksum),
+                || Ok(duplicate),
+            )
+            .unwrap_err();
+            let message = error.message();
+            assert!(message.contains("pass-through failed"));
+            assert!(message.contains("SMART_RCV_DRIVE_DATA fallback failed"));
+            assert!(message.contains("ATA SMART READ THRESHOLDS was malformed"));
+            assert!(message.contains("ATA SMART data checksum is invalid"));
+            assert!(message.contains("duplicate ATA SMART threshold ID"));
+            assert_eq!(read_data, original_read_data);
+            assert!(!read_data.thresholds_available);
+        }
+
+        #[test]
+        fn legacy_smart_receive_header_uses_documented_sector_request() {
+            assert_eq!(IOCTL_SMART_RCV_DRIVE_DATA, 508040);
+            for (feature, sector_number) in
+                [(ATA_SMART_READ_DATA, 0), (ATA_SMART_READ_THRESHOLDS, 1)]
+            {
+                let input = legacy_smart_input(feature);
+                assert_eq!(input.len(), 32);
+                assert_eq!(get_u32(&input, 0), Some(512));
+                assert_eq!(
+                    &input[4..12],
+                    &[
+                        feature,
+                        1,
+                        sector_number,
+                        0x4f,
+                        0xc2,
+                        0xa0,
+                        ATA_SMART_COMMAND,
+                        0
+                    ]
+                );
+                assert_eq!(input[12], 0, "bDriveNumber is opaque and unused");
+            }
+        }
+
+        #[test]
+        fn legacy_smart_request_uses_selected_interface_handle_not_disk_ordinal() {
+            let identity = DiskIdentity {
+                id: r"interface:\\?\usbstor#disk&ven_example&prod_drive#physical42".into(),
+                index: 42,
+                model: None,
+                serial: Some("physical42".into()),
+                firmware: None,
+                capacity_bytes: None,
+                bus: None,
+                kind: DiskKind::Unknown,
+            };
+            let selected_interface = interface_path(&identity).unwrap().to_owned();
+
+            let sector = legacy_smart_sector_with(
+                &selected_interface,
+                ATA_SMART_READ_DATA,
+                |handle, code, input, output| {
+                    assert_eq!(handle, &selected_interface);
+                    assert_eq!(code, IOCTL_SMART_RCV_DRIVE_DATA);
+                    assert_eq!(input.len(), 32);
+                    assert_eq!(output.len(), 16 + 512);
+                    assert_eq!(input[12], 0, "the OS selects the target from the handle");
+                    put_u32(output, 0, 512);
+                    output[16..].fill(0x42);
+                    Ok(output.len())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(sector, vec![0x42; 512]);
+        }
+
+        #[test]
+        fn legacy_smart_response_uses_driver_error_not_ide_error_as_status() {
+            let mut output = [0u8; 16 + 512];
+            put_u32(&mut output, 0, 512);
+            // These bits overlap ATA status ERR/DF, but here byte 5 is
+            // DRIVERSTATUS.bIDEError, diagnostic data only.
+            output[5] = ATA_STATUS_ERR | ATA_STATUS_DF;
+            assert_eq!(
+                legacy_smart_response(&output, output.len()).unwrap().len(),
+                512
+            );
+            assert_eq!(
+                legacy_smart_response(&output, output.len() - 1),
+                Err(AtaCommandError::ShortResponse)
+            );
+            output[4] = 0x04;
+            assert_eq!(
+                legacy_smart_response(&output, output.len()),
+                Err(AtaCommandError::Device {
+                    status: 0,
+                    error: 0x04,
+                })
+            );
+        }
+
+        fn diagnostic_observation(
+            identity: &DiskIdentity,
+            result: &Result<Telemetry, QueryError>,
+        ) -> serde_json::Value {
+            let summary = match result {
+                Ok(telemetry) => {
+                    let health_score = crate::health::score_health(identity.kind, telemetry);
+                    let ata = match &telemetry.ata {
+                        QueryState::Success(health) => {
+                            let attributes: Vec<_> = health
+                                .attributes
+                                .iter()
+                                .map(|attribute| {
+                                    serde_json::json!({
+                                        "id": attribute.id,
+                                        "flags": attribute.flags,
+                                        "current": attribute.current,
+                                        "worst": attribute.worst,
+                                        "threshold": attribute.threshold,
+                                        "raw": attribute.raw,
+                                    })
+                                })
+                                .collect();
+                            serde_json::json!({
+                                "state": "readable",
+                                "attribute_count": attributes.len(),
+                                "attributes": attributes,
+                                "thresholds_available": health.thresholds_available,
+                            })
+                        }
+                        QueryState::Failed { message } => serde_json::json!({
+                            "state": "failed",
+                            "message": message,
+                        }),
+                        QueryState::Unsupported => serde_json::json!({"state": "unsupported"}),
+                        QueryState::NotQueried => serde_json::json!({"state": "not_queried"}),
+                    };
+                    serde_json::json!({
+                        "ata": ata,
+                        "nvme": telemetry.nvme,
+                        "normalized": {
+                            "endurance_percent_used": telemetry.endurance_percent,
+                            "ata_profile": telemetry.ata_profile,
+                            "power_on_hours": telemetry.power_on_hours,
+                            "temperature_c": telemetry.temperature_c,
+                            "overall_failure": telemetry.overall_failure,
+                        },
+                        "health_score": {
+                            "score": health_score.score,
+                            "outcome": health_score.outcome,
+                            "confidence": health_score.confidence,
+                            "provenance": health_score.provenance,
+                            "warnings": health_score.warnings,
+                        },
+                    })
+                }
+                Err(error) => serde_json::json!({
+                    "query_error": format!("{:?}: {}", error.state, error.message),
+                }),
+            };
+            serde_json::json!({
+                "index": identity.index,
+                "model": identity.model,
+                "bus": identity.bus,
+                "kind": format!("{:?}", identity.kind),
+                "query": summary,
+            })
+        }
+
+        #[test]
+        fn diagnostic_report_includes_raw_ata_data_normalized_fields_and_score() {
+            let identity = DiskIdentity {
+                id: "test-disk".into(),
+                index: 0,
+                model: Some("MACROVIP MV240GB".into()),
+                serial: None,
+                firmware: None,
+                capacity_bytes: None,
+                bus: Some("SATA".into()),
+                kind: DiskKind::Ssd,
+            };
+            let telemetry = Telemetry {
+                ata: QueryState::Success(crate::model::AtaHealth {
+                    attributes: vec![crate::model::AtaAttribute {
+                        id: 202,
+                        flags: 0x0018,
+                        current: 100,
+                        worst: 100,
+                        threshold: Some(1),
+                        raw: [0x34, 0x12, 0, 0, 0, 0],
+                    }],
+                    thresholds_available: true,
+                }),
+                overall_failure: QueryState::Success(false),
+                ..Default::default()
+            };
+            let report = diagnostic_observation(&identity, &Ok(telemetry));
+            assert_eq!(report["model"], "MACROVIP MV240GB");
+            assert!(report.get("serial").is_none());
+            assert_eq!(report["query"]["ata"]["attribute_count"], 1);
+            assert_eq!(report["query"]["ata"]["attributes"][0]["raw"][0], 0x34);
+            assert_eq!(report["query"]["ata"]["attributes"][0]["threshold"], 1);
+            assert_eq!(
+                report["query"]["normalized"]["endurance_percent_used"],
+                serde_json::Value::Null
+            );
+            assert_eq!(
+                report["query"]["normalized"]["overall_failure"]["state"],
+                "success"
+            );
+            assert_eq!(
+                report["query"]["normalized"]["overall_failure"]["value"],
+                false
+            );
+            assert_eq!(report["query"]["health_score"]["score"], 100);
+            assert_eq!(report["query"]["health_score"]["outcome"], "pass");
+            assert!(report["query"]["health_score"]["provenance"].is_array());
+            assert_eq!(
+                report["query"]["health_score"]["warnings"],
+                serde_json::json!([])
+            );
+        }
+
+        #[test]
+        #[ignore = "requires elevated physical-drive access; set CHKDSK_HARDWARE_REPORT to an absolute report path"]
+        fn physical_disk_smart_diagnostic() {
+            let report_path = std::env::var_os("CHKDSK_HARDWARE_REPORT")
+                .expect("set CHKDSK_HARDWARE_REPORT to an absolute report path");
+            let report_path = std::path::PathBuf::from(report_path);
+            assert!(report_path.is_absolute(), "report path must be absolute");
+            let disks = discover().expect("native disk discovery");
+            let observations: Vec<_> = disks
+                .iter()
+                .map(|identity| diagnostic_observation(identity, &query(identity)))
+                .collect();
+            let report = serde_json::json!({
+                "discovered": disks.len(),
+                "observations": observations,
+            });
+            std::fs::write(report_path, serde_json::to_vec_pretty(&report).unwrap())
+                .expect("write hardware report");
         }
 
         #[test]

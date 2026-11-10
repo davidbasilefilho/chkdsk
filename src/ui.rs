@@ -472,7 +472,7 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
     let mut page = page.child(hero).child(facts).child(status);
     for warning in &health.warnings {
         page = page.child(
-            text(*warning)
+            text(warning.clone())
                 .font(BODY_STRONG)
                 .color(palette.attention)
                 .wrap()
@@ -487,7 +487,7 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
 
 fn attributes(rows: &[AttributeRow], palette: &Palette) -> El {
     let t = palette.theme;
-    let line = |cells: [&str; 4], style: TextStyle, color: Color| {
+    let line = |cells: [&str; 5], style: TextStyle, color: Color| {
         let cell = |content: &str, width: f32, align: Align| {
             text(content.to_owned())
                 .font(style)
@@ -500,7 +500,8 @@ fn attributes(rows: &[AttributeRow], palette: &Palette) -> El {
             .child(cell(cells[0], 40.0, Align::Start))
             .child(cell(cells[1], 56.0, Align::End))
             .child(cell(cells[2], 56.0, Align::End))
-            .child(text(cells[3].to_owned()).font(style).color(color).grow(1.0))
+            .child(cell(cells[3], 56.0, Align::End))
+            .child(text(cells[4].to_owned()).font(style).color(color).grow(1.0))
     };
     let mut table = col()
         .key("atributos")
@@ -513,13 +514,21 @@ fn attributes(rows: &[AttributeRow], palette: &Palette) -> El {
                 .color(t.text_secondary)
                 .wrap(),
         )
-        .child(line(["ID", "Atual", "Pior", "Bruto"], CAPTION, t.text_secondary).mt(8.0));
+        .child(
+            line(
+                ["ID", "Atual", "Pior", "Limite", "Bruto"],
+                CAPTION,
+                t.text_secondary,
+            )
+            .mt(8.0),
+        );
     for attribute in rows {
         table = table.child(line(
             [
                 &attribute.id,
                 &attribute.current,
                 &attribute.worst,
+                &attribute.threshold,
                 &attribute.raw,
             ],
             BODY,

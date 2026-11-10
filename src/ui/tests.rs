@@ -207,7 +207,7 @@ fn healthy_disk_shows_score_estimate_and_readings() {
     for text in [
         "Samsung SSD 990 PRO 1TB",
         "NVMe  ·  931,5 GiB",
-        "96",
+        "93",
         "saúde",
         "Vida estimada",
         "1488 dias",

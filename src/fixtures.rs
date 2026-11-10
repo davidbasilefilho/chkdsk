@@ -97,39 +97,45 @@ pub fn disks() -> Vec<DiskSnapshot> {
         "SATA",
         1_000_204_886_016,
     );
-    let failing = Telemetry {
-        ata: QueryState::Success(AtaHealth {
-            attributes: [
-                (0x01, 100, 100, 0),
-                (0x03, 96, 94, 0),
-                (0x04, 100, 100, 1_204),
-                (0x05, 41, 41, 1_736),
-                (0x07, 100, 253, 0),
-                (0x09, 62, 62, 33_815),
-                (0x0A, 100, 100, 0),
-                (0x0C, 100, 100, 1_204),
-                (0xBB, 100, 100, 0),
-                (0xBE, 66, 55, 0x0022_0000_0022),
-                (0xC2, 104, 98, 0x0014_0000_0022),
-                (0xC4, 41, 41, 1_736),
-                (0xC5, 1, 1, 24),
-                (0xC6, 1, 1, 24),
-                (0xC7, 200, 200, 0),
-            ]
-            .map(|(id, current, worst, raw)| AtaAttribute {
-                id,
-                flags: 0,
-                current,
-                worst,
-                raw: u64::to_le_bytes(raw)[..6].try_into().expect("six bytes"),
-            })
-            .to_vec(),
-        }),
+    // Normalized values, declared thresholds and raw counts as a worn WD Blue reports them.
+    let attributes = [
+        (0x01, 100, 100, Some(51), 0),
+        (0x03, 96, 94, Some(21), 0),
+        (0x04, 100, 100, Some(0), 1_204),
+        (0x05, 41, 41, Some(36), 1_736),
+        (0x07, 100, 253, Some(0), 0),
+        (0x09, 62, 62, Some(0), 33_815),
+        (0x0A, 100, 100, Some(51), 0),
+        (0x0C, 100, 100, Some(0), 1_204),
+        (0xBB, 100, 100, Some(0), 0),
+        (0xBE, 66, 55, None, 0x0022_0000_0022),
+        (0xC2, 104, 98, None, 0x0014_0000_0022),
+        (0xC4, 41, 41, Some(0), 1_736),
+        (0xC5, 1, 1, Some(0), 24),
+        (0xC6, 1, 1, Some(0), 24),
+        (0xC7, 200, 200, Some(0), 0),
+    ]
+    .map(|(id, current, worst, threshold, raw)| AtaAttribute {
+        id,
+        flags: 0,
+        current,
+        worst,
+        threshold,
+        raw: u64::to_le_bytes(raw)[..6].try_into().expect("six bytes"),
+    })
+    .to_vec();
+    // The model's profile decodes the hours and the temperature from the raw fields.
+    let mut failing = Telemetry {
         overall_failure: QueryState::Success(true),
-        temperature_c: Some(34),
-        power_on_hours: Some(33_815),
         ..Default::default()
     };
+    failing.apply_ata(
+        AtaHealth {
+            attributes,
+            thresholds_available: true,
+        },
+        hdd.model.as_deref(),
+    );
 
     let ssd = identity(
         "interface:usb-2",
