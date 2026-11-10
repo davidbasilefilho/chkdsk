@@ -207,7 +207,7 @@ fn healthy_disk_shows_score_estimate_and_readings() {
     for text in [
         "Samsung SSD 990 PRO 1TB",
         "NVMe  ·  931,5 GiB",
-        "96",
+        "93",
         "saúde",
         "Vida estimada",
         "1488 dias",
@@ -284,7 +284,7 @@ fn fixture_text_stays_inside_the_window_at_both_sizes() {
 }
 
 #[test]
-fn fixtures_cover_the_four_states() {
+fn fixtures_cover_every_state() {
     let disks = fixtures::disks();
     let cards: Vec<_> = disks
         .iter()
@@ -297,8 +297,63 @@ fn fixtures_cover_the_four_states() {
             Some(Tone::Attention),
             Some(Tone::Unknown),
             None,
-            Some(Tone::Unknown)
+            Some(Tone::Unknown),
+            Some(Tone::Unknown),
+            Some(Tone::Attention)
         ]
+    );
+}
+
+#[test]
+fn too_little_data_shows_no_score_and_says_why() {
+    for size in [(1100.0, 720.0), (760.0, 560.0)] {
+        let rt = runtime(fixtures::dashboard(5), size);
+        let shown = screen(&rt);
+        assert!(rt.find("nota").is_none(), "{size:?}: no hero number");
+        assert!(
+            shown.contains("Dados SMART insuficientes para calcular a nota"),
+            "{size:?}: {shown}"
+        );
+        assert!(
+            !shown.contains("backup"),
+            "{size:?}: no advice without a verdict"
+        );
+    }
+}
+
+#[test]
+fn a_pass_with_soft_warnings_reads_attention_and_names_the_cause_and_next_step() {
+    let rt = runtime(fixtures::dashboard(6), (760.0, 560.0));
+    let shown = screen(&rt);
+    assert!(shown.contains("Atenção"), "{shown}");
+    assert!(
+        shown.contains("Erros de mídia NVMe registrados: 12"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("Faça backup dos dados importantes."),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("O dispositivo relatou uma falha"),
+        "{shown}"
+    );
+    // A healthy disk gets neither warnings nor advice.
+    let healthy = screen(&runtime(fixtures::dashboard(0), (760.0, 560.0)));
+    assert!(!healthy.contains("backup"), "{healthy}");
+}
+
+#[test]
+fn threshold_warnings_name_the_attribute_and_label_the_numbers() {
+    let rt = runtime(fixtures::dashboard(1), (1100.0, 720.0));
+    let shown = screen(&rt);
+    assert!(
+        shown.contains("Próximo do limite: Setores realocados (05), valor\u{a0}41, limite\u{a0}36"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("Faça backup dos dados importantes."),
+        "{shown}"
     );
 }
 
@@ -431,7 +486,7 @@ fn list_rows_follow_the_disk_not_its_position() {
         state.deliver(Update::Disks(disks), NOW, tx);
     });
     settle(&mut rt);
-    assert_eq!(rt.state.selected, 4, "the selection follows its disk");
+    assert_eq!(rt.state.selected, 6, "the selection follows its disk");
     click(&mut rt, "disco-interface:usb-2");
     assert_eq!(rt.state.cards[rt.state.selected].id, "interface:usb-2");
 }

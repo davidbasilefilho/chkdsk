@@ -15,6 +15,7 @@ import tempfile
 import time
 import tomllib
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +68,24 @@ def validate_tag(mode: str, version: str, sha: str, supplied_tag: str | None) ->
     if supplied_tag is not None and supplied_tag != tag:
         raise ValueError(f"tag mismatch: expected {tag!r} for {mode} mode, got {supplied_tag!r}")
     return tag
+
+
+def release_inputs(
+    mode: str, sha: str | None, tag: str | None, environ: dict[str, str] | None = None
+) -> tuple[str, str | None]:
+    """Commit and tag from the flags, else from the Actions environment.
+
+    The workflow never interpolates ref names into a shell line; this reads them
+    from the environment instead. A dev run builds on a branch, so only stable
+    mode takes its tag from GITHUB_REF_NAME.
+    """
+    environment = os.environ if environ is None else environ
+    sha = sha or environment.get("GITHUB_SHA")
+    if not sha:
+        raise ValueError("a commit SHA is required: pass --sha or set GITHUB_SHA")
+    if tag is None and mode == "stable":
+        tag = environment.get("GITHUB_REF_NAME") or None
+    return sha, tag
 
 
 def manifest() -> tuple[str, str]:
@@ -209,6 +228,46 @@ def verify_assets(assets_dir: Path, expected: list[Path]) -> None:
         raise ValueError("release checksum manifest does not match the two executable assets")
 
 
+def verify_pe_machine(binary: Path, architecture: str) -> None:
+    expected_machine = {"x64": 0x8664, "arm64": 0xAA64}[architecture]
+    data = binary.read_bytes()
+    if len(data) < 64 or data[:2] != b"MZ":
+        raise ValueError(f"invalid DOS executable header: {binary.name}")
+    pe_offset = int.from_bytes(data[0x3C:0x40], "little")
+    if pe_offset < 64 or pe_offset + 24 > len(data) or data[pe_offset:pe_offset + 4] != b"PE\0\0":
+        raise ValueError(f"invalid PE executable header: {binary.name}")
+    machine = int.from_bytes(data[pe_offset + 4:pe_offset + 6], "little")
+    if machine != expected_machine:
+        raise ValueError(f"wrong PE architecture for {binary.name}: expected {expected_machine:#06x}, got {machine:#06x}")
+    print(f"verified PE architecture {architecture}: {binary.name}", flush=True)
+
+
+def smoke_environment() -> dict[str, str]:
+    """Environment for running a freshly built executable, without GitHub credentials."""
+    return {key: value for key, value in os.environ.items() if key.upper() not in ("GH_TOKEN", "GITHUB_TOKEN")}
+
+
+def verify_executables(binaries: list[Path], name: str, version: str) -> None:
+    if len(binaries) != len(TARGETS):
+        raise ValueError("exactly two Windows executables are required")
+    for architecture, binary in zip(TARGETS, binaries, strict=True):
+        verify_pe_machine(binary, architecture)
+    if os.name != "nt":
+        raise RuntimeError("packaged x64 version smoke checks require Windows")
+    # --version returns before elevation or the window start; never open the GUI here.
+    for architecture, binary in zip(TARGETS, binaries, strict=True):
+        if architecture == "arm64":
+            continue  # PE validation only; the Windows x64 runner cannot execute ARM64.
+        result = subprocess.run(
+            [str(binary), "--version"],
+            check=True, capture_output=True, text=True, timeout=30, env=smoke_environment(),
+        )
+        expected = f"{name} {version}"
+        if result.stdout.strip() != expected:
+            raise ValueError(f"unexpected --version from {binary.name}: {result.stdout!r}; expected {expected!r}")
+        print(f"verified {architecture} --version: {result.stdout.strip()}", flush=True)
+
+
 def package(mode: str, sha: str, tag: str | None, output: Path) -> None:
     name, version = manifest()
     release_tag = validate_tag(mode, version, sha, tag)
@@ -219,6 +278,7 @@ def package(mode: str, sha: str, tag: str | None, output: Path) -> None:
         shutil.copy2(build_target(architecture, name), asset)
     write_checksums(binaries, assets[-1])
     verify_assets(output, assets)
+    verify_executables(binaries, name, version)
     print(f"verified release assets for {release_tag}: {', '.join(path.name for path in assets)}")
 
 
@@ -395,6 +455,7 @@ def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> 
     tag = validate_tag(mode, version, sha, supplied_tag)
     assets = expected_assets(mode, sha, name, version, assets_dir)
     verify_assets(assets_dir, assets)
+    verify_executables(assets[:-1], name, version)
     repository = os.environ.get("GITHUB_REPOSITORY")
     if not repository:
         raise ValueError("GITHUB_REPOSITORY is required to publish")
@@ -454,6 +515,16 @@ def self_check() -> None:
     assert expected_tag("dev", "1.2.3", sha) == "v1.2.3-dev-abcdef0"
     assert expected_tag("dev", "1.2.3-rc.2", sha) == "v1.2.3-rc.2-dev-abcdef0"
     assert expected_tag("stable", "1.2.3", sha) == "v1.2.3"
+    environment = {"GITHUB_SHA": sha, "GITHUB_REF_NAME": "v1.2.3"}
+    assert release_inputs("stable", None, None, environment) == (sha, "v1.2.3")
+    assert release_inputs("dev", None, None, {**environment, "GITHUB_REF_NAME": "main"}) == (sha, None)
+    assert release_inputs("stable", "1234567", "v9.9.9", environment) == ("1234567", "v9.9.9")
+    try:
+        release_inputs("dev", None, None, {})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a missing commit SHA was accepted")
     assert release_asset_names("chkdsk", "1.2.3", "dev", sha) == [
         "chkdsk-1.2.3-dev-abcdef0-windows-x64-baseline.exe",
         "chkdsk-1.2.3-dev-abcdef0-windows-arm64.exe",
@@ -480,6 +551,64 @@ def self_check() -> None:
         pass
     else:
         raise AssertionError("stable mode accepted a mismatched tag")
+
+    with tempfile.TemporaryDirectory() as directory:
+        binary = Path(directory) / "test.exe"
+        for architecture, machine in (("x64", 0x8664), ("arm64", 0xAA64)):
+            data = bytearray(88)
+            data[:2] = b"MZ"
+            data[0x3C:0x40] = (64).to_bytes(4, "little")
+            data[64:68] = b"PE\0\0"
+            data[68:70] = machine.to_bytes(2, "little")
+            binary.write_bytes(data)
+            verify_pe_machine(binary, architecture)
+            wrong = "arm64" if architecture == "x64" else "x64"
+            try:
+                verify_pe_machine(binary, wrong)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("incorrect PE machine was accepted")
+        for invalid in (b"", b"MZ", b"MZ" + bytes(86)):
+            binary.write_bytes(invalid)
+            try:
+                verify_pe_machine(binary, "x64")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid PE header was accepted")
+
+    with tempfile.TemporaryDirectory() as directory:
+        binaries = [Path(directory) / f"test-{architecture}.exe" for architecture in TARGETS]
+        original_name, original_subprocess_run = os.name, subprocess.run
+        calls = []
+        original_verify_pe_machine = globals()["verify_pe_machine"]
+        try:
+            os.name = "nt"
+            globals()["verify_pe_machine"] = lambda binary, architecture: None
+
+            def smoke_run(command, **kwargs):
+                calls.append(command)
+                assert kwargs.get("check") and kwargs.get("timeout") == 30
+                smoke_env = kwargs.get("env")
+                assert smoke_env is not None and not {"GH_TOKEN", "GITHUB_TOKEN"} & {key.upper() for key in smoke_env}
+                return subprocess.CompletedProcess(command, 0, stdout="chkdsk 1.2.3\n", stderr="")
+
+            subprocess.run = smoke_run
+            with mock.patch.dict(os.environ, {"GH_TOKEN": "secret", "GITHUB_TOKEN": "secret", "KEEP": "1"}):
+                verify_executables(binaries, "chkdsk", "1.2.3")
+                assert smoke_environment().get("KEEP") == "1"
+            assert calls == [[str(binaries[0]), "--version"]]
+            try:
+                verify_executables(binaries, "chkdsk", "9.9.9")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("incorrect executable version was accepted")
+        finally:
+            os.name = original_name
+            subprocess.run = original_subprocess_run
+            globals()["verify_pe_machine"] = original_verify_pe_machine
 
     global run
     original_run = run
@@ -741,12 +870,12 @@ def main() -> int:
 
     build.add_argument("--architecture", choices=TARGETS, required=True)
     package_parser.add_argument("--mode", choices=("dev", "stable"), required=True)
-    package_parser.add_argument("--sha", required=True)
-    package_parser.add_argument("--tag")
+    package_parser.add_argument("--sha", help="commit SHA; defaults to GITHUB_SHA")
+    package_parser.add_argument("--tag", help="stable tag; defaults to GITHUB_REF_NAME")
     package_parser.add_argument("--output", type=Path, default=Path("dist/release"))
     publish_parser.add_argument("--mode", choices=("dev", "stable"), required=True)
-    publish_parser.add_argument("--sha", required=True)
-    publish_parser.add_argument("--tag")
+    publish_parser.add_argument("--sha", help="commit SHA; defaults to GITHUB_SHA")
+    publish_parser.add_argument("--tag", help="stable tag; defaults to GITHUB_REF_NAME")
     publish_parser.add_argument("--assets-dir", type=Path, default=Path("dist/release"))
     cargo.add_argument("--architecture", choices=TARGETS, required=True)
     cargo.add_argument("arguments", nargs=argparse.REMAINDER)
@@ -768,9 +897,11 @@ def main() -> int:
             output = build_target(args.architecture, name)
             print(f"built {output}")
         elif args.command == "package":
-            package(args.mode, args.sha, args.tag, (ROOT / args.output).resolve())
+            sha, tag = release_inputs(args.mode, args.sha, args.tag)
+            package(args.mode, sha, tag, (ROOT / args.output).resolve())
         elif args.command == "publish":
-            publish(args.mode, args.sha, args.tag, (ROOT / args.assets_dir).resolve())
+            sha, tag = release_inputs(args.mode, args.sha, args.tag)
+            publish(args.mode, sha, tag, (ROOT / args.assets_dir).resolve())
         else:
             arguments = args.arguments
             if arguments[:1] == ["--"]:

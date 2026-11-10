@@ -5,10 +5,12 @@
 use crate::{
     backend::QueryErrorState,
     collector::{DISCOVERY_INTERVAL, DiskSnapshot, Reading, Ready},
-    health::{HealthOutcome, score_health},
-    model::{AtaAttribute, DiskKind, QueryState, Telemetry},
+    health::{HealthOutcome, HealthScore, score_health},
+    model::{
+        AtaAttribute, AtaHealth, DiskIdentity, DiskKind, HealthWarningReason, QueryState, Telemetry,
+    },
 };
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 /// The three colors of the palette: healthy, attention, no usable data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +58,10 @@ pub struct Health {
     pub temperature: String,
     pub power_on: String,
     pub last_reading: String,
-    pub warnings: Vec<&'static str>,
+    /// Device-reported failures and softer signals behind the score, one line each.
+    pub warnings: Vec<String>,
+    /// What to do about an Atenção verdict; none otherwise.
+    pub advice: Option<&'static str>,
     pub attributes: Vec<AttributeRow>,
 }
 
@@ -65,6 +70,8 @@ pub struct AttributeRow {
     pub id: String,
     pub current: String,
     pub worst: String,
+    /// The device's declared failure threshold; `—` when it declares none.
+    pub threshold: String,
     pub raw: String,
 }
 
@@ -77,7 +84,11 @@ impl Card {
             .as_deref()
             .map(str::trim)
             .filter(|model| !model.is_empty());
-        let kind = match identity.kind {
+        // Discovery may not know the kind; a successful reading can tell.
+        let kind = match match &snapshot.reading {
+            Reading::Ready(ready) => ready.telemetry.effective_kind(identity),
+            Reading::Pending | Reading::Failed(_) => identity.kind,
+        } {
             DiskKind::Hdd => "HD",
             DiskKind::Ssd => "SSD",
             DiskKind::Nvme => "NVMe",
@@ -90,7 +101,7 @@ impl Card {
         let body = match &snapshot.reading {
             Reading::Pending => Body::Loading,
             Reading::Failed(state) => Body::Message(query_error_message(*state)),
-            Reading::Ready(ready) => Body::Health(Box::new(Health::new(identity.kind, ready, now))),
+            Reading::Ready(ready) => Body::Health(Box::new(Health::new(identity, ready, now))),
         };
         Card {
             id: identity.id.clone(),
@@ -121,28 +132,21 @@ impl Card {
 }
 
 impl Health {
-    fn new(kind: DiskKind, ready: &Ready, now: u64) -> Self {
+    fn new(identity: &DiskIdentity, ready: &Ready, now: u64) -> Self {
         let telemetry = &ready.telemetry;
-        let health = score_health(kind, telemetry);
+        let health = score_health(telemetry.effective_kind(identity), telemetry);
+        // Soft signals keep a passing disk from reading as plainly healthy.
         let (label, tone) = match health.outcome {
-            HealthOutcome::Pass => ("Saudável", Tone::Healthy),
-            HealthOutcome::Fail => ("Atenção", Tone::Attention),
+            HealthOutcome::Pass if health.warnings.is_empty() && health.score > 50 => {
+                ("Saudável", Tone::Healthy)
+            }
+            HealthOutcome::Pass | HealthOutcome::Fail => ("Atenção", Tone::Attention),
             HealthOutcome::Unknown => ("Indisponível", Tone::Unknown),
         };
         let score = (health.outcome != HealthOutcome::Unknown).then(|| health.score.to_string());
-        let warnings = match &telemetry.nvme {
-            QueryState::Success(nvme) => [
-                (1, "Reserva NVMe crítica"),
-                (2, "Temperatura NVMe crítica"),
-                (4, "Confiabilidade NVMe degradada"),
-                (8, "Mídia NVMe somente leitura"),
-                (16, "Aviso de memória NVMe"),
-            ]
-            .into_iter()
-            .filter(|(bit, _)| nvme.critical_warning & bit != 0)
-            .map(|(_, warning)| warning)
-            .collect(),
-            _ => Vec::new(),
+        let status = match telemetry_status(telemetry) {
+            SMART_AVAILABLE if health.outcome == HealthOutcome::Unknown => SMART_INSUFFICIENT,
+            status => status,
         };
         Health {
             tone,
@@ -153,7 +157,7 @@ impl Health {
                 .map(format_endurance_days)
                 .unwrap_or_else(|| "aguardando histórico".into()),
             lifetime_known: ready.remaining_seconds.is_some(),
-            status: telemetry_status(telemetry),
+            status,
             status_tone: status_tone(telemetry),
             wear: telemetry
                 .endurance_percent
@@ -171,13 +175,185 @@ impl Health {
                 .last_sample_unix
                 .map(|timestamp| format!("há {}", format_duration(now.saturating_sub(timestamp))))
                 .unwrap_or_else(|| "indisponível".into()),
-            warnings,
+            warnings: warning_lines(&health, telemetry),
+            advice: (tone == Tone::Attention).then_some(BACKUP_ADVICE),
             attributes: match &telemetry.ata {
                 QueryState::Success(ata) => ata.attributes.iter().map(attribute_row).collect(),
                 _ => Vec::new(),
             },
         }
     }
+}
+
+const BACKUP_ADVICE: &str = "Faça backup dos dados importantes.";
+
+/// Failures the device declared, then the softer signals behind the score.
+fn warning_lines(health: &HealthScore, telemetry: &Telemetry) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let QueryState::Success(nvme) = &telemetry.nvme {
+        let spare_below_threshold = matches!(
+            (nvme.available_spare_percent, nvme.available_spare_threshold_percent),
+            (Some(spare), Some(threshold)) if spare < threshold
+        );
+        if spare_below_threshold
+            && nvme.critical_warning & 1 == 0
+            && let (Some(spare), Some(threshold)) = (
+                nvme.available_spare_percent,
+                nvme.available_spare_threshold_percent,
+            )
+        {
+            lines.push(format!(
+                "Reserva NVMe abaixo do limite ({spare}% < {threshold}%)"
+            ));
+        }
+        // These bits also appear as score warnings; they are worded here once.
+        for (bit, warning) in [
+            (1, "Reserva NVMe crítica"),
+            (2, "Temperatura NVMe crítica"),
+            (4, "Confiabilidade NVMe degradada"),
+            (8, "Mídia NVMe somente leitura"),
+            (16, "Aviso de memória NVMe"),
+            (32, "Região de memória persistente NVMe degradada"),
+        ] {
+            if nvme.critical_warning & bit != 0 {
+                lines.push(warning.into());
+            }
+        }
+    }
+    if let QueryState::Success(ata) = &telemetry.ata {
+        for attribute in &ata.attributes {
+            if let Some(threshold) = ata_threshold(ata, attribute)
+                && attribute.current <= threshold
+                && attribute.flags & 1 != 0
+            {
+                lines.push(format!(
+                    "Falha iminente, limite atingido: {}, {}",
+                    attribute_label(attribute.id),
+                    values_against(attribute.current, threshold)
+                ));
+            }
+        }
+    }
+    for reason in &health.warnings {
+        match reason {
+            HealthWarningReason::AtaThresholdMargin => lines.extend(
+                ata_threshold_lines(telemetry, true)
+                    .unwrap_or_else(|| vec!["SMART ATA próximo do limite declarado".into()]),
+            ),
+            HealthWarningReason::AtaThresholdReached => lines.extend(
+                ata_threshold_lines(telemetry, false)
+                    .unwrap_or_else(|| vec!["SMART ATA atingiu o limite declarado".into()]),
+            ),
+            HealthWarningReason::EnduranceExhausted => {
+                lines.push("Vida útil nominal do dispositivo esgotada".into());
+            }
+            HealthWarningReason::AtaReallocatedSectors => {
+                lines.push("Setores realocados registrados na mídia".into());
+            }
+            HealthWarningReason::AtaSpinRetries => {
+                lines.push("Tentativas repetidas de giro registradas".into());
+            }
+            HealthWarningReason::AtaReportedUncorrectable => {
+                lines.push("Erros incorrigíveis reportados pelo dispositivo".into());
+            }
+            HealthWarningReason::AtaPendingSectors => {
+                lines.push("Setores pendentes aguardando remapeamento".into());
+            }
+            HealthWarningReason::AtaOfflineUncorrectable => {
+                lines.push("Setores incorrigíveis encontrados em verificações offline".into());
+            }
+            HealthWarningReason::AtaRawEncodingAmbiguous => lines
+                .push("Codificação bruta SMART ambígua; nota de saúde do HD indisponível".into()),
+            HealthWarningReason::NvmeMediaErrors => lines.push(match &telemetry.nvme {
+                QueryState::Success(nvme) => nvme
+                    .media_errors
+                    .filter(|count| *count > 0)
+                    .map(|count| format!("Erros de mídia NVMe registrados: {count}"))
+                    .unwrap_or_else(|| "Erros de mídia NVMe registrados".into()),
+                _ => "Erros de mídia NVMe registrados".into(),
+            }),
+            // Worded with the critical-warning bits above.
+            HealthWarningReason::NvmeTemperatureThreshold
+            | HealthWarningReason::NvmeVolatileMemoryBackup
+            | HealthWarningReason::NvmePersistentMemoryRegion => {}
+        }
+    }
+    let mut seen = HashSet::new();
+    lines.retain(|line| seen.insert(line.clone()));
+    lines
+}
+
+/// The declared threshold of an attribute that can be judged: it appears once,
+/// holds a valid normalized value and declares a nonzero threshold.
+fn ata_threshold(ata: &AtaHealth, attribute: &AtaAttribute) -> Option<u8> {
+    if crate::ata::unique_attribute(ata, attribute.id).is_none()
+        || !(1..=254).contains(&attribute.current)
+    {
+        return None;
+    }
+    attribute.threshold.filter(|threshold| *threshold > 0)
+}
+
+/// Attributes within ten points of their threshold (`near`) or at it, for the
+/// soft warnings. Pre-failure attributes at the threshold are failures, worded above.
+fn ata_threshold_lines(telemetry: &Telemetry, near: bool) -> Option<Vec<String>> {
+    let QueryState::Success(ata) = &telemetry.ata else {
+        return None;
+    };
+    let lines: Vec<String> = ata
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.flags & 1 == 0)
+        .filter_map(|attribute| {
+            let threshold = ata_threshold(ata, attribute)?;
+            let matches = if near {
+                attribute.current > threshold && attribute.current <= threshold.saturating_add(10)
+            } else {
+                attribute.current <= threshold
+            };
+            matches.then(|| {
+                let description = if near {
+                    "Próximo do limite"
+                } else {
+                    "Limite atingido"
+                };
+                format!(
+                    "{description}: {}, {}",
+                    attribute_label(attribute.id),
+                    values_against(attribute.current, threshold)
+                )
+            })
+        })
+        .collect();
+    (!lines.is_empty()).then_some(lines)
+}
+
+/// `valor 41, limite 36`: the normalized value next to the threshold it is judged by.
+fn values_against(current: u8, threshold: u8) -> String {
+    // No-break spaces keep a number with its word when the line wraps.
+    format!("valor\u{a0}{current}, limite\u{a0}{threshold}")
+}
+
+/// `Setores realocados (05)`: the attribute's usual name where it is the same on
+/// every drive, so the number in the table can be found; otherwise only its ID.
+fn attribute_label(id: u8) -> String {
+    let name = match id {
+        0x01 => "Taxa de erros de leitura",
+        0x03 => "Tempo de aceleração do disco",
+        0x04 => "Ciclos de partida e parada",
+        0x05 => "Setores realocados",
+        0x07 => "Taxa de erros de posicionamento",
+        0x09 => "Horas ligado",
+        0x0A => "Tentativas de giro",
+        0x0C => "Ciclos de energia",
+        0xBB => "Erros incorrigíveis reportados",
+        0xC4 => "Eventos de realocação",
+        0xC5 => "Setores pendentes",
+        0xC6 => "Setores incorrigíveis offline",
+        0xC7 => "Erros de CRC na interface",
+        _ => "Atributo ATA",
+    };
+    format!("{name} ({id:02X})")
 }
 
 fn attribute_row(attribute: &AtaAttribute) -> AttributeRow {
@@ -192,6 +368,9 @@ fn attribute_row(attribute: &AtaAttribute) -> AttributeRow {
         id: format!("{:02X}", attribute.id),
         current: attribute.current.to_string(),
         worst: attribute.worst.to_string(),
+        threshold: attribute
+            .threshold
+            .map_or_else(|| "—".into(), |threshold| threshold.to_string()),
         raw,
     }
 }
@@ -223,6 +402,9 @@ fn telemetry_has_usable_data(telemetry: &Telemetry) -> bool {
         || telemetry.power_on_hours.is_some()
         || telemetry.temperature_c.is_some()
 }
+
+const SMART_AVAILABLE: &str = "Dados SMART disponíveis";
+const SMART_INSUFFICIENT: &str = "Dados SMART insuficientes para calcular a nota";
 
 fn telemetry_status(telemetry: &Telemetry) -> &'static str {
     if !telemetry_has_usable_data(telemetry) {
@@ -265,7 +447,7 @@ fn telemetry_status(telemetry: &Telemetry) -> &'static str {
     {
         return "Dados de saúde parcialmente disponíveis";
     }
-    "Dados SMART disponíveis"
+    SMART_AVAILABLE
 }
 
 /// A device-reported failure is as loud as the pill; a permission gap only warns.
@@ -402,8 +584,16 @@ mod tests {
             flags: 0,
             current: 100,
             worst: 100,
+            threshold: None,
             raw: [0; 6],
         }
+    }
+
+    fn ata(attributes: Vec<AtaAttribute>) -> QueryState<AtaHealth> {
+        QueryState::Success(AtaHealth {
+            attributes,
+            thresholds_available: true,
+        })
     }
 
     #[test]
@@ -521,9 +711,7 @@ mod tests {
     fn partial_telemetry_is_not_mislabeled_as_unsupported() {
         let telemetry = Telemetry {
             nvme: QueryState::Unsupported,
-            ata: QueryState::Success(AtaHealth {
-                attributes: vec![attribute()],
-            }),
+            ata: ata(vec![attribute()]),
             ..Default::default()
         };
         assert!(telemetry_has_usable_data(&telemetry));
@@ -559,9 +747,7 @@ mod tests {
             nvme: QueryState::Failed {
                 message: "Access is denied (5)".into(),
             },
-            ata: QueryState::Success(AtaHealth {
-                attributes: vec![attribute()],
-            }),
+            ata: ata(vec![attribute()]),
             endurance_percent: Some(12.0),
             ..Default::default()
         };
@@ -624,15 +810,14 @@ mod tests {
                 critical_warning: 2 | 8,
                 ..Default::default()
             }),
-            ata: QueryState::Success(AtaHealth {
-                attributes: vec![AtaAttribute {
-                    id: 0xC2,
-                    flags: 0,
-                    current: 71,
-                    worst: 53,
-                    raw: [0x22, 0x01, 0, 0, 0, 0],
-                }],
-            }),
+            ata: ata(vec![AtaAttribute {
+                id: 0xC2,
+                flags: 0,
+                current: 71,
+                worst: 53,
+                threshold: Some(10),
+                raw: [0x22, 0x01, 0, 0, 0, 0],
+            }]),
             endurance_percent: Some(7.0),
             power_on_hours: Some(4_200_000),
             temperature_c: Some(38),
@@ -665,8 +850,212 @@ mod tests {
                 id: "C2".into(),
                 current: "71".into(),
                 worst: "53".into(),
+                threshold: "10".into(),
                 raw: "000000000122".into(),
             }]
+        );
+    }
+
+    fn health_of(telemetry: Telemetry, kind: DiskKind) -> Health {
+        let mut disk = identity("disk");
+        disk.kind = kind;
+        let Body::Health(health) = card(disk, ready(telemetry)).body else {
+            panic!("a reading must produce a health body");
+        };
+        *health
+    }
+
+    #[test]
+    fn a_passing_disk_with_soft_signals_reads_as_attention_and_says_why() {
+        let telemetry = Telemetry {
+            nvme: QueryState::Success(NvmeHealth {
+                percentage_used: Some(4),
+                media_errors: Some(12),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            score_health(DiskKind::Nvme, &telemetry).outcome,
+            HealthOutcome::Pass
+        );
+        let health = health_of(telemetry, DiskKind::Nvme);
+        assert_eq!((health.label, health.tone), ("Atenção", Tone::Attention));
+        assert!(health.score.is_some());
+        assert_eq!(health.warnings, ["Erros de mídia NVMe registrados: 12"]);
+
+        let exhausted = Telemetry {
+            nvme: QueryState::Success(NvmeHealth {
+                percentage_used: Some(100),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let health = health_of(exhausted, DiskKind::Nvme);
+        assert_eq!(health.label, "Atenção");
+        assert_eq!(
+            health.warnings,
+            ["Vida útil nominal do dispositivo esgotada"]
+        );
+    }
+
+    #[test]
+    fn nvme_critical_bits_are_worded_once_next_to_their_score_warnings() {
+        let telemetry = Telemetry {
+            nvme: QueryState::Success(NvmeHealth {
+                critical_warning: 1 | 2 | 16 | 32,
+                available_spare_percent: Some(5),
+                available_spare_threshold_percent: Some(10),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            health_of(telemetry, DiskKind::Nvme).warnings,
+            [
+                "Reserva NVMe crítica",
+                "Temperatura NVMe crítica",
+                "Aviso de memória NVMe",
+                "Região de memória persistente NVMe degradada",
+            ]
+        );
+
+        // Without the critical bit, the spare level below its threshold is the failure.
+        let spare_only = Telemetry {
+            nvme: QueryState::Success(NvmeHealth {
+                available_spare_percent: Some(5),
+                available_spare_threshold_percent: Some(10),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let health = health_of(spare_only, DiskKind::Nvme);
+        assert_eq!(health.label, "Atenção");
+        assert_eq!(
+            health.warnings,
+            ["Reserva NVMe abaixo do limite (5% < 10%)"]
+        );
+    }
+
+    #[test]
+    fn ata_thresholds_name_the_attribute_and_fill_the_limit_column() {
+        let row = |id, flags, current, threshold| AtaAttribute {
+            id,
+            flags,
+            current,
+            worst: current,
+            threshold,
+            raw: [0; 6],
+        };
+        let telemetry = Telemetry {
+            ata: ata(vec![
+                row(0x05, 1, 30, Some(36)),
+                row(0xC4, 0, 41, Some(36)),
+                row(0x09, 0, 60, None),
+                // A duplicated ID is ambiguous and never judged.
+                row(0x0A, 1, 1, Some(51)),
+                row(0x0A, 1, 1, Some(51)),
+            ]),
+            ..Default::default()
+        };
+        let health = health_of(telemetry, DiskKind::Hdd);
+        assert_eq!((health.label, health.tone), ("Atenção", Tone::Attention));
+        assert_eq!(
+            health.warnings,
+            [
+                "Falha iminente, limite atingido: Setores realocados (05), valor\u{a0}30, limite\u{a0}36",
+                "Próximo do limite: Eventos de realocação (C4), valor\u{a0}41, limite\u{a0}36",
+            ]
+        );
+        assert_eq!(
+            health
+                .attributes
+                .iter()
+                .map(|row| row.threshold.as_str())
+                .collect::<Vec<_>>(),
+            ["36", "36", "—", "51", "51"]
+        );
+    }
+
+    #[test]
+    fn hdd_counters_and_ambiguous_encodings_are_worded_in_portuguese() {
+        let counter = |id, raw0, raw2| AtaAttribute {
+            id,
+            flags: 0,
+            current: 100,
+            worst: 100,
+            threshold: None,
+            raw: [raw0, 0, raw2, 0, 0, 0],
+        };
+        let reallocated = Telemetry {
+            ata: ata(vec![counter(5, 3, 0), counter(197, 1, 0)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            health_of(reallocated, DiskKind::Hdd).warnings,
+            [
+                "Setores realocados registrados na mídia",
+                "Setores pendentes aguardando remapeamento",
+            ]
+        );
+
+        // ID 5 with a nonzero upper word is not decoded: no grade, and it says so.
+        let ambiguous = Telemetry {
+            ata: ata(vec![counter(5, 3, 1)]),
+            ..Default::default()
+        };
+        let health = health_of(ambiguous, DiskKind::Hdd);
+        assert_eq!((health.label, health.score), ("Indisponível", None));
+        assert_eq!(
+            health.warnings,
+            ["Codificação bruta SMART ambígua; nota de saúde do HD indisponível"]
+        );
+    }
+
+    #[test]
+    fn a_coarse_pass_alone_is_not_a_grade_and_says_so() {
+        let health = health_of(
+            Telemetry {
+                overall_failure: QueryState::Success(false),
+                ..Default::default()
+            },
+            DiskKind::Hdd,
+        );
+        assert_eq!((health.label, health.score), ("Indisponível", None));
+        assert_eq!(health.status, "Sem falha geral relatada pelo dispositivo");
+
+        let unscored = health_of(
+            Telemetry {
+                ata: ata(vec![attribute()]),
+                ..Default::default()
+            },
+            DiskKind::Ssd,
+        );
+        assert_eq!((unscored.label, unscored.score), ("Indisponível", None));
+        assert_eq!(
+            unscored.status,
+            "Dados SMART insuficientes para calcular a nota"
+        );
+    }
+
+    #[test]
+    fn a_successful_reading_names_the_kind_discovery_could_not() {
+        let mut telemetry = Telemetry::default();
+        telemetry.apply_nvme(NvmeHealth {
+            percentage_used: Some(12),
+            ..Default::default()
+        });
+        let shown = card(identity("unknown"), ready(telemetry.clone()));
+        assert_eq!(shown.subtitle, "NVMe  ·  capacidade indisponível");
+        let Body::Health(health) = shown.body else {
+            panic!("a reading must produce a health body");
+        };
+        assert_eq!(health.label, "Saudável");
+
+        let pending = card(identity("unknown"), Reading::Pending);
+        assert_eq!(
+            pending.subtitle,
+            "Tipo desconhecido  ·  capacidade indisponível"
         );
     }
 }
