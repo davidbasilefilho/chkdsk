@@ -1,1916 +1,533 @@
-//! Interface terminal em português brasileiro. A tradução fica nesta fronteira:
-//! detalhes e mensagens do sistema operacional nunca são exibidos diretamente.
+//! A janela: lista de discos à esquerda e, à direita, o painel do disco
+//! selecionado com a nota em destaque. A janela só desenha cartões já
+//! formatados (`present`); nenhuma E/S nem formatação acontece em `view`.
 
 use crate::{
-    backend::{self, QueryErrorState},
-    health::{HealthOutcome, score_health},
-    history::{HealthSample, History},
-    model::{DiskIdentity, DiskKind, QueryState, Telemetry},
+    collector::Update,
+    present::{AttributeRow, Body, Card, Health, Tone},
 };
-use r3bl_tui::{
-    App, BoxedSafeApp, Button, CommonResult, ComponentRegistryMap, EventPropagation, GlobalData,
-    HasFocus, InputEvent, Key, KeyPress, MouseInputKind, RenderOpCommon, RenderOpIR, RenderOpIRVec,
-    RenderPipeline, RgbValue, SpecialKey, TerminalWindowMainThreadSignal, TuiColor, TuiStyle,
-    ZOrder,
+use rune::{
+    Align, Color, Cursor, Cx, El, Key, KeyEvent, Live, ScrollSpec, Tx, col, oklch, row, text,
+    tok::{self, TextStyle},
 };
-use std::{
-    collections::{HashMap, VecDeque},
-    fmt::{Display, Formatter},
-    io::Write,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
-use tokio::{
-    sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
-    task::JoinSet,
-    time::{Duration, MissedTickBehavior},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const MOCHA_BASE: RgbValue = RgbValue {
-    red: 30,
-    green: 30,
-    blue: 46,
-};
-const MOCHA_SURFACE: RgbValue = RgbValue {
-    red: 69,
-    green: 71,
-    blue: 90,
-};
-const MOCHA_TEXT: RgbValue = RgbValue {
-    red: 205,
-    green: 214,
-    blue: 244,
-};
-const MOCHA_MUTED: RgbValue = RgbValue {
-    red: 166,
-    green: 173,
-    blue: 200,
-};
-const MOCHA_LAVENDER: RgbValue = RgbValue {
-    red: 180,
-    green: 190,
-    blue: 254,
-};
-const MOCHA_GREEN: RgbValue = RgbValue {
-    red: 166,
-    green: 227,
-    blue: 161,
-};
-const MOCHA_RED: RgbValue = RgbValue {
-    red: 243,
-    green: 139,
-    blue: 168,
-};
-const MOCHA_YELLOW: RgbValue = RgbValue {
-    red: 249,
-    green: 226,
-    blue: 175,
-};
+const SIDEBAR_WIDTH: f32 = 272.0;
+const SCROLL_STEP: f32 = 56.0;
+const DETAIL_KEY: &str = "detalhe";
+/// The pill's tint of its own color; low enough for 4.5:1 text whatever the blend mode.
+const PILL_TINT: f32 = 0.08;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct DiskView {
-    pub identity: DiskIdentity,
-    pub telemetry: Option<Telemetry>,
-    pub querying: bool,
-    pub computing: bool,
-    pending_telemetry: Option<Telemetry>,
-    pub error_message: Option<String>,
+// Windows type ramp: Caption 12/16, Body 14/20, Subtitle 20/28, Display 72 (semibold, never bold).
+const CAPTION: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0);
+const CAPTION_STRONG: TextStyle = TextStyle::new(12.0, 600.0).lh(16.0);
+const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(20.0).features("'tnum' 1");
+const BODY_STRONG: TextStyle = TextStyle::new(14.0, 600.0).lh(20.0).features("'tnum' 1");
+const SUBTITLE: TextStyle = TextStyle::new(20.0, 600.0).lh(28.0);
+const SCORE: TextStyle = TextStyle::new(72.0, 600.0).lh(80.0).features("'tnum' 1");
+
+/// A named state for headless captures (`--scene`).
+pub type Scene = (&'static str, fn(&mut Dashboard));
+
+/// What the window says when there is no disk to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notice {
+    Searching,
+    NoDisks,
+    DiscoveryFailed,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+impl Notice {
+    fn title(self) -> &'static str {
+        match self {
+            Notice::Searching => "Procurando discos…",
+            Notice::NoDisks => "Nenhum disco encontrado",
+            Notice::DiscoveryFailed => "Não foi possível localizar os discos",
+        }
+    }
+
+    fn hint(self) -> Option<&'static str> {
+        match self {
+            Notice::Searching => None,
+            Notice::NoDisks => Some("Conecte um disco; a lista é atualizada a cada 15 segundos."),
+            Notice::DiscoveryFailed => Some("Uma nova tentativa acontece em até 15 segundos."),
+        }
+    }
+}
+
 pub struct Dashboard {
-    pub disks: Vec<DiskView>,
+    pub cards: Vec<Card>,
     pub selected: usize,
-    pub scroll: usize,
-    pub content_scroll: usize,
-    pub notice: Option<String>,
-    pub history: History,
-    pub generation: u64,
-    pub frame: usize,
+    pub notice: Notice,
+    /// Where the detail panel is scrolled, as the viewport reports it.
+    scroll: Live<f32>,
 }
 
-impl Display for Dashboard {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Painel[discos={}, selecionado={}]",
-            self.disks.len(),
-            self.selected
-        )
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-#[allow(clippy::large_enum_variant)]
-pub enum AppSignal {
-    #[default]
-    Noop,
-    Discovered {
-        generation: u64,
-        result: Result<Vec<DiskIdentity>, String>,
-    },
-    QueryFinished {
-        generation: u64,
-        disk_id: String,
-        result: Result<Telemetry, QueryErrorState>,
-    },
-    ComputeFinished {
-        generation: u64,
-        disk_id: String,
-    },
-    Frame,
-    HistoryLoaded(History),
-}
-
-#[derive(Default)]
-pub struct DashboardApp {
-    started: bool,
-    history_writer: Option<UnboundedSender<History>>,
-}
-
-impl DashboardApp {
-    pub fn new_boxed() -> BoxedSafeApp<Dashboard, AppSignal> {
-        Box::new(Self::default())
-    }
-}
-
-impl App for DashboardApp {
-    type S = Dashboard;
-    type AS = AppSignal;
-
-    fn app_init(
-        &mut self,
-        _components: &mut ComponentRegistryMap<Dashboard, AppSignal>,
-        _focus: &mut HasFocus,
-    ) {
-    }
-
-    fn app_handle_input_event(
-        &mut self,
-        event: InputEvent,
-        global: &mut GlobalData<Dashboard, AppSignal>,
-        _components: &mut ComponentRegistryMap<Dashboard, AppSignal>,
-        _focus: &mut HasFocus,
-    ) -> CommonResult<EventPropagation> {
-        let state = &mut global.state;
-        match event {
-            InputEvent::Keyboard(KeyPress::Plain { key }) => match key {
-                Key::Character('q') | Key::SpecialKey(SpecialKey::Esc) => {
-                    return Ok(EventPropagation::ExitMainEventLoop);
-                }
-                Key::SpecialKey(SpecialKey::Left) | Key::SpecialKey(SpecialKey::BackTab) => {
-                    move_selection(state, false, 1);
-                }
-                Key::SpecialKey(SpecialKey::Right) | Key::SpecialKey(SpecialKey::Tab) => {
-                    move_selection(state, true, 1);
-                }
-                Key::SpecialKey(SpecialKey::Up) | Key::Character('k') => {
-                    state.content_scroll = state.content_scroll.saturating_sub(1);
-                }
-                Key::SpecialKey(SpecialKey::Down) | Key::Character('j') => {
-                    state.content_scroll = state.content_scroll.saturating_add(1);
-                }
-                Key::SpecialKey(SpecialKey::PageUp) => {
-                    state.content_scroll = state.content_scroll.saturating_sub(5);
-                }
-                Key::SpecialKey(SpecialKey::PageDown) => {
-                    state.content_scroll = state.content_scroll.saturating_add(5);
-                }
-                _ => return Ok(EventPropagation::Propagate),
-            },
-            InputEvent::Mouse(mouse) => {
-                let x: usize = (*mouse.pos.col_index).into();
-                let y: usize = (*mouse.pos.row_index).into();
-                let layout = Layout::new(
-                    (*global.window_size.col_width).into(),
-                    (*global.window_size.row_height).into(),
-                    state.disks.len(),
-                    state.scroll,
-                );
-                match mouse.kind {
-                    MouseInputKind::MouseDown(Button::Left) => {
-                        if layout.quit.contains(x, y) {
-                            return Ok(EventPropagation::ExitMainEventLoop);
-                        }
-                        if let Some(index) = layout.tab_at(x, y) {
-                            state.selected = index;
-                            state.scroll = index;
-                            state.content_scroll = 0;
-                        }
-                    }
-                    MouseInputKind::ScrollUp
-                        if layout.tabs.iter().any(|tab| tab.contains(x, y)) =>
-                    {
-                        move_selection(state, false, 1);
-                    }
-                    MouseInputKind::ScrollDown
-                        if layout.tabs.iter().any(|tab| tab.contains(x, y)) =>
-                    {
-                        move_selection(state, true, 1);
-                    }
-                    MouseInputKind::ScrollUp => {
-                        state.content_scroll = state.content_scroll.saturating_sub(1)
-                    }
-                    MouseInputKind::ScrollDown => {
-                        state.content_scroll = state.content_scroll.saturating_add(1)
-                    }
-                    _ => return Ok(EventPropagation::Propagate),
-                }
-            }
-            _ => return Ok(EventPropagation::Propagate),
-        }
-        Ok(EventPropagation::ConsumedRender)
-    }
-
-    fn app_handle_signal(
-        &mut self,
-        signal: &AppSignal,
-        global: &mut GlobalData<Dashboard, AppSignal>,
-        _components: &mut ComponentRegistryMap<Dashboard, AppSignal>,
-        _focus: &mut HasFocus,
-    ) -> CommonResult<EventPropagation> {
-        let state = &mut global.state;
-        match signal {
-            AppSignal::Discovered {
-                generation,
-                result: Ok(disks),
-            } => {
-                if *generation < state.generation {
-                    return Ok(EventPropagation::Consumed);
-                }
-                state.generation = *generation;
-                let old_id = state
-                    .disks
-                    .get(state.selected)
-                    .map(|disk| disk.identity.id.clone());
-                let previous = std::mem::take(&mut state.disks);
-                state.disks = disks
-                    .iter()
-                    .cloned()
-                    .map(|identity| {
-                        let telemetry = previous
-                            .iter()
-                            .find(|disk| disk.identity == identity)
-                            .and_then(|disk| disk.telemetry.clone());
-                        DiskView {
-                            identity,
-                            telemetry,
-                            querying: true,
-                            computing: false,
-                            pending_telemetry: None,
-                            error_message: None,
-                        }
-                    })
-                    .collect();
-                state.selected = old_id
-                    .and_then(|id| state.disks.iter().position(|disk| disk.identity.id == id))
-                    .unwrap_or(0)
-                    .min(state.disks.len().saturating_sub(1));
-                state.scroll = state.selected;
-                state.notice = if state.disks.is_empty() {
-                    Some("Nenhum disco encontrado".into())
-                } else {
-                    None
-                };
-            }
-            AppSignal::Discovered {
-                generation,
-                result: Err(_),
-            } => {
-                if *generation < state.generation {
-                    return Ok(EventPropagation::Consumed);
-                }
-                state.notice = Some("Não foi possível localizar os discos".into())
-            }
-            AppSignal::QueryFinished {
-                generation,
-                disk_id,
-                result,
-            } => {
-                if *generation != state.generation {
-                    return Ok(EventPropagation::Consumed);
-                }
-                if let Some(disk) = state
-                    .disks
-                    .iter_mut()
-                    .find(|disk| disk.identity.id == *disk_id)
-                {
-                    if let Ok(telemetry) = result {
-                        disk.querying = false;
-                        disk.computing = true;
-                        disk.pending_telemetry = Some(telemetry.clone());
-                        disk.error_message = None;
-                        let sender = global.main_thread_channel_sender.clone();
-                        let disk_id = disk_id.clone();
-                        let generation = *generation;
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(120)).await;
-                            let _ = sender
-                                .send(TerminalWindowMainThreadSignal::ApplyAppSignal(
-                                    AppSignal::ComputeFinished {
-                                        generation,
-                                        disk_id,
-                                    },
-                                ))
-                                .await;
-                        });
-                    } else {
-                        disk.querying = false;
-                        disk.computing = false;
-                        disk.telemetry = None;
-                        disk.error_message = Some(
-                            match result {
-                                Err(QueryErrorState::Permission) => {
-                                    "Permissão insuficiente para consultar o dispositivo"
-                                }
-                                Err(QueryErrorState::Unsupported) => {
-                                    "Leitura de saúde não compatível com o dispositivo"
-                                }
-                                Err(QueryErrorState::Transient | QueryErrorState::Partial) => {
-                                    "Não foi possível consultar os dados de saúde"
-                                }
-                                Ok(_) => unreachable!(),
-                            }
-                            .into(),
-                        );
-                    }
-                }
-            }
-            AppSignal::ComputeFinished {
-                generation,
-                disk_id,
-            } => {
-                if *generation != state.generation {
-                    return Ok(EventPropagation::Consumed);
-                }
-                if let Some(disk) = state
-                    .disks
-                    .iter_mut()
-                    .find(|disk| disk.identity.id == *disk_id)
-                {
-                    disk.computing = false;
-                    if let Some(telemetry) = disk.pending_telemetry.take() {
-                        let score = score_health(disk.identity.kind, &telemetry);
-                        if let Some(timestamp_unix_secs) = next_timestamp(&state.history, disk_id) {
-                            let sample = HealthSample {
-                                disk_id: disk.identity.id.clone(),
-                                timestamp_unix_secs,
-                                kind: disk.identity.kind,
-                                endurance_percent: telemetry.endurance_percent,
-                                power_on_hours: telemetry.power_on_hours,
-                                score: (score.outcome != HealthOutcome::Unknown)
-                                    .then_some(score.score),
-                            };
-                            if state.history.record(sample).is_ok()
-                                && let Some(writer) = &self.history_writer
-                            {
-                                let _ = writer.send(state.history.clone());
-                            }
-                        }
-                        disk.telemetry = Some(telemetry);
-                    }
-                }
-            }
-            AppSignal::HistoryLoaded(history) => state.history = history.clone(),
-            AppSignal::Frame => {
-                if !state
-                    .disks
-                    .iter()
-                    .any(|disk| disk.querying || disk.computing)
-                {
-                    return Ok(EventPropagation::Consumed);
-                }
-                state.frame = state.frame.wrapping_add(1);
-            }
-            AppSignal::Noop => return Ok(EventPropagation::Consumed),
-        }
-        Ok(EventPropagation::ConsumedRender)
-    }
-
-    fn app_render(
-        &mut self,
-        global: &mut GlobalData<Dashboard, AppSignal>,
-        _components: &mut ComponentRegistryMap<Dashboard, AppSignal>,
-        _focus: &mut HasFocus,
-    ) -> CommonResult<RenderPipeline> {
-        if !self.started {
-            self.started = true;
-            self.history_writer = Some(start_history_writer());
-            start_background(global.main_thread_channel_sender.clone());
-        }
-        let state = &global.state;
-        let width: usize = (*global.window_size.col_width).into();
-        let height: usize = (*global.window_size.row_height).into();
-        let layout = Layout::new(width, height, state.disks.len(), state.scroll);
-        let mut pipeline = RenderPipeline::default();
-        let mut ops = RenderOpIRVec::new();
-        ops += RenderOpCommon::SetBgColor(TuiColor::Rgb(MOCHA_BASE));
-        ops += RenderOpCommon::SetFgColor(TuiColor::Rgb(MOCHA_TEXT));
-        ops += RenderOpCommon::ClearScreen;
-        if width == 0 || height == 0 {
-            pipeline.push(ZOrder::Normal, ops);
-            return Ok(pipeline);
-        }
-
-        paint(
-            &mut ops,
-            0,
-            0,
-            &format!("chkdsk v{}", env!("CARGO_PKG_VERSION")),
-            MOCHA_LAVENDER,
-            true,
-            width.saturating_sub(layout.quit.width),
-        );
-        if layout.quit.visible() {
-            paint(
-                &mut ops,
-                layout.quit.x,
-                0,
-                if layout.quit.width >= 7 {
-                    "[ Sair]"
-                } else if layout.quit.width >= 4 {
-                    "Sair"
-                } else {
-                    "×"
-                },
-                MOCHA_RED,
-                true,
-                width.saturating_sub(layout.quit.x),
-            );
-        }
-        for (position, area) in layout.tabs.iter().enumerate() {
-            let index = layout.tab_indices[position];
-            let disk = &state.disks[index];
-            let mark = if index == state.selected {
-                "● "
-            } else {
-                "○ "
-            };
-            let name = disk
-                .identity
-                .model
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("Disco");
-            let label = clipped(&format!("{mark}{name}"), area.width);
-            let label = format!("{label:<width$}", width = area.width);
-            paint_background(
-                &mut ops,
-                area.x,
-                area.y,
-                &label,
-                if index == state.selected {
-                    MOCHA_LAVENDER
-                } else {
-                    MOCHA_MUTED
-                },
-                index == state.selected,
-                area.width,
-                (index == state.selected).then_some(MOCHA_SURFACE),
-            );
-        }
-        if height > layout.body_y {
-            if let Some(disk) = state.disks.get(state.selected) {
-                render_disk(
-                    &mut ops,
-                    disk,
-                    &state.history,
-                    layout.body_y,
-                    width,
-                    height - layout.body_y - usize::from(height >= 6),
-                    state.content_scroll,
-                    state.frame,
-                );
-            } else {
-                paint(
-                    &mut ops,
-                    width.min(2).saturating_sub(1),
-                    layout.body_y,
-                    state.notice.as_deref().unwrap_or("Procurando discos…"),
-                    MOCHA_MUTED,
-                    false,
-                    width.saturating_sub(2),
-                );
-            }
-        }
-        if height >= 6 {
-            paint(
-                &mut ops,
-                0,
-                height - 1,
-                "←/→ disco  ↑/↓ rolar  Tab próximo  q sair",
-                MOCHA_MUTED,
-                false,
-                width,
-            );
-        }
-        pipeline.push(ZOrder::Normal, ops);
-        Ok(pipeline)
-    }
-}
-
-fn move_selection(state: &mut Dashboard, forward: bool, amount: usize) {
-    if state.disks.is_empty() {
-        return;
-    }
-    state.selected = if forward {
-        state
-            .selected
-            .saturating_add(amount)
-            .min(state.disks.len() - 1)
-    } else {
-        state.selected.saturating_sub(amount)
-    };
-    state.scroll = state.selected;
-    state.content_scroll = 0;
-}
-
-const MAX_CONCURRENT_DISK_QUERIES: usize = 4;
-
-#[derive(Default)]
-struct QueryScheduler {
-    generation: u64,
-    disks: Vec<DiskIdentity>,
-    pending: VecDeque<DiskIdentity>,
-    in_flight: HashMap<String, u64>,
-}
-
-impl QueryScheduler {
-    fn update_disks(&mut self, mut disks: Vec<DiskIdentity>) {
-        disks.sort_by(|left, right| left.id.cmp(&right.id));
-        if self.disks != disks {
-            self.generation = self.generation.saturating_add(1);
-            self.disks = disks;
-        }
-        self.pending = self
-            .disks
-            .iter()
-            .filter(|disk| !self.in_flight.contains_key(&disk.id))
-            .cloned()
-            .collect();
-    }
-
-    fn begin_next(&mut self) -> Option<(u64, DiskIdentity)> {
-        if self.in_flight.len() >= MAX_CONCURRENT_DISK_QUERIES {
-            return None;
-        }
-        while let Some(identity) = self.pending.pop_front() {
-            if self.in_flight.contains_key(&identity.id) {
-                continue;
-            }
-            self.in_flight.insert(identity.id.clone(), self.generation);
-            return Some((self.generation, identity));
-        }
-        None
-    }
-
-    /// Retire the in-flight slot, accept only the current topology, and requeue
-    /// a still-present disk if its result belonged to an older topology.
-    fn finish(&mut self, generation: u64, identity: &DiskIdentity) -> bool {
-        if self.in_flight.remove(&identity.id) != Some(generation) {
-            return false;
-        }
-        let current = self.disks.iter().find(|disk| disk.id == identity.id);
-        if generation == self.generation && current == Some(identity) {
-            return true;
-        }
-        if let Some(current) = current
-            && !self.pending.iter().any(|disk| disk.id == current.id)
-        {
-            self.pending.push_back(current.clone());
-        }
-        false
-    }
-}
-
-fn start_background(sender: Sender<TerminalWindowMainThreadSignal<AppSignal>>) {
-    tokio::spawn(async move {
-        let animation_sender = sender.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(120));
-            loop {
-                ticker.tick().await;
-                if animation_sender
-                    .send(TerminalWindowMainThreadSignal::ApplyAppSignal(
-                        AppSignal::Frame,
-                    ))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        let path = history_path();
-        if let Ok(history) = tokio::task::spawn_blocking(move || {
-            std::fs::read(path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<History>(&bytes).ok())
-                .unwrap_or_default()
-        })
-        .await
-        {
-            let _ = sender
-                .send(TerminalWindowMainThreadSignal::ApplyAppSignal(
-                    AppSignal::HistoryLoaded(history),
-                ))
-                .await;
-        }
-
-        let mut scheduler = QueryScheduler::default();
-        let mut jobs = JoinSet::<(u64, DiskIdentity, Result<Telemetry, QueryErrorState>)>::new();
-        let mut interval = tokio::time::interval(Duration::from_secs(15));
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let discovered = tokio::task::spawn_blocking(backend::discover)
-                        .await
-                        .unwrap_or_else(|_| Err("falha de execução".to_owned()));
-                    match discovered {
-                        Ok(disks) => {
-                            scheduler.update_disks(disks);
-                            let signal = AppSignal::Discovered {
-                                generation: scheduler.generation,
-                                result: Ok(scheduler.disks.clone()),
-                            };
-                            if sender.send(TerminalWindowMainThreadSignal::ApplyAppSignal(signal)).await.is_err() { break; }
-                            while let Some((generation, identity)) = scheduler.begin_next() {
-                                jobs.spawn(async move {
-                                    let query_identity = identity.clone();
-                                    let result = tokio::task::spawn_blocking(move || backend::query(&query_identity).map_err(|error| error.state))
-                                        .await
-                                        .unwrap_or(Err(QueryErrorState::Transient));
-                                    // Keep the immutable query key for generation validation.
-                                    (generation, identity, result)
-                                });
-                            }
-                        }
-                        Err(_) => {
-                            let signal = AppSignal::Discovered {
-                                generation: scheduler.generation,
-                                result: Err(String::new()),
-                            };
-                            if sender.send(TerminalWindowMainThreadSignal::ApplyAppSignal(signal)).await.is_err() { break; }
-                        }
-                    }
-                }
-                Some(joined) = jobs.join_next(), if !jobs.is_empty() => {
-                    if let Ok((generation, identity, result)) = joined {
-                        if scheduler.finish(generation, &identity) {
-                            let signal = AppSignal::QueryFinished {
-                                generation,
-                                disk_id: identity.id.clone(),
-                                result,
-                            };
-                            if sender.send(TerminalWindowMainThreadSignal::ApplyAppSignal(signal)).await.is_err() { break; }
-                        }
-                        while let Some((generation, identity)) = scheduler.begin_next() {
-                            jobs.spawn(async move {
-                                let query_identity = identity.clone();
-                                let result = tokio::task::spawn_blocking(move || backend::query(&query_identity).map_err(|error| error.state))
-                                    .await
-                                    .unwrap_or(Err(QueryErrorState::Transient));
-                                (generation, identity, result)
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct HitArea {
-    pub x: usize,
-    pub y: usize,
-    pub width: usize,
-    pub height: usize,
-}
-impl HitArea {
-    fn contains(self, x: usize, y: usize) -> bool {
-        self.width > 0
-            && self.height > 0
-            && x >= self.x
-            && x < self.x + self.width
-            && y >= self.y
-            && y < self.y + self.height
-    }
-    fn visible(self) -> bool {
-        self.width > 0 && self.height > 0
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Layout {
-    pub tabs: Vec<HitArea>,
-    pub tab_indices: Vec<usize>,
-    pub quit: HitArea,
-    pub body_y: usize,
-}
-impl Layout {
-    pub fn new(width: usize, height: usize, disks: usize, scroll: usize) -> Self {
-        if width == 0 || height == 0 {
-            return Self::default();
-        }
-        let quit = if width >= 21 {
-            HitArea {
-                x: width - 7,
-                y: 0,
-                width: 7,
-                height: 1,
-            }
-        } else if width >= 18 {
-            HitArea {
-                x: width - 4,
-                y: 0,
-                width: 4,
-                height: 1,
-            }
-        } else {
-            HitArea {
-                x: width - 1,
-                y: 0,
-                width: 1,
-                height: 1,
-            }
-        };
-        let mut tabs = Vec::new();
-        let mut tab_indices = Vec::new();
-        let mut x = 0;
-        let y = usize::from(height > 1);
-        let start = scroll.min(disks.saturating_sub(1));
-        if width >= 3 && height > 2 {
-            for index in start..disks {
-                let available = (14 + (index % 10)).min(width.saturating_sub(x));
-                if available == 0 {
-                    break;
-                }
-                tabs.push(HitArea {
-                    x,
-                    y,
-                    width: available,
-                    height: 1,
-                });
-                tab_indices.push(index);
-                x += available;
-                if x >= width {
-                    break;
-                }
-            }
-        }
-        let body_y = if height > 2 { 2.min(height) } else { height };
+impl Default for Dashboard {
+    fn default() -> Self {
         Self {
-            tabs,
-            tab_indices,
-            quit,
-            body_y,
+            cards: Vec::new(),
+            selected: 0,
+            notice: Notice::Searching,
+            scroll: Live::new(0.0),
         }
-    }
-    pub fn tab_at(&self, x: usize, y: usize) -> Option<usize> {
-        self.tabs
-            .iter()
-            .position(|tab| tab.contains(x, y))
-            .and_then(|position| self.tab_indices.get(position).copied())
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_disk(
-    ops: &mut RenderOpIRVec,
-    disk: &DiskView,
-    history: &History,
-    top: usize,
-    width: usize,
-    available_height: usize,
-    scroll: usize,
-    frame: usize,
-) {
-    if available_height == 0 || width == 0 {
-        return;
-    }
-    let model = disk
-        .identity
-        .model
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("Modelo desconhecido");
-    let kind = match disk.identity.kind {
-        DiskKind::Hdd => "HD",
-        DiskKind::Ssd => "SSD",
-        DiskKind::Nvme => "NVMe",
-        DiskKind::Unknown => "Tipo desconhecido",
-    };
-    let capacity = disk
-        .identity
-        .capacity_bytes
-        .map(format_bytes)
-        .unwrap_or_else(|| "capacidade indisponível".into());
-    let mut lines: Vec<(String, RgbValue, bool)> = vec![
-        (model.to_owned(), MOCHA_TEXT, true),
-        (format!("{kind}  ·  {capacity}"), MOCHA_MUTED, false),
-    ];
-    if disk.querying || disk.computing {
-        let spinner = ["◐", "◓", "◑", "◒"][frame % 4];
-        let stage = if disk.computing {
-            "Calculando saúde"
-        } else {
-            "Consultando e interpretando dados"
-        };
-        lines.push((format!("{spinner} {stage}…"), MOCHA_YELLOW, true));
-    } else if disk.telemetry.is_none() {
-        lines.push((
-            disk.error_message
-                .clone()
-                .unwrap_or_else(|| "Dados de saúde indisponíveis".into()),
-            MOCHA_YELLOW,
-            false,
-        ));
-    }
-    if let Some(telemetry) = disk.telemetry.as_ref() {
-        let health = score_health(disk.identity.kind, telemetry);
-        let (label, color) = match health.outcome {
-            HealthOutcome::Pass => ("SAUDÁVEL", MOCHA_GREEN),
-            HealthOutcome::Fail => ("ATENÇÃO", MOCHA_RED),
-            HealthOutcome::Unknown => ("INDISPONÍVEL", MOCHA_YELLOW),
-        };
-        lines.push((label.into(), color, true));
-        let digits = if health.outcome == HealthOutcome::Unknown {
-            "N/A".to_owned()
-        } else {
-            health.score.to_string()
-        };
-        let ascii = ascii_score_lines(&digits);
-        for row in ascii {
-            lines.push((row, color, true));
-        }
-        if health.outcome != HealthOutcome::Unknown {
-            lines.push(("% saúde".into(), MOCHA_MUTED, false));
-        }
-        let eta = history
-            .estimate_endurance(&disk.identity.id)
-            .map(|estimate| {
-                format!(
-                    "Vida estimada  {}",
-                    format_endurance_days(estimate.remaining_seconds)
-                )
-            })
-            .unwrap_or_else(|| "Vida estimada  aguardando histórico".into());
-        lines.push((eta, MOCHA_LAVENDER, true));
-        lines.push((
-            telemetry_status(telemetry).into(),
-            if telemetry_status(telemetry).contains("permissão") {
-                MOCHA_RED
-            } else {
-                MOCHA_MUTED
-            },
-            false,
-        ));
-        lines.push((
-            telemetry
-                .endurance_percent
-                .map(|wear| format!("Desgaste  {:.0}%", wear))
-                .unwrap_or_else(|| "Desgaste  indisponível".into()),
-            MOCHA_TEXT,
-            false,
-        ));
-        lines.push((
-            telemetry
-                .temperature_c
-                .map(|v| format!("Temperatura  {v} °C"))
-                .unwrap_or_else(|| "Temperatura  indisponível".into()),
-            MOCHA_TEXT,
-            false,
-        ));
-        lines.push((
-            telemetry
-                .power_on_hours
-                .map(|v| format!("Tempo ligado  {} h", compact_number(v)))
-                .unwrap_or_else(|| "Tempo ligado  indisponível".into()),
-            MOCHA_TEXT,
-            false,
-        ));
-        let last_reading = history
-            .samples
-            .iter()
-            .filter(|sample| sample.disk_id == disk.identity.id)
-            .map(|sample| sample.timestamp_unix_secs)
-            .max();
-        lines.push((
-            last_reading
-                .map(|timestamp| {
-                    format!(
-                        "Última leitura  há {}",
-                        format_duration(age_seconds(timestamp))
-                    )
-                })
-                .unwrap_or_else(|| "Última leitura  indisponível".into()),
-            MOCHA_MUTED,
-            false,
-        ));
-        if let QueryState::Success(nvme) = &telemetry.nvme {
-            for (bit, warning) in [
-                (1, "Reserva NVMe crítica"),
-                (2, "Temperatura NVMe crítica"),
-                (4, "Confiabilidade NVMe degradada"),
-                (8, "Mídia NVMe somente leitura"),
-                (16, "Aviso de memória NVMe"),
-            ] {
-                if nvme.critical_warning & bit != 0 {
-                    lines.push((warning.into(), MOCHA_RED, true));
+impl Dashboard {
+    /// Take what the collector found. The selected disk stays selected while it
+    /// is still there. True when something visible changed.
+    pub fn apply(&mut self, update: Update, now: u64) -> bool {
+        match update {
+            Update::Disks(snapshots) => {
+                let cards: Vec<Card> = snapshots
+                    .iter()
+                    .map(|snapshot| Card::new(snapshot, now))
+                    .collect();
+                let selected = self
+                    .cards
+                    .get(self.selected)
+                    .and_then(|old| cards.iter().position(|card| card.id == old.id))
+                    .unwrap_or(0)
+                    .min(cards.len().saturating_sub(1));
+                // A failed discovery is over once a later one lists disks.
+                let notice = match (cards.is_empty(), self.notice) {
+                    (true, _) => Notice::NoDisks,
+                    (false, Notice::DiscoveryFailed) => Notice::Searching,
+                    (false, notice) => notice,
+                };
+                let changed =
+                    cards != self.cards || selected != self.selected || notice != self.notice;
+                (self.cards, self.selected, self.notice) = (cards, selected, notice);
+                changed
+            }
+            // Only the empty window shows the notice; with disks listed it stays as is.
+            Update::DiscoveryFailed => {
+                let changed = self.cards.is_empty() && self.notice != Notice::DiscoveryFailed;
+                if self.cards.is_empty() {
+                    self.notice = Notice::DiscoveryFailed;
                 }
+                changed
             }
         }
     }
-    if width < 40 || available_height < 12 {
-        if let Some(telemetry) = disk.telemetry.as_ref() {
-            let health = score_health(disk.identity.kind, telemetry);
-            let (summary, color) = match health.outcome {
-                HealthOutcome::Pass => (
-                    if width < 20 {
-                        format!("{}%", health.score)
-                    } else {
-                        format!("SAUDÁVEL · {}%", health.score)
-                    },
-                    MOCHA_GREEN,
-                ),
-                HealthOutcome::Fail => (
-                    if width < 20 {
-                        format!("{}%", health.score)
-                    } else {
-                        format!("ATENÇÃO · {}%", health.score)
-                    },
-                    MOCHA_RED,
-                ),
-                HealthOutcome::Unknown => ("SAÚDE INDISPONÍVEL".into(), MOCHA_YELLOW),
-            };
-            let mut compact = vec![(summary, color, true)];
-            if let Some(eta) = lines
-                .iter()
-                .find(|(text, _, _)| text.starts_with("Vida estimada"))
-            {
-                compact.push(eta.clone());
-            }
-            compact.extend(lines.iter().take(2).cloned());
-            compact.extend(lines.iter().skip(10).cloned());
-            lines = compact;
-        } else if lines.len() > 2 {
-            lines.rotate_left(2);
+
+    /// `apply` for the window: when the selection moves to another disk because
+    /// the selected one vanished, the panel opens at its top, as `select` does.
+    /// Whenever the selected row moves, the list scrolls to keep it visible.
+    pub fn deliver(&mut self, update: Update, now: u64, tx: &mut Tx) -> bool {
+        let before = (self.selected, self.selected_id().map(str::to_owned));
+        let changed = self.apply(update, now);
+        let id = self.selected_id();
+        if id != before.1.as_deref() {
+            tx.scroll_to_instant(DETAIL_KEY, 0.0, 0.0);
         }
+        if let Some(id) = id
+            && (self.selected != before.0 || Some(id) != before.1.as_deref())
+        {
+            tx.scroll_into_view(row_key(id));
+        }
+        changed
     }
-    let scroll = scroll.min(lines.len().saturating_sub(available_height));
-    for (line, (text, color, bold)) in lines.iter().skip(scroll).take(available_height).enumerate()
-    {
-        paint(
-            ops,
-            width.min(2).saturating_sub(1),
-            top + line,
-            text,
-            *color,
-            *bold,
-            width.saturating_sub(width.min(2).saturating_sub(1)),
-        );
+
+    fn selected_id(&self) -> Option<&str> {
+        self.cards.get(self.selected).map(|card| card.id.as_str())
+    }
+
+    pub fn select(&mut self, index: usize, tx: &mut Tx) {
+        if self.cards.is_empty() {
+            return;
+        }
+        let index = index.min(self.cards.len() - 1);
+        if index != self.selected {
+            self.selected = index;
+            tx.scroll_to_instant(DETAIL_KEY, 0.0, 0.0);
+        }
+        tx.scroll_into_view(row_key(&self.cards[index].id));
+    }
+
+    fn step(&mut self, forward: bool, tx: &mut Tx) {
+        let index = if forward {
+            self.selected.saturating_add(1)
+        } else {
+            self.selected.saturating_sub(1)
+        };
+        self.select(index, tx);
+    }
+
+    fn scroll_by(&self, delta: f32, tx: &mut Tx) {
+        tx.scroll_to(DETAIL_KEY, 0.0, (self.scroll.get() + delta).max(0.0));
     }
 }
 
-fn ascii_score_lines(value: &str) -> Vec<String> {
-    let glyph = |ch: char| -> [&'static str; 5] {
-        match ch {
-            '0' => ["###", "# #", "# #", "# #", "###"],
-            '1' => [" # ", "## ", " # ", " # ", "###"],
-            '2' => ["###", "  #", "###", "#  ", "###"],
-            '3' => ["###", "  #", " ##", "  #", "###"],
-            '4' => ["# #", "# #", "###", "  #", "  #"],
-            '5' => ["###", "#  ", "###", "  #", "###"],
-            '6' => ["###", "#  ", "###", "# #", "###"],
-            '7' => ["###", "  #", "  #", " # ", " # "],
-            '8' => ["###", "# #", "###", "# #", "###"],
-            '9' => ["###", "# #", "###", "  #", "###"],
-            'N' => ["# #", "###", "###", "###", "# #"],
-            'A' => ["###", "# #", "###", "# #", "# #"],
-            '/' => ["  #", "  #", " # ", "#  ", "#  "],
-            _ => ["   "; 5],
-        }
-    };
-    (0..5)
-        .map(|row| {
-            value
-                .chars()
-                .map(|ch| glyph(ch)[row])
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect()
+/// The keys of the window: arrows and Tab switch disks (not with Ctrl, Alt or
+/// Super held, which belong to the system), Up and Down scroll the panel, `q`
+/// and Esc quit. Page keys are left to rune, which scrolls the panel.
+pub fn on_key(state: &mut Dashboard, event: &KeyEvent, tx: &mut Tx) -> bool {
+    let mods = event.mods;
+    let plain = !(mods.cmd || mods.ctrl || mods.alt || mods.logo);
+    match &event.key {
+        Key::Escape => tx.quit(),
+        Key::Text(text) if plain && text == "q" => tx.quit(),
+        Key::Left if plain => state.step(false, tx),
+        Key::Right if plain => state.step(true, tx),
+        Key::Tab if plain => state.step(!mods.shift, tx),
+        Key::Up => state.scroll_by(-SCROLL_STEP, tx),
+        Key::Down => state.scroll_by(SCROLL_STEP, tx),
+        Key::Text(text) if plain && text == "k" => state.scroll_by(-SCROLL_STEP, tx),
+        Key::Text(text) if plain && text == "j" => state.scroll_by(SCROLL_STEP, tx),
+        _ => return false,
+    }
+    true
 }
 
-fn age_seconds(timestamp: u64) -> u64 {
+pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |now| now.as_secs().saturating_sub(timestamp))
+        .map_or(0, |now| now.as_secs())
 }
 
-fn telemetry_has_usable_data(telemetry: &Telemetry) -> bool {
-    matches!(&telemetry.nvme, QueryState::Success(_))
-        || matches!(&telemetry.ata, QueryState::Success(ata) if !ata.attributes.is_empty())
-        || matches!(&telemetry.overall_failure, QueryState::Success(_))
-        || telemetry.endurance_percent.is_some()
-        || telemetry.power_on_hours.is_some()
-        || telemetry.temperature_c.is_some()
+struct Palette {
+    theme: tok::Theme,
+    accent: Color,
+    healthy: Color,
+    attention: Color,
+    unknown: Color,
 }
 
-fn telemetry_status(telemetry: &Telemetry) -> &'static str {
-    if !telemetry_has_usable_data(telemetry) {
-        if failed_permission(&telemetry.nvme)
-            || failed_permission(&telemetry.ata)
-            || failed_permission(&telemetry.overall_failure)
-        {
-            return "Permissão insuficiente para consultar o dispositivo";
-        }
-        if matches!(&telemetry.nvme, QueryState::Unsupported)
-            || matches!(&telemetry.ata, QueryState::Unsupported)
-            || matches!(&telemetry.overall_failure, QueryState::Unsupported)
-        {
-            return "Leitura SMART não compatível";
-        }
-        if matches!(&telemetry.nvme, QueryState::Failed { .. })
-            || matches!(&telemetry.ata, QueryState::Failed { .. })
-            || matches!(&telemetry.overall_failure, QueryState::Failed { .. })
-        {
-            return "Falha ao ler dados SMART";
-        }
-        return "Dados de saúde indisponíveis";
-    }
-    if failed_permission(&telemetry.nvme)
-        || failed_permission(&telemetry.ata)
-        || failed_permission(&telemetry.overall_failure)
-    {
-        return "Dados parciais; permissão insuficiente em algumas consultas";
-    }
-    if matches!(&telemetry.overall_failure, QueryState::Success(true)) {
-        return "O dispositivo relatou uma falha";
-    }
-    if matches!(&telemetry.overall_failure, QueryState::Success(false))
-        && !matches!(&telemetry.nvme, QueryState::Unsupported)
-        && !matches!(&telemetry.ata, QueryState::Unsupported)
-    {
-        return "Sem falha geral relatada pelo dispositivo";
-    }
-    if matches!(
-        &telemetry.nvme,
-        QueryState::Unsupported | QueryState::Failed { .. }
-    ) || matches!(
-        &telemetry.ata,
-        QueryState::Unsupported | QueryState::Failed { .. }
-    ) || matches!(&telemetry.overall_failure, QueryState::Failed { .. })
-    {
-        return "Dados de saúde parcialmente disponíveis";
-    }
-    "Dados SMART disponíveis"
-}
-
-fn failed_permission<T>(state: &QueryState<T>) -> bool {
-    match state {
-        QueryState::Failed { message } => is_permission_error(message),
-        QueryState::NotQueried | QueryState::Unsupported | QueryState::Success(_) => false,
-    }
-}
-
-fn paint(
-    ops: &mut RenderOpIRVec,
-    x: usize,
-    y: usize,
-    text: &str,
-    color: RgbValue,
-    bold: bool,
-    max_width: usize,
-) {
-    paint_background(ops, x, y, text, color, bold, max_width, None);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_background(
-    ops: &mut RenderOpIRVec,
-    x: usize,
-    y: usize,
-    text: &str,
-    color: RgbValue,
-    bold: bool,
-    max_width: usize,
-    background: Option<RgbValue>,
-) {
-    if max_width == 0 {
-        return;
-    }
-    if let Some(background) = background {
-        *ops += RenderOpCommon::SetBgColor(TuiColor::Rgb(background));
-    }
-    let text = clipped(text, max_width);
-    let style = TuiStyle {
-        color_fg: Some(TuiColor::Rgb(color)),
-        color_bg: None,
-        attribs: r3bl_tui::TuiStyleAttribs {
-            bold: bold.then_some(r3bl_tui::tui_style_attrib::Bold),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    *ops += RenderOpCommon::MoveCursorPositionAbs(r3bl_tui::col(x) + r3bl_tui::row(y));
-    *ops += RenderOpIR::PaintTextWithAttributes(text.into(), Some(style));
-    if background.is_some() {
-        *ops += RenderOpCommon::SetBgColor(TuiColor::Rgb(MOCHA_BASE));
-    }
-}
-
-fn is_permission_error(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("access is denied")
-        || message.contains("acesso negado")
-        || message.contains("error 5")
-        || message == "5"
-}
-
-fn clipped(text: &str, limit: usize) -> String {
-    text.chars().take(limit).collect()
-}
-fn compact_number(value: u64) -> String {
-    if value >= 1_000_000_000 {
-        format!("{} bi", decimal_pt(value as f64 / 1_000_000_000.0))
-    } else if value >= 1_000_000 {
-        format!("{} mi", decimal_pt(value as f64 / 1_000_000.0))
-    } else {
-        value.to_string()
-    }
-}
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[unit])
-    } else {
-        format!("{} {}", decimal_pt(size), UNITS[unit])
-    }
-}
-fn decimal_pt(value: f64) -> String {
-    format!("{value:.1}").replace('.', ",")
-}
-fn format_duration(seconds: u64) -> String {
-    let days = seconds / 86_400;
-    if days >= 365 {
-        let years = days / 365;
-        if years == 1 {
-            "1 ano".into()
+impl Palette {
+    fn new(dark: bool, accent: Color) -> Self {
+        // Status colors keep 4.5:1 against the window and list backgrounds in both themes.
+        let (healthy, attention, unknown) = if dark {
+            (
+                oklch(0.80, 0.16, 152.0),
+                oklch(0.74, 0.17, 24.0),
+                oklch(0.84, 0.14, 88.0),
+            )
         } else {
-            format!("{years} anos")
+            (
+                oklch(0.45, 0.13, 152.0),
+                oklch(0.47, 0.19, 27.0),
+                oklch(0.46, 0.11, 72.0),
+            )
+        };
+        Self {
+            theme: tok::theme(dark),
+            accent,
+            healthy,
+            attention,
+            unknown,
         }
-    } else if days >= 30 {
-        let months = days / 30;
-        if months == 1 {
-            "1 mês".into()
-        } else {
-            format!("{months} meses")
+    }
+
+    fn tone(&self, tone: Tone) -> Color {
+        match tone {
+            Tone::Healthy => self.healthy,
+            Tone::Attention => self.attention,
+            Tone::Unknown => self.unknown,
         }
-    } else if days == 1 {
-        "1 dia".into()
-    } else if days > 0 {
-        format!("{} dias", days)
-    } else {
-        "menos de 1 dia".into()
     }
 }
 
-fn format_endurance_days(remaining_seconds: u64) -> String {
-    let days = remaining_seconds / 86_400;
-    if days == 1 {
-        "1 dia".into()
-    } else {
-        format!("{days} dias")
-    }
-}
-
-fn history_path() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("chkdsk")
-        .join("historico.json")
-}
-fn start_history_writer() -> UnboundedSender<History> {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(history_writer_loop(receiver, history_path()));
-    sender
-}
-
-async fn history_writer_loop(mut receiver: UnboundedReceiver<History>, path: PathBuf) {
-    while let Some(mut newest) = receiver.recv().await {
-        // Snapshots are sent in UI-event order. Drain queued snapshots before each
-        // write so a slow filesystem persists the newest state, never an older one.
-        while let Ok(next) = receiver.try_recv() {
-            newest = next;
-        }
-        let destination = path.clone();
-        let _ = tokio::task::spawn_blocking(move || write_history_snapshot(&destination, &newest))
-            .await;
-    }
-}
-
-fn write_history_snapshot(path: &std::path::Path, history: &History) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let Some(file_name) = path.file_name() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "caminho do histórico sem nome de arquivo",
-        ));
+pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
+    let palette = Palette::new(cx.system_dark(), cx.accent());
+    let content = match state.cards.get(state.selected) {
+        Some(card) => row()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(sidebar(state, &palette))
+            .child(detail(card, &palette, &state.scroll)),
+        None => empty(state.notice, &palette),
     };
-    let mut temporary_name = file_name.to_os_string();
-    temporary_name.push(format!(".tmp-{}", std::process::id()));
-    let temporary = path.with_file_name(temporary_name);
-    let write_result = (|| {
-        let bytes = serde_json::to_vec(history).map_err(std::io::Error::other)?;
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        replace_file(&temporary, path)
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    write_result
+    col()
+        .key("janela")
+        .w_full()
+        .h_full()
+        .fill(palette.theme.bg)
+        .child(content)
 }
 
-#[cfg(windows)]
-fn replace_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-    let replaced = unsafe {
-        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
-                | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+fn row_key(id: &str) -> String {
+    format!("disco-{id}")
+}
+
+fn sidebar(state: &Dashboard, palette: &Palette) -> El {
+    let t = palette.theme;
+    let mut list = col().gap(4.0).padding(8.0);
+    for (index, card) in state.cards.iter().enumerate() {
+        let selected = index == state.selected;
+        let dot = rune::el()
+            .w(8.0)
+            .h(8.0)
+            .radius(4.0)
+            .fill(card.tone().map_or(t.control_off, |tone| palette.tone(tone)));
+        let marker = rune::el()
+            .w(3.0)
+            .h(16.0)
+            .radius(1.5)
+            .ml(4.0)
+            .fill(if selected {
+                palette.accent
+            } else {
+                Color::TRANSPARENT
+            });
+        let status = card.status_label();
+        let names = col()
+            .grow(1.0)
+            .min_w(0.0)
+            .gap(2.0)
+            .child(
+                text(card.list_name.clone())
+                    .font(if selected { BODY_STRONG } else { BODY })
+                    .color(t.text)
+                    .truncate(),
+            )
+            .child(
+                row()
+                    .gap(8.0)
+                    .child(
+                        text(card.subtitle.clone())
+                            .font(CAPTION)
+                            .color(t.text_secondary)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .child(text(status).font(CAPTION_STRONG).color(t.text_secondary)),
+            );
+        list = list.child(
+            row()
+                .key(row_key(&card.id))
+                .role("tab")
+                .label(format!("{}, {}, {status}", card.list_name, card.subtitle))
+                .checked(selected)
+                .h(56.0)
+                .px(8.0)
+                .gap(8.0)
+                .center_y()
+                .radius(tok::radius::SM)
+                .fill(if selected {
+                    t.control_track
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(t.hover)
+                .cursor(Cursor::Pointer)
+                .on_press_tx(move |s: &mut Dashboard, tx: &mut Tx| s.select(index, tx))
+                .child(marker)
+                .child(dot)
+                .child(names),
+        );
+    }
+    let panel = col()
+        .key("discos")
+        .w(SIDEBAR_WIDTH)
+        .h_full()
+        .fill(t.card)
+        .child(
+            list.scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .grow(1.0)
+            .min_h(0.0),
+        );
+    row()
+        .h_full()
+        .child(panel)
+        .child(rune::el().w(1.0).h_full().fill(t.separator))
+}
+
+fn empty(notice: Notice, palette: &Palette) -> El {
+    let t = palette.theme;
+    let mut message = col().gap(8.0).center_y().child(
+        text(notice.title())
+            .key("aviso")
+            .font(SUBTITLE)
+            .color(t.text),
+    );
+    if let Some(hint) = notice.hint() {
+        message = message.child(text(hint).font(BODY).color(t.text_secondary));
+    }
+    col().grow(1.0).min_h(0.0).center().child(message)
+}
+
+fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
+    let t = palette.theme;
+    let mut page = col()
+        .w_full()
+        .max_w(720.0)
+        .padding(32.0)
+        .child(
+            text(card.title.clone())
+                .key("titulo")
+                .font(SUBTITLE)
+                .color(t.text)
+                .wrap(),
         )
+        .child(
+            text(card.subtitle.clone())
+                .font(BODY)
+                .color(t.text_secondary)
+                .mt(4.0),
+        );
+    page = match &card.body {
+        Body::Loading => page.child(
+            text("Consultando o disco…")
+                .key("estado")
+                .font(BODY)
+                .color(t.text_secondary)
+                .mt(32.0),
+        ),
+        Body::Message(message) => page.child(
+            text(message.clone())
+                .key("estado")
+                .font(BODY)
+                .color(palette.unknown)
+                .wrap()
+                .mt(32.0),
+        ),
+        Body::Health(health) => health_body(page, health, palette),
     };
-    if replaced == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    let scroll = scroll.clone();
+    col()
+        .key(DETAIL_KEY)
+        .grow(1.0)
+        .min_w(0.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .on_scroll_offset(move |at| {
+            scroll.set(at.offset[1]);
+        })
+        .child(page)
 }
 
-#[cfg(not(windows))]
-fn replace_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(from, to)
-}
-fn next_timestamp(history: &History, disk_id: &str) -> Option<u64> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    next_timestamp_at(history, disk_id, now)
+fn health_body(page: El, health: &Health, palette: &Palette) -> El {
+    let t = palette.theme;
+    let tone = palette.tone(health.tone);
+    let pill = row()
+        .key("estado")
+        .px(12.0)
+        .py(4.0)
+        .radius(12.0)
+        .fill(tone.alpha(PILL_TINT))
+        .child(text(health.label).font(CAPTION_STRONG).color(tone));
+    // With no usable evidence there is no number to show, only the pill.
+    let hero = row().mt(32.0).center_y().flex_wrap();
+    let hero = match &health.score {
+        Some(score) => hero
+            .child(text(score.clone()).key("nota").font(SCORE).color(tone))
+            .child(
+                col()
+                    .gap(8.0)
+                    .ml(20.0)
+                    .child(pill)
+                    .child(text("saúde").font(CAPTION).color(t.text_secondary)),
+            ),
+        None => hero.child(pill),
+    };
+
+    let fact = |key: &'static str, label: &'static str, value: &str, style: TextStyle| {
+        row()
+            .key(key)
+            .gap(16.0)
+            .child(text(label).font(BODY).color(t.text_secondary).w(144.0))
+            .child(text(value.to_owned()).font(style).color(t.text).wrap())
+    };
+    let facts = col()
+        .mt(32.0)
+        .gap(12.0)
+        .child(fact(
+            "vida",
+            "Vida estimada",
+            &health.lifetime,
+            if health.lifetime_known {
+                BODY_STRONG
+            } else {
+                BODY
+            },
+        ))
+        .child(fact("desgaste", "Desgaste", &health.wear, BODY))
+        .child(fact(
+            "temperatura",
+            "Temperatura",
+            &health.temperature,
+            BODY,
+        ))
+        .child(fact("ligado", "Tempo ligado", &health.power_on, BODY))
+        .child(fact(
+            "leitura",
+            "Última leitura",
+            &health.last_reading,
+            BODY,
+        ));
+
+    let status = text(health.status).key("situacao").wrap().mt(24.0);
+    let status = match health.status_tone {
+        Some(Tone::Attention) => status.font(BODY_STRONG).color(palette.attention),
+        Some(tone) => status.font(BODY).color(palette.tone(tone)),
+        None => status.font(BODY).color(t.text_secondary),
+    };
+    let mut page = page.child(hero).child(facts).child(status);
+    for warning in &health.warnings {
+        page = page.child(
+            text(*warning)
+                .font(BODY_STRONG)
+                .color(palette.attention)
+                .wrap()
+                .mt(8.0),
+        );
+    }
+    if !health.attributes.is_empty() {
+        page = page.child(attributes(&health.attributes, palette));
+    }
+    page
 }
 
-fn next_timestamp_at(history: &History, disk_id: &str, now: u64) -> Option<u64> {
-    let latest = history
-        .samples
-        .iter()
-        .filter(|sample| sample.disk_id == disk_id)
-        .map(|sample| sample.timestamp_unix_secs)
-        .max();
-    match latest {
-        Some(latest) if now <= latest => None,
-        _ => Some(now),
+fn attributes(rows: &[AttributeRow], palette: &Palette) -> El {
+    let t = palette.theme;
+    let line = |cells: [&str; 4], style: TextStyle, color: Color| {
+        let cell = |content: &str, width: f32, align: Align| {
+            text(content.to_owned())
+                .font(style)
+                .color(color)
+                .w(width)
+                .align(align)
+        };
+        row()
+            .gap(16.0)
+            .child(cell(cells[0], 40.0, Align::Start))
+            .child(cell(cells[1], 56.0, Align::End))
+            .child(cell(cells[2], 56.0, Align::End))
+            .child(text(cells[3].to_owned()).font(style).color(color).grow(1.0))
+    };
+    let mut table = col()
+        .key("atributos")
+        .mt(40.0)
+        .gap(8.0)
+        .child(text("Atributos ATA").font(BODY_STRONG).color(t.text))
+        .child(
+            text("Valores brutos definidos pelo fabricante, sem unidade atribuída.")
+                .font(CAPTION)
+                .color(t.text_secondary)
+                .wrap(),
+        )
+        .child(line(["ID", "Atual", "Pior", "Bruto"], CAPTION, t.text_secondary).mt(8.0));
+    for attribute in rows {
+        table = table.child(line(
+            [
+                &attribute.id,
+                &attribute.current,
+                &attribute.worst,
+                &attribute.raw,
+            ],
+            BODY,
+            t.text,
+        ));
     }
+    table
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_global_data(
-        state: Dashboard,
-        width: usize,
-        height: usize,
-    ) -> GlobalData<Dashboard, AppSignal> {
-        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-        let window_size = r3bl_tui::Size::new((
-            r3bl_tui::ColWidth::new(width),
-            r3bl_tui::RowHeight::new(height),
-        ));
-        GlobalData::try_to_create_instance(
-            sender,
-            state,
-            window_size,
-            r3bl_tui::OutputDevice::new_stderr(),
-            r3bl_tui::OffscreenBufferPool::new(window_size),
-        )
-        .unwrap()
-    }
-
-    fn dispatch_input(
-        app: &mut DashboardApp,
-        global: &mut GlobalData<Dashboard, AppSignal>,
-        event: InputEvent,
-    ) -> EventPropagation {
-        app.app_handle_input_event(
-            event,
-            global,
-            &mut ComponentRegistryMap::default(),
-            &mut HasFocus::default(),
-        )
-        .unwrap()
-    }
-
-    fn mouse_event(kind: MouseInputKind, x: usize, y: usize) -> InputEvent {
-        InputEvent::Mouse(r3bl_tui::MouseInput {
-            pos: r3bl_tui::col(x) + r3bl_tui::row(y),
-            kind,
-            maybe_modifier_keys: None,
-        })
-    }
-
-    fn identity(id: &str, index: u32) -> DiskIdentity {
-        DiskIdentity {
-            id: id.into(),
-            index,
-            model: None,
-            serial: None,
-            firmware: None,
-            capacity_bytes: None,
-            bus: None,
-            kind: DiskKind::Unknown,
-        }
-    }
-
-    #[test]
-    fn layouts_and_tab_hits_stay_inside_viewport_without_overlap() {
-        for (width, height) in [(0, 0), (1, 1), (4, 2), (12, 6), (80, 24)] {
-            let layout = Layout::new(width, height, 100, 20);
-            let areas = layout
-                .tabs
-                .iter()
-                .copied()
-                .chain(std::iter::once(layout.quit))
-                .filter(|area| area.visible())
-                .collect::<Vec<_>>();
-            for (index, area) in areas.iter().enumerate() {
-                assert!(area.x + area.width <= width && area.y + area.height <= height);
-                for other in areas.iter().skip(index + 1) {
-                    assert!(
-                        area.x + area.width <= other.x
-                            || other.x + other.width <= area.x
-                            || area.y + area.height <= other.y
-                            || other.y + other.height <= area.y
-                    );
-                }
-            }
-            for (position, tab) in layout.tabs.iter().enumerate() {
-                assert_eq!(
-                    layout.tab_at(tab.x, tab.y),
-                    Some(layout.tab_indices[position])
-                );
-            }
-            if layout.quit.visible() {
-                assert!(layout.quit.contains(layout.quit.x, layout.quit.y));
-                assert!(!layout.quit.contains(width, layout.quit.y));
-            }
-        }
-        for index in 0..100 {
-            let one_disk_tab = Layout::new(12, 6, 100, index);
-            assert_eq!(one_disk_tab.tab_at(0, 1), Some(index));
-        }
-    }
-
-    #[test]
-    fn ui_generated_messages_are_brazilian_portuguese() {
-        assert_eq!(format_duration(86_400), "1 dia");
-        assert_eq!(format_duration(366 * 86_400), "1 ano");
-        assert_eq!(format_endurance_days(0), "0 dias");
-        assert_eq!(format_endurance_days(86_400), "1 dia");
-        assert_eq!(format_endurance_days(3 * 86_400), "3 dias");
-        assert_eq!(compact_number(1_234_567), "1,2 mi");
-        let disk = DiskView {
-            identity: DiskIdentity {
-                id: "id".into(),
-                index: 0,
-                model: None,
-                serial: None,
-                firmware: None,
-                capacity_bytes: None,
-                bus: None,
-                kind: DiskKind::Unknown,
-            },
-            telemetry: None,
-            querying: false,
-            computing: false,
-            pending_telemetry: None,
-            error_message: None,
-        };
-        let mut ops = RenderOpIRVec::new();
-        render_disk(&mut ops, &disk, &History::default(), 0, 64, 12, 0, 0);
-        let shown = format!("{ops:?}");
-        assert!(shown.contains("Modelo desconhecido"));
-        assert!(shown.contains("capacidade indisponível"));
-        assert!(shown.contains("Dados de saúde indisponíveis"));
-
-        let unknown = DiskView {
-            telemetry: Some(Telemetry::default()),
-            ..disk
-        };
-        let mut unknown_ops = RenderOpIRVec::new();
-        render_disk(
-            &mut unknown_ops,
-            &unknown,
-            &History::default(),
-            0,
-            80,
-            18,
-            0,
-            0,
-        );
-        let unknown_screen = format!("{unknown_ops:?}");
-        assert!(unknown_screen.contains("INDISPONÍVEL"));
-        assert!(unknown_screen.contains("N/A"));
-        assert!(!unknown_screen.contains("% saúde"));
-        assert!(!unknown_screen.contains("0 / 100"));
-    }
-
-    #[test]
-    fn keyboard_wheel_click_and_compact_quit_dispatch_real_input_events() {
-        let state = Dashboard {
-            disks: (0..4)
-                .map(|index| DiskView {
-                    identity: identity(&index.to_string(), index),
-                    telemetry: None,
-                    querying: false,
-                    computing: false,
-                    pending_telemetry: None,
-                    error_message: None,
-                })
-                .collect(),
-            ..Default::default()
-        };
-        let mut app = DashboardApp::default();
-        let mut global = test_global_data(state, 80, 24);
-
-        assert!(matches!(
-            dispatch_input(
-                &mut app,
-                &mut global,
-                InputEvent::Keyboard(KeyPress::Plain {
-                    key: Key::SpecialKey(SpecialKey::Tab),
-                }),
-            ),
-            EventPropagation::ConsumedRender
-        ));
-        assert_eq!(global.state.selected, 1);
-        assert_eq!(global.state.scroll, 1);
-        for key in [SpecialKey::Right, SpecialKey::BackTab] {
-            dispatch_input(
-                &mut app,
-                &mut global,
-                InputEvent::Keyboard(KeyPress::Plain {
-                    key: Key::SpecialKey(key),
-                }),
-            );
-        }
-        assert_eq!(global.state.selected, 1);
-
-        assert!(matches!(
-            dispatch_input(
-                &mut app,
-                &mut global,
-                mouse_event(MouseInputKind::ScrollDown, 0, 8),
-            ),
-            EventPropagation::ConsumedRender
-        ));
-        assert_eq!(global.state.selected, 1);
-        assert_eq!(global.state.content_scroll, 1);
-
-        let layout = Layout::new(80, 24, global.state.disks.len(), global.state.scroll);
-        let next_tab = layout.tabs[1];
-        assert_eq!(layout.tab_at(next_tab.x, next_tab.y), Some(2));
-        assert!(matches!(
-            dispatch_input(
-                &mut app,
-                &mut global,
-                mouse_event(
-                    MouseInputKind::MouseDown(Button::Left),
-                    next_tab.x,
-                    next_tab.y
-                ),
-            ),
-            EventPropagation::ConsumedRender
-        ));
-        assert_eq!(global.state.selected, 2);
-        assert_eq!(global.state.scroll, 2);
-
-        let compact_state = global.state.clone();
-        let mut compact = test_global_data(compact_state, 12, 2);
-        let compact_layout = Layout::new(12, 2, compact.state.disks.len(), compact.state.scroll);
-        assert!(compact_layout.tabs.is_empty());
-        assert!(matches!(
-            dispatch_input(
-                &mut app,
-                &mut compact,
-                mouse_event(
-                    MouseInputKind::MouseDown(Button::Left),
-                    compact_layout.quit.x,
-                    compact_layout.quit.y,
-                ),
-            ),
-            EventPropagation::ExitMainEventLoop
-        ));
-        assert_eq!(compact.state.selected, 2);
-        assert_eq!(compact.state.scroll, 2);
-
-        let mut tiny = test_global_data(compact.state.clone(), 1, 1);
-        let tiny_layout = Layout::new(1, 1, tiny.state.disks.len(), tiny.state.scroll);
-        assert_eq!(
-            tiny_layout.quit,
-            HitArea {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1
-            }
-        );
-        assert!(matches!(
-            dispatch_input(
-                &mut app,
-                &mut tiny,
-                mouse_event(MouseInputKind::MouseDown(Button::Left), 0, 0),
-            ),
-            EventPropagation::ExitMainEventLoop
-        ));
-    }
-
-    #[test]
-    fn partial_telemetry_is_not_mislabeled_as_unsupported() {
-        let telemetry = Telemetry {
-            nvme: QueryState::Unsupported,
-            ata: QueryState::Success(crate::model::AtaHealth {
-                attributes: vec![crate::model::AtaAttribute {
-                    id: 9,
-                    flags: 0,
-                    current: 100,
-                    worst: 100,
-                    raw: [0; 6],
-                }],
-            }),
-            ..Default::default()
-        };
-        assert!(telemetry_has_usable_data(&telemetry));
-        assert_ne!(telemetry_status(&telemetry), "Leitura SMART não compatível");
-        assert_eq!(
-            telemetry_status(&telemetry),
-            "Dados de saúde parcialmente disponíveis"
-        );
-
-        let no_data = Telemetry {
-            nvme: QueryState::Unsupported,
-            ata: QueryState::Unsupported,
-            ..Default::default()
-        };
-        assert!(!telemetry_has_usable_data(&no_data));
-        assert_eq!(telemetry_status(&no_data), "Leitura SMART não compatível");
-
-        let empty_success = Telemetry {
-            nvme: QueryState::Unsupported,
-            ata: QueryState::Success(crate::model::AtaHealth::default()),
-            ..Default::default()
-        };
-        assert!(!telemetry_has_usable_data(&empty_success));
-        assert_eq!(
-            telemetry_status(&empty_success),
-            "Leitura SMART não compatível"
-        );
-    }
-
-    #[test]
-    fn partial_permission_failure_keeps_successful_score_and_warns_about_probe() {
-        let telemetry = Telemetry {
-            nvme: QueryState::Failed {
-                message: "Access is denied (5)".into(),
-            },
-            ata: QueryState::Success(crate::model::AtaHealth {
-                attributes: vec![crate::model::AtaAttribute {
-                    id: 9,
-                    flags: 0,
-                    current: 100,
-                    worst: 100,
-                    raw: [0; 6],
-                }],
-            }),
-            endurance_percent: Some(12.0),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            score_health(DiskKind::Ssd, &telemetry).outcome,
-            HealthOutcome::Pass
-        );
-        assert_eq!(
-            telemetry_status(&telemetry),
-            "Dados parciais; permissão insuficiente em algumas consultas"
-        );
-
-        let no_data = Telemetry {
-            nvme: QueryState::Failed {
-                message: "Access is denied".into(),
-            },
-            ..Default::default()
-        };
-        assert_eq!(
-            telemetry_status(&no_data),
-            "Permissão insuficiente para consultar o dispositivo"
-        );
-    }
-
-    #[test]
-    fn wall_clock_rollback_holds_history_baseline_until_time_advances() {
-        let mut history = History::default();
-        history
-            .record(HealthSample {
-                disk_id: "ssd-a".into(),
-                timestamp_unix_secs: 2_000,
-                kind: DiskKind::Ssd,
-                endurance_percent: Some(10.0),
-                power_on_hours: None,
-                score: Some(94),
-            })
-            .unwrap();
-
-        assert_eq!(next_timestamp_at(&history, "ssd-a", 1_000), None);
-        assert_eq!(next_timestamp_at(&history, "ssd-a", 2_000), None);
-        assert_eq!(next_timestamp_at(&history, "ssd-a", 2_001), Some(2_001));
-        assert_eq!(next_timestamp_at(&history, "other", 1_000), Some(1_000));
-        assert_eq!(history.estimate_endurance("ssd-a"), None);
-    }
-
-    #[test]
-    fn unknown_health_keeps_historical_eta_in_compact_and_normal_views() {
-        let mut history = History::default();
-        for (timestamp, wear) in [(1_000_000, 10.0), (1_086_400, 11.0)] {
-            history
-                .record(HealthSample {
-                    disk_id: "test".into(),
-                    timestamp_unix_secs: timestamp,
-                    kind: DiskKind::Nvme,
-                    endurance_percent: Some(wear),
-                    power_on_hours: None,
-                    score: None,
-                })
-                .unwrap();
-        }
-
-        for (width, height, querying) in [(12, 8, false), (12, 8, true), (64, 20, false)] {
-            let state = Dashboard {
-                disks: vec![DiskView {
-                    identity: identity("test", 0),
-                    telemetry: Some(Telemetry::default()),
-                    querying,
-                    computing: false,
-                    pending_telemetry: None,
-                    error_message: None,
-                }],
-                history: history.clone(),
-                ..Default::default()
-            };
-            let mut app = DashboardApp {
-                started: true,
-                ..Default::default()
-            };
-            let mut global = test_global_data(state, width, height);
-            let pipeline = app
-                .app_render(
-                    &mut global,
-                    &mut ComponentRegistryMap::default(),
-                    &mut HasFocus::default(),
-                )
-                .unwrap();
-            let size = r3bl_tui::Size::new((
-                r3bl_tui::ColWidth::new(width),
-                r3bl_tui::RowHeight::new(height),
-            ));
-            let mut buffer = r3bl_tui::OffscreenBuffer::new_empty(size);
-            pipeline.compose_render_ops_into_ofs_buf(
-                size,
-                &mut buffer,
-                &mut r3bl_tui::MemoizedLenMap::default(),
-            );
-            let rendered = buffer
-                .iter()
-                .map(|line| {
-                    line.iter()
-                        .map(|pixel| match pixel {
-                            r3bl_tui::PixelChar::PlainText { display_char, .. } => *display_char,
-                            _ => ' ',
-                        })
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                rendered.contains("Vida estima"),
-                "{width}x{height}: {rendered}"
-            );
-        }
-    }
-
-    #[test]
-    fn rendered_dashboard_has_brand_large_health_and_safe_compact_fallbacks() {
-        let telemetry = Telemetry {
-            nvme: QueryState::Success(crate::model::NvmeHealth {
-                percentage_used: Some(12),
-                ..Default::default()
-            }),
-            endurance_percent: Some(12.0),
-            ..Default::default()
-        };
-        let disk = DiskView {
-            identity: identity("test", 0),
-            telemetry: Some(telemetry),
-            querying: false,
-            computing: false,
-            pending_telemetry: None,
-            error_message: None,
-        };
-        let state = Dashboard {
-            disks: vec![disk],
-            ..Default::default()
-        };
-        let mut app = DashboardApp {
-            started: true,
-            ..Default::default()
-        };
-        for (width, height) in [(100, 28), (12, 4), (1, 1), (1, 8)] {
-            let mut global = test_global_data(state.clone(), width, height);
-            let pipeline = app
-                .app_render(
-                    &mut global,
-                    &mut ComponentRegistryMap::default(),
-                    &mut HasFocus::default(),
-                )
-                .unwrap();
-            let mut buffer = r3bl_tui::OffscreenBuffer::new_empty(r3bl_tui::Size::new((
-                r3bl_tui::ColWidth::new(width),
-                r3bl_tui::RowHeight::new(height),
-            )));
-            pipeline.compose_render_ops_into_ofs_buf(
-                r3bl_tui::Size::new((
-                    r3bl_tui::ColWidth::new(width),
-                    r3bl_tui::RowHeight::new(height),
-                )),
-                &mut buffer,
-                &mut r3bl_tui::MemoizedLenMap::default(),
-            );
-            if width == 100 {
-                assert!(
-                    matches!(
-                        buffer[1][0],
-                        r3bl_tui::PixelChar::PlainText { style, .. }
-                            if style.color_bg == Some(TuiColor::Rgb(MOCHA_SURFACE))
-                    ),
-                    "bg={:?} wanted={:?}",
-                    match buffer[1][0] {
-                        r3bl_tui::PixelChar::PlainText { style, .. } => style.color_bg,
-                        _ => None,
-                    },
-                    TuiColor::Rgb(MOCHA_SURFACE)
-                );
-            }
-            let rendered = buffer
-                .iter()
-                .map(|line| {
-                    line.iter()
-                        .map(|pixel| match pixel {
-                            r3bl_tui::PixelChar::PlainText { display_char, .. } => *display_char,
-                            _ => ' ',
-                        })
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if width >= 12 {
-                assert!(
-                    rendered.contains("chkdsk v"),
-                    "{width}x{height}: {rendered}"
-                );
-            }
-            if width == 100 {
-                assert!(rendered.contains("SAUDÁVEL"));
-                assert!(rendered.contains("% saúde"));
-                assert!(rendered.contains("###"));
-            }
-            if width == 12 {
-                assert!(rendered.contains("93%"), "{rendered}");
-                assert!(rendered.contains("Vida estima"), "{rendered}");
-            }
-        }
-        let unknown = Telemetry::default();
-        assert_eq!(
-            score_health(DiskKind::Unknown, &unknown).outcome,
-            HealthOutcome::Unknown
-        );
-        let digits = ascii_score_lines("N/A").join("\n");
-        assert!(!digits.contains("000"));
-        let permission = Telemetry {
-            nvme: QueryState::Failed {
-                message: "Access is denied (5)".into(),
-            },
-            ..Default::default()
-        };
-        assert_eq!(
-            telemetry_status(&permission),
-            "Permissão insuficiente para consultar o dispositivo"
-        );
-    }
-
-    #[test]
-    fn slow_queries_are_bounded_deduplicated_and_stale_hotplug_results_requeued() {
-        let disks: Vec<DiskIdentity> = (0..8).map(|i| identity(&format!("disk-{i}"), i)).collect();
-        let mut scheduler = QueryScheduler::default();
-        scheduler.update_disks(disks.clone());
-        let topology_generation = scheduler.generation;
-        let first = (0..MAX_CONCURRENT_DISK_QUERIES)
-            .map(|_| scheduler.begin_next().unwrap())
-            .collect::<Vec<_>>();
-        assert!(scheduler.begin_next().is_none());
-        assert_eq!(scheduler.in_flight.len(), MAX_CONCURRENT_DISK_QUERIES);
-
-        // Repeated polling cannot enqueue an already-running disk a second time.
-        scheduler.update_disks(disks.clone());
-        assert_eq!(scheduler.generation, topology_generation);
-        assert_eq!(scheduler.in_flight.len(), MAX_CONCURRENT_DISK_QUERIES);
-        assert!(
-            scheduler
-                .pending
-                .iter()
-                .all(|disk| !scheduler.in_flight.contains_key(&disk.id))
-        );
-        assert!(scheduler.finish(first[1].0, &first[1].1));
-
-        let stale_identity = first[0].1.clone();
-        let mut changed = disks;
-        changed[0] = identity(&stale_identity.id, 99);
-        scheduler.update_disks(changed);
-        assert_ne!(scheduler.generation, topology_generation);
-        assert!(!scheduler.finish(first[0].0, &stale_identity));
-        assert!(
-            scheduler
-                .pending
-                .iter()
-                .any(|disk| disk.id == stale_identity.id && disk.index == 99)
-        );
-        assert!(scheduler.begin_next().is_some());
-        assert!(scheduler.in_flight.len() <= MAX_CONCURRENT_DISK_QUERIES);
-    }
-
-    #[tokio::test]
-    async fn history_snapshots_are_serialized_atomic_and_end_at_the_newest_state() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "chkdsk-history-{}-{unique}.json",
-            std::process::id()
-        ));
-        write_history_snapshot(
-            &path,
-            &History {
-                version: 0,
-                samples: Vec::new(),
-            },
-        )
-        .unwrap();
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let writer = tokio::spawn(history_writer_loop(receiver, path.clone()));
-        for version in 1..=5 {
-            sender
-                .send(History {
-                    version,
-                    samples: Vec::new(),
-                })
-                .unwrap();
-        }
-        drop(sender);
-        writer.await.unwrap();
-
-        let persisted: History = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted.version, 5);
-        let temporary = path.with_file_name(format!(
-            "{}.tmp-{}",
-            path.file_name().unwrap().to_string_lossy(),
-            std::process::id()
-        ));
-        assert!(!temporary.exists(), "arquivo temporário remanescente");
-        std::fs::remove_file(path).unwrap();
-    }
-}
+mod tests;

@@ -1,5 +1,5 @@
 [tools]
-rust = { version = "stable", components = ["rustfmt", "clippy"], targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc", "i686-pc-windows-msvc"] }
+rust = { version = "stable", components = ["rustfmt", "clippy"], targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] }
 python = "3.12"
 "github:llvm/llvm-project" = { version = "llvmorg-23.1.2", matching = "clang+llvm", matching_regex = "\\.tar\\.xz$" }
 prek = "latest"
@@ -9,7 +9,7 @@ description = "Check Rust formatting"
 run = "cargo fmt --all -- --check"
 
 [tasks.clippy]
-description = "Lint every target and feature for x64, ARM64, and x86"
+description = "Lint every target and feature for x64 and ARM64"
 run = "python scripts/release.py clippy"
 
 [tasks.tests]
@@ -17,7 +17,7 @@ description = "Run the complete x64 Windows test suite"
 run = "python scripts/release.py tests"
 
 [tasks.compile]
-description = "Compile every Cargo target and feature for x64, ARM64, and x86"
+description = "Compile every Cargo target and feature for x64 and ARM64"
 run = "python scripts/release.py compile"
 
 [tasks.release-check]
@@ -25,7 +25,7 @@ description = "Self-check release naming and Windows target mapping"
 run = "python scripts/release.py self-check"
 
 [tasks.linker-check]
-description = "Verify the x64, ARM64, and x86 MSVC environment and linkers"
+description = "Verify the x64 and ARM64 MSVC environment and linkers"
 run = "python scripts/release.py linker-check"
 
 [tasks.validation]
@@ -44,11 +44,10 @@ description = "Install the repository pre-commit hook"
 run = "prek install"
 
 [tasks.release]
-description = "Build optimized x64-baseline, ARM64, and x86 executables"
+description = "Build optimized x64-baseline and ARM64 executables"
 run = [
   { task = "release-x64-baseline" },
   { task = "release-arm64" },
-  { task = "release-x86" },
 ]
 
 [tasks.release-x64-baseline]
@@ -58,10 +57,6 @@ run = "python scripts/release.py build --architecture x64"
 [tasks.release-arm64]
 description = "Build the optimized ARM64 executable"
 run = "python scripts/release.py build --architecture arm64"
-
-[tasks.release-x86]
-description = "Build the optimized x86 executable"
-run = "python scripts/release.py build --architecture x86"
 
 [tasks.package-dev]
 description = "Package the complete development release using the current commit"
