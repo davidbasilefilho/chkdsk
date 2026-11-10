@@ -32,6 +32,10 @@ pub struct Card {
     /// Title of the detail panel.
     pub title: String,
     pub subtitle: String,
+    /// The subtitle for the disk list, without the bus and with tight separators.
+    pub list_subtitle: String,
+    /// The disk sits behind a USB bridge: the list says so next to the name.
+    pub usb: bool,
     /// Bus, firmware, serial and data sources, for the collapsed Avançado section.
     pub details: Vec<Detail>,
     pub body: Body,
@@ -59,6 +63,11 @@ pub struct Health {
     pub label: &'static str,
     /// 0 to 100; none when there is no usable evidence.
     pub score: Option<u8>,
+    /// How much evidence stands behind the score, 0 to 1.
+    pub confidence: f64,
+    /// No wear source was measured, so the score is kept for export but never
+    /// shown as a number.
+    pub limited: bool,
     /// `412 dias` or `aguardando histórico`.
     pub lifetime: String,
     /// The lifetime is an estimate, not the waiting placeholder.
@@ -124,6 +133,12 @@ impl Card {
         } else {
             format!("{kind_label}  ·  {capacity}")
         };
+        // The list row shares its line with the status word, so the bus moves to the
+        // name line and the media shrinks to nothing when a bridge hides it.
+        let list_subtitle = match (usb, kind) {
+            (true, DiskKind::Unknown) => capacity,
+            _ => format!("{kind_label} · {capacity}"),
+        };
         let body = match &snapshot.reading {
             Reading::Pending => Body::Loading,
             Reading::Failed(state) => Body::Message(query_error_message_for(identity, *state)),
@@ -134,6 +149,8 @@ impl Card {
             list_name: model.unwrap_or("Disco").into(),
             title: model.unwrap_or("Modelo desconhecido").into(),
             subtitle,
+            list_subtitle,
+            usb,
             details: details(identity, &snapshot.reading),
             body,
         }
@@ -209,6 +226,8 @@ impl Health {
             tone,
             label,
             score,
+            confidence: health.confidence,
+            limited: health.limited,
             lifetime: ready
                 .remaining_seconds
                 .map(format_endurance_days)
@@ -297,10 +316,9 @@ const BACKUP_ADVICE: &str = "Faça backup dos dados importantes.";
 const CABLE_ADVICE: &str =
     "Troque o cabo de dados ou a porta e confira se o número de erros continua subindo.";
 const LIMITED_SSD_ADVICE: &str =
-    "Use o programa do fabricante do SSD para ver o desgaste, que este disco não informa.";
+    "Use o programa do fabricante do SSD para ver a vida útil restante.";
 /// A drive of unknown kind may not be an SSD, so the advice names no media.
-const LIMITED_ADVICE: &str =
-    "Use o programa do fabricante do disco para ver o desgaste, que este disco não informa.";
+const LIMITED_ADVICE: &str = "Use o programa do fabricante do disco para ver a vida útil restante.";
 
 /// Failures the device declared, then the softer signals behind the score.
 fn warning_lines(health: &HealthScore, telemetry: &Telemetry) -> Vec<String> {
@@ -1312,7 +1330,9 @@ mod tests {
         assert_eq!(health.wear, "indisponível");
         assert_eq!((health.label, health.tone), ("Limitada", Tone::Unknown));
         assert_ne!(health.label, "Saudável");
+        // Kept for the export, with its confidence; the window shows no number for it.
         assert_eq!(health.score, Some(100));
+        assert!(health.limited && health.confidence < 0.5);
         assert_eq!(
             health.status,
             "Avaliação limitada: o disco não informa desgaste"
@@ -1333,6 +1353,28 @@ mod tests {
             None,
             "absent rows are not invented"
         );
+    }
+
+    #[test]
+    fn an_attribute_id_without_a_shared_name_is_labeled_vendor_specific() {
+        let health = health_of(
+            unprofiled(vec![
+                row(0x05, 0),
+                row(0xA0, 0),
+                row(0xC2, 0x0037_0014_0029),
+            ]),
+            DiskKind::Ssd,
+        );
+        let name = |id: &str| {
+            health
+                .attributes
+                .iter()
+                .find(|attribute| attribute.id == id)
+                .map(|attribute| attribute.name.as_str())
+        };
+        assert_eq!(name("A0"), Some("Específico do fabricante"));
+        assert_eq!(name("05"), Some("Setores realocados"));
+        assert_eq!(name("C2"), Some("Temperatura"));
     }
 
     #[test]
@@ -1437,6 +1479,9 @@ mod tests {
         let unreachable = card(stick.clone(), Reading::Failed(QueryErrorState::Unsupported));
         assert_eq!(unreachable.title, "Lexar USB Flash Drive");
         assert_eq!(unreachable.subtitle, "USB  ·  29,8 GiB");
+        // The list names the bus beside the name, so its subtitle keeps the capacity short.
+        assert!(unreachable.usb);
+        assert_eq!(unreachable.list_subtitle, "29,8 GiB");
         let Body::Message(message) = &unreachable.body else {
             panic!("an unreadable disk shows a message");
         };
@@ -1477,9 +1522,8 @@ mod tests {
 
         // A known kind over USB keeps its kind and names the bus.
         stick.kind = DiskKind::Ssd;
-        assert_eq!(
-            card(stick, Reading::Pending).subtitle,
-            "SSD  ·  USB  ·  29,8 GiB"
-        );
+        let known = card(stick, Reading::Pending);
+        assert_eq!(known.subtitle, "SSD  ·  USB  ·  29,8 GiB");
+        assert_eq!(known.list_subtitle, "SSD · 29,8 GiB");
     }
 }

@@ -1601,6 +1601,12 @@ fn a_generic_ssd_shows_hours_and_cycles_and_a_limited_assessment() {
             panic!("the generic SSD has a reading");
         };
         assert_eq!((health.label, health.tone), ("Limitada", Tone::Unknown));
+        assert_eq!(health.score, Some(100), "kept for the export");
+        assert!(rt.find("nota").is_none(), "{size:?}: no hero number");
+        assert!(
+            !shown.contains("saúde"),
+            "{size:?}: no `100% saúde`: {shown}"
+        );
         assert!(
             !shown.contains("backup"),
             "{size:?}: no verdict, no backup advice"
@@ -1712,4 +1718,16 @@ fn a_usb_stick_without_smart_shows_identity_and_the_adapter_message_but_no_score
         assert!(!shown.contains("Tipo desconhecido"), "{size:?}: {shown}");
         assert!(rt.find("nota").is_none(), "{size:?}: no hero number");
     }
+}
+
+#[test]
+fn the_avancado_tooltip_names_the_action_the_header_will_do() {
+    let mut rt = runtime(fixtures::dashboard(1), (1100.0, 720.0));
+    let shown = screen(&rt);
+    assert!(shown.contains("Mostrar detalhes técnicos (A)"), "{shown}");
+    assert!(!shown.contains("Ocultar detalhes técnicos"));
+    typed(&mut rt, "a");
+    let shown = screen(&rt);
+    assert!(shown.contains("Ocultar detalhes técnicos (A)"), "{shown}");
+    assert!(!shown.contains("Mostrar detalhes técnicos"));
 }

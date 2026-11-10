@@ -33,7 +33,11 @@ fn a_generic_ssd_exports_its_counters_and_a_usb_stick_without_smart_exports_no_n
     let ssd = &listed[7];
     assert_eq!(ssd["status"], "Limitada");
     assert_eq!(ssd["tone"], "unknown");
+    // The window shows no number for it, but the export keeps the score with what qualifies it.
     assert_eq!(ssd["score"], 100);
+    assert_eq!(ssd["score_limited"], true);
+    assert!(ssd["score_confidence"].as_f64().unwrap() < 0.5);
+    assert_eq!(listed[0]["score_limited"], false);
     assert_eq!(
         ssd["verdict"],
         "Avaliação limitada: o disco não informa desgaste"
@@ -64,6 +68,13 @@ fn a_generic_ssd_exports_its_counters_and_a_usb_stick_without_smart_exports_no_n
         lines[8]
     );
     assert!(lines[8].contains("Limitada"));
+    // The score column is empty for a limited assessment, never a confident 100.
+    assert_eq!(
+        lines[8].split(',').nth(3),
+        Some(""),
+        "no score for a limited SSD: {}",
+        lines[8]
+    );
     assert!(lines[9].contains("Indisponível"));
 }
 

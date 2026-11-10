@@ -138,9 +138,10 @@ fn health_body(page: El, health: &Health, palette: &Palette, narrow: bool) -> El
         .radius(S3)
         .fill(tone.alpha(PILL_TINT))
         .child(text(health.label).font(CAPTION_STRONG).color(tone));
-    // With no usable evidence there is no number to show, only the pill.
+    // With no usable evidence, or with no wear source behind the score, there is
+    // no number to show, only the pill: a limited 100% would read as a clean bill.
     let hero = row().mt(S6).center_y().gap(S4).flex_wrap();
-    let hero = match health.score {
+    let hero = match health.score.filter(|_| !health.limited) {
         Some(value) => hero.child(score(value, palette, tone)).child(pill),
         None => hero.child(pill),
     };
@@ -297,7 +298,11 @@ fn advanced(state: &Dashboard, card: &Card, palette: &Palette, narrow: bool) -> 
         .role("button")
         .label("Avançado")
         .expanded(open)
-        .help("Mostrar detalhes técnicos (A)")
+        .help(if open {
+            "Ocultar detalhes técnicos (A)"
+        } else {
+            "Mostrar detalhes técnicos (A)"
+        })
         .h(40.0)
         .px(S2)
         .ml(-S2)

@@ -330,6 +330,8 @@ fn disk_json(snapshot: &DiskSnapshot, history: &History, now: u64) -> Value {
         "status": card.status_label(),
         "tone": tone_name(card.tone()),
         "score": Value::Null,
+        "score_confidence": Value::Null,
+        "score_limited": Value::Null,
         "verdict": Value::Null,
         "warnings": [],
         "telemetry": Value::Null,
@@ -339,7 +341,10 @@ fn disk_json(snapshot: &DiskSnapshot, history: &History, now: u64) -> Value {
     });
     match (&card.body, &snapshot.reading) {
         (Body::Health(health), Reading::Ready(ready)) => {
+            // Kept even when the window shows no number, with what qualifies it.
             disk["score"] = health.score.into();
+            disk["score_confidence"] = health.score.map(|_| health.confidence).into();
+            disk["score_limited"] = health.score.map(|_| health.limited).into();
             disk["verdict"] = health.status.into();
             disk["warnings"] = health.warnings.clone().into();
             disk["telemetry"] = telemetry_json(&ready.telemetry);
@@ -408,7 +413,12 @@ pub fn to_csv(snapshots: &[DiskSnapshot], now: u64) -> String {
             Reading::Pending | Reading::Failed(_) => (None, None),
         };
         let score = match &card.body {
-            Body::Health(health) => health.score.map(|score| score.to_string()),
+            // A limited score says no problem counter is raised, not how healthy the
+            // disk is, so the spreadsheet column stays empty; the JSON keeps it.
+            Body::Health(health) => health
+                .score
+                .filter(|_| !health.limited)
+                .map(|score| score.to_string()),
             _ => None,
         };
         let row = [

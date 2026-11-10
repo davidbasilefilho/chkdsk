@@ -592,16 +592,28 @@ fn sidebar(state: &Dashboard, palette: &Palette, narrow: bool) -> El {
             .min_w(0.0)
             .gap(2.0)
             .child(
-                text(card.list_name.clone())
-                    .font(if selected { BODY_STRONG } else { BODY })
-                    .color(t.text)
-                    .truncate(),
+                row()
+                    .gap(S2)
+                    // The smaller bus word sits on the name's baseline, not its top.
+                    .items_end()
+                    .child(
+                        text(card.list_name.clone())
+                            .font(if selected { BODY_STRONG } else { BODY })
+                            .color(t.text)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .children(
+                        card.usb
+                            .then(|| text("USB").font(CAPTION).color(t.text_secondary)),
+                    ),
             )
             .child(
                 row()
                     .gap(S2)
                     .child(
-                        text(card.subtitle.clone())
+                        text(card.list_subtitle.clone())
                             .font(CAPTION)
                             .color(t.text_secondary)
                             .truncate()
