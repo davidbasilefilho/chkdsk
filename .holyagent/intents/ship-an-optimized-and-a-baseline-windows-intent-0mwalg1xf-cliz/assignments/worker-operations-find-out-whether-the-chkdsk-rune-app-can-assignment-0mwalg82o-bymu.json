@@ -1,0 +1,39 @@
+{
+  "id": "assignment-0mwalg82o-bymu",
+  "intentId": "intent-0mwalg1xf-cliz",
+  "intentRevision": 1,
+  "roleTask": "Worker.operations",
+  "slug": "find-out-whether-the-chkdsk-rune-app-can",
+  "objective": "Find out whether the chkdsk rune app can now compile for 32-bit Windows (i686-pc-windows-msvc) with a newer rune revision.",
+  "state": "Running",
+  "scope": [
+    "Copy the tree of origin/main (git -C /home/user/chkdsk archive origin/main | tar -x -C /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/i686-probe) into /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/i686-probe; it pins rune git rev 757bcb1d1da1b3f80484f36ef610b83ddbcc6003",
+    "Rune repo https://github.com/anomalyco/rune default branch dev"
+  ],
+  "constraints": [
+    "In the probe copy only: run cargo xwin check --target i686-pc-windows-msvc with the current pin and record the errors; then change the pin to the latest rune dev commit (git ls-remote https://github.com/anomalyco/rune refs/heads/dev), cargo update -p rune (and its git siblings), and run the same check again; also run cargo xwin check --target x86_64-pc-windows-msvc with the latest rev to see whether the app still compiles against it",
+    "Do not touch /home/user/chkdsk, /home/user/chkdsk-port or /home/user/chkdsk-release; no git writes",
+    "Report in under 200 words: rune revs tried, exit codes, the error count and first error locations for i686, whether the newest rev builds x86_64; logs in /tmp/claude-0/-home-user-chkdsk/6d301693-1f05-56b7-955a-cbe3996284b5/scratchpad/logs/i686-*.log"
+  ],
+  "criteria": [
+    {
+      "text": "Reports i686 check results for the pinned and the latest rune rev with exit codes",
+      "blocking": true,
+      "dimension": "behavior"
+    }
+  ],
+  "evidence": [
+    "checks-run"
+  ],
+  "ownershipPaths": [
+    "i686-probe"
+  ],
+  "dependencies": [],
+  "independentFrom": [],
+  "specialist": {
+    "model": "haiku",
+    "effort": "medium",
+    "startedAt": "2026-11-10T11:15:35.520Z"
+  },
+  "createdAt": "2026-11-10T11:15:35.520Z"
+}
