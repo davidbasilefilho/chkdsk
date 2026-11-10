@@ -12,10 +12,13 @@ use chkdsk_core::{
 use chkdsk_windows::backend::QueryErrorState;
 use std::{collections::HashSet, time::Duration};
 
-/// The three colors of the palette: healthy, attention, no usable data.
+/// How loudly a disk speaks: healthy, a passing disk with warnings (caution),
+/// a device-reported failure (attention) or no usable data. Caution reads "Atenção"
+/// and attention reads "Crítico", so the two differ in words as well as color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Healthy,
+    Caution,
     Attention,
     Unknown,
 }
@@ -29,7 +32,20 @@ pub struct Card {
     /// Title of the detail panel.
     pub title: String,
     pub subtitle: String,
+    /// The subtitle for the disk list, without the bus and with tight separators.
+    pub list_subtitle: String,
+    /// The disk sits behind a USB bridge: the list says so next to the name.
+    pub usb: bool,
+    /// Bus, firmware, serial and data sources, for the collapsed Avançado section.
+    pub details: Vec<Detail>,
     pub body: Body,
+}
+
+/// One technical fact about a disk: `Barramento`, `NVMe`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Detail {
+    pub label: &'static str,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,8 +61,13 @@ pub enum Body {
 pub struct Health {
     pub tone: Tone,
     pub label: &'static str,
-    /// `93`; none when there is no usable evidence.
-    pub score: Option<String>,
+    /// 0 to 100; none when there is no usable evidence.
+    pub score: Option<u8>,
+    /// How much evidence stands behind the score, 0 to 1.
+    pub confidence: f64,
+    /// No wear source was measured, so the score is kept for export but never
+    /// shown as a number.
+    pub limited: bool,
     /// `412 dias` or `aguardando histórico`.
     pub lifetime: String,
     /// The lifetime is an estimate, not the waiting placeholder.
@@ -60,22 +81,19 @@ pub struct Health {
     pub last_reading: String,
     /// Device-reported failures and softer signals behind the score, one line each.
     pub warnings: Vec<String>,
-    /// What to do about an Atenção verdict or a limited assessment.
+    /// What to do about an Atenção or Crítico verdict or a limited assessment.
     pub advice: Option<&'static str>,
-    /// Counters that SMART reports the same way on every drive, one row each.
-    pub details: Vec<Detail>,
+    /// Counters that SMART reports the same way on every drive, one row each,
+    /// for the Avançado section.
+    pub counters: Vec<Detail>,
     pub attributes: Vec<AttributeRow>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Detail {
-    pub label: &'static str,
-    pub value: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttributeRow {
     pub id: String,
+    /// The attribute's usual name where it is the same on every drive.
+    pub name: String,
     pub current: String,
     pub worst: String,
     /// The device's declared failure threshold; `—` when it declares none.
@@ -115,6 +133,12 @@ impl Card {
         } else {
             format!("{kind_label}  ·  {capacity}")
         };
+        // The list row shares its line with the status word, so the bus moves to the
+        // name line and the media shrinks to nothing when a bridge hides it.
+        let list_subtitle = match (usb, kind) {
+            (true, DiskKind::Unknown) => capacity,
+            _ => format!("{kind_label} · {capacity}"),
+        };
         let body = match &snapshot.reading {
             Reading::Pending => Body::Loading,
             Reading::Failed(state) => Body::Message(query_error_message_for(identity, *state)),
@@ -125,8 +149,24 @@ impl Card {
             list_name: model.unwrap_or("Disco").into(),
             title: model.unwrap_or("Modelo desconhecido").into(),
             subtitle,
+            list_subtitle,
+            usb,
+            details: details(identity, &snapshot.reading),
             body,
         }
+    }
+
+    /// Avançado has something to show: technical details or the ATA table.
+    pub fn has_advanced(&self) -> bool {
+        let attributes = match &self.body {
+            Body::Health(health) => health.attributes.len(),
+            _ => 0,
+        };
+        let counters = match &self.body {
+            Body::Health(health) => health.counters.len(),
+            _ => 0,
+        };
+        !self.details.is_empty() || counters > 0 || attributes > 0
     }
 
     /// The word next to the disk in the list, so color is never the only signal.
@@ -162,10 +202,11 @@ impl Health {
             HealthOutcome::Pass if health.warnings.is_empty() && health.score > 50 => {
                 ("Saudável", Tone::Healthy)
             }
-            HealthOutcome::Pass | HealthOutcome::Fail => ("Atenção", Tone::Attention),
+            HealthOutcome::Pass => ("Atenção", Tone::Caution),
+            HealthOutcome::Fail => ("Crítico", Tone::Attention),
             HealthOutcome::Unknown => ("Indisponível", Tone::Unknown),
         };
-        let score = (health.outcome != HealthOutcome::Unknown).then(|| health.score.to_string());
+        let score = (health.outcome != HealthOutcome::Unknown).then_some(health.score);
         // A USB bridge that forwards nothing leaves identity and capacity only.
         let bridge_blocks_smart = identity.is_usb()
             && health.outcome == HealthOutcome::Unknown
@@ -185,6 +226,8 @@ impl Health {
             tone,
             label,
             score,
+            confidence: health.confidence,
+            limited: health.limited,
             lifetime: ready
                 .remaining_seconds
                 .map(format_endurance_days)
@@ -210,7 +253,7 @@ impl Health {
                 .unwrap_or_else(|| "indisponível".into()),
             warnings: warning_lines(&health, telemetry),
             advice: advice(&health, tone, kind),
-            details: details(telemetry),
+            counters: counters(telemetry),
             attributes: match &telemetry.ata {
                 QueryState::Success(ata) => ata.attributes.iter().map(attribute_row).collect(),
                 _ => Vec::new(),
@@ -222,7 +265,7 @@ impl Health {
 /// Counts every ATA drive without a model profile reports the same way
 /// (smartmontools' default layouts). A profiled drive's raw fields are decoded
 /// by its profile, so they stay out of this list.
-fn details(telemetry: &Telemetry) -> Vec<Detail> {
+fn counters(telemetry: &Telemetry) -> Vec<Detail> {
     // Set by `apply_ata` only for a drive with no model profile.
     let (QueryState::Success(_), Some(generic)) = (&telemetry.ata, telemetry.generic_ata) else {
         return Vec::new();
@@ -252,17 +295,17 @@ fn details(telemetry: &Telemetry) -> Vec<Detail> {
     .collect()
 }
 
-/// What to do next: back up on a verdict of Atenção, check the cable when that
+/// What to do next: back up on a verdict of Atenção or Crítico, check the cable when that
 /// is the only cause, and where to find the wear when the disk does not say.
 fn advice(health: &HealthScore, tone: Tone, kind: DiskKind) -> Option<&'static str> {
     match tone {
-        Tone::Attention
+        Tone::Caution
             if health.outcome == HealthOutcome::Pass
                 && health.warnings == [HealthWarningReason::AtaInterfaceCrc] =>
         {
             Some(CABLE_ADVICE)
         }
-        Tone::Attention => Some(BACKUP_ADVICE),
+        Tone::Caution | Tone::Attention => Some(BACKUP_ADVICE),
         Tone::Unknown if health.limited && kind == DiskKind::Ssd => Some(LIMITED_SSD_ADVICE),
         Tone::Unknown if health.limited => Some(LIMITED_ADVICE),
         Tone::Healthy | Tone::Unknown => None,
@@ -273,10 +316,9 @@ const BACKUP_ADVICE: &str = "Faça backup dos dados importantes.";
 const CABLE_ADVICE: &str =
     "Troque o cabo de dados ou a porta e confira se o número de erros continua subindo.";
 const LIMITED_SSD_ADVICE: &str =
-    "Use o programa do fabricante do SSD para ver o desgaste, que este disco não informa.";
+    "Use o programa do fabricante do SSD para ver a vida útil restante.";
 /// A drive of unknown kind may not be an SSD, so the advice names no media.
-const LIMITED_ADVICE: &str =
-    "Use o programa do fabricante do disco para ver o desgaste, que este disco não informa.";
+const LIMITED_ADVICE: &str = "Use o programa do fabricante do disco para ver a vida útil restante.";
 
 /// Failures the device declared, then the softer signals behind the score.
 fn warning_lines(health: &HealthScore, telemetry: &Telemetry) -> Vec<String> {
@@ -436,7 +478,15 @@ fn values_against(current: u8, threshold: u8) -> String {
 /// `Setores realocados (05)`: the attribute's usual name where it is the same on
 /// every drive, so the number in the table can be found; otherwise only its ID.
 fn attribute_label(id: u8) -> String {
-    let name = match id {
+    format!(
+        "{} ({id:02X})",
+        attribute_name(id).unwrap_or("Atributo ATA")
+    )
+}
+
+/// The name most drives agree on; vendors define the rest.
+pub fn attribute_name(id: u8) -> Option<&'static str> {
+    Some(match id {
         0x01 => "Taxa de erros de leitura",
         0x03 => "Tempo de aceleração do disco",
         0x04 => "Ciclos de partida e parada",
@@ -447,15 +497,67 @@ fn attribute_label(id: u8) -> String {
         0x0C => "Ciclos de energia",
         0xBB => "Erros incorrigíveis reportados",
         0xBC => "Tempos limite de comando",
-        0xBE => "Temperatura do fluxo de ar",
+        0xBE => "Temperatura do ar",
         0xC2 => "Temperatura",
         0xC4 => "Eventos de realocação",
         0xC5 => "Setores pendentes",
         0xC6 => "Setores incorrigíveis offline",
         0xC7 => "Erros de CRC na interface",
-        _ => "Atributo ATA",
+        _ => return None,
+    })
+}
+
+/// `96%`: the score as the window and the exports write it.
+pub fn percent(value: u8) -> String {
+    format!("{value}%")
+}
+
+/// What the Avançado section lists besides the attribute table: where the disk
+/// sits on the machine and which readings the numbers above came from.
+fn details(identity: &DiskIdentity, reading: &Reading) -> Vec<Detail> {
+    let mut details = Vec::new();
+    let mut add = |label: &'static str, value: Option<&str>| {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            details.push(Detail {
+                label,
+                value: value.to_owned(),
+            });
+        }
     };
-    format!("{name} ({id:02X})")
+    add("Barramento", identity.bus.as_deref());
+    add("Firmware", identity.firmware.as_deref());
+    add("Número de série", identity.serial.as_deref());
+    if let Reading::Ready(ready) = reading {
+        let sources = data_sources(&ready.telemetry);
+        add(
+            "Fontes dos dados",
+            (!sources.is_empty()).then(|| sources.join(", ")).as_deref(),
+        );
+        add(
+            "Perfil de atributos",
+            ready.telemetry.ata_profile.as_deref(),
+        );
+    }
+    details
+}
+
+/// The readings that succeeded, as the user would name them.
+fn data_sources(telemetry: &Telemetry) -> Vec<&'static str> {
+    let mut sources = Vec::new();
+    if matches!(&telemetry.nvme, QueryState::Success(_)) {
+        sources.push("log de saúde NVMe");
+    }
+    if let QueryState::Success(ata) = &telemetry.ata {
+        sources.push(if ata.thresholds_available {
+            "SMART ATA com limites"
+        } else {
+            "SMART ATA sem limites"
+        });
+    }
+    if matches!(&telemetry.overall_failure, QueryState::Success(_)) {
+        sources.push("estado geral SMART");
+    }
+    sources
 }
 
 fn attribute_row(attribute: &AtaAttribute) -> AttributeRow {
@@ -468,6 +570,9 @@ fn attribute_row(attribute: &AtaAttribute) -> AttributeRow {
         .collect();
     AttributeRow {
         id: format!("{:02X}", attribute.id),
+        name: attribute_name(attribute.id)
+            .unwrap_or("Específico do fabricante")
+            .into(),
         current: attribute.current.to_string(),
         worst: attribute.worst.to_string(),
         threshold: attribute
@@ -770,7 +875,7 @@ mod tests {
         };
         for (telemetry, label, tone) in [
             (healthy, "Saudável", Tone::Healthy),
-            (worn, "Atenção", Tone::Attention),
+            (worn, "Crítico", Tone::Attention),
             (Telemetry::default(), "Indisponível", Tone::Unknown),
         ] {
             let expected = score_health(DiskKind::Nvme, &telemetry);
@@ -783,7 +888,7 @@ mod tests {
             };
             assert_eq!((health.label, health.tone), (label, tone));
             if tone != Tone::Unknown {
-                assert_eq!(health.score, Some(expected.score.to_string()));
+                assert_eq!(health.score, Some(expected.score));
             } else {
                 assert_eq!(health.score, None);
             }
@@ -966,6 +1071,7 @@ mod tests {
             health.attributes,
             [AttributeRow {
                 id: "C2".into(),
+                name: "Temperatura".into(),
                 current: "71".into(),
                 worst: "53".into(),
                 threshold: "10".into(),
@@ -984,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn a_passing_disk_with_soft_signals_reads_as_attention_and_says_why() {
+    fn a_passing_disk_with_soft_signals_reads_as_caution_and_says_why() {
         let telemetry = Telemetry {
             nvme: QueryState::Success(NvmeHealth {
                 percentage_used: Some(4),
@@ -998,8 +1104,13 @@ mod tests {
             HealthOutcome::Pass
         );
         let health = health_of(telemetry, DiskKind::Nvme);
-        assert_eq!((health.label, health.tone), ("Atenção", Tone::Attention));
+        assert_eq!((health.label, health.tone), ("Atenção", Tone::Caution));
         assert!(health.score.is_some());
+        assert_eq!(
+            health.advice,
+            Some(BACKUP_ADVICE),
+            "caution still advises a backup"
+        );
         assert_eq!(health.warnings, ["Erros de mídia NVMe registrados: 12"]);
 
         let exhausted = Telemetry {
@@ -1048,7 +1159,7 @@ mod tests {
             ..Default::default()
         };
         let health = health_of(spare_only, DiskKind::Nvme);
-        assert_eq!(health.label, "Atenção");
+        assert_eq!(health.label, "Crítico");
         assert_eq!(
             health.warnings,
             ["Reserva NVMe abaixo do limite (5% < 10%)"]
@@ -1077,7 +1188,7 @@ mod tests {
             ..Default::default()
         };
         let health = health_of(telemetry, DiskKind::Hdd);
-        assert_eq!((health.label, health.tone), ("Atenção", Tone::Attention));
+        assert_eq!((health.label, health.tone), ("Crítico", Tone::Attention));
         assert_eq!(
             health.warnings,
             [
@@ -1219,7 +1330,9 @@ mod tests {
         assert_eq!(health.wear, "indisponível");
         assert_eq!((health.label, health.tone), ("Limitada", Tone::Unknown));
         assert_ne!(health.label, "Saudável");
-        assert_eq!(health.score.as_deref(), Some("100"));
+        // Kept for the export, with its confidence; the window shows no number for it.
+        assert_eq!(health.score, Some(100));
+        assert!(health.limited && health.confidence < 0.5);
         assert_eq!(
             health.status,
             "Avaliação limitada: o disco não informa desgaste"
@@ -1228,7 +1341,7 @@ mod tests {
         assert!(health.warnings.is_empty());
         let detail = |label: &str| {
             health
-                .details
+                .counters
                 .iter()
                 .find(|detail| detail.label == label)
                 .map(|detail| detail.value.as_str())
@@ -1240,6 +1353,28 @@ mod tests {
             None,
             "absent rows are not invented"
         );
+    }
+
+    #[test]
+    fn an_attribute_id_without_a_shared_name_is_labeled_vendor_specific() {
+        let health = health_of(
+            unprofiled(vec![
+                row(0x05, 0),
+                row(0xA0, 0),
+                row(0xC2, 0x0037_0014_0029),
+            ]),
+            DiskKind::Ssd,
+        );
+        let name = |id: &str| {
+            health
+                .attributes
+                .iter()
+                .find(|attribute| attribute.id == id)
+                .map(|attribute| attribute.name.as_str())
+        };
+        assert_eq!(name("A0"), Some("Específico do fabricante"));
+        assert_eq!(name("05"), Some("Setores realocados"));
+        assert_eq!(name("C2"), Some("Temperatura"));
     }
 
     #[test]
@@ -1272,7 +1407,7 @@ mod tests {
             },
             Some("WDC WD10EZEX-00WN4A0"),
         );
-        assert!(health_of(wd, DiskKind::Hdd).details.is_empty());
+        assert!(health_of(wd, DiskKind::Hdd).counters.is_empty());
     }
 
     #[test]
@@ -1281,7 +1416,7 @@ mod tests {
             unprofiled(vec![row(0x05, 3), row(0xC5, 1), row(0xBB, 2)]),
             DiskKind::Ssd,
         );
-        assert_eq!((health.label, health.tone), ("Atenção", Tone::Attention));
+        assert_eq!((health.label, health.tone), ("Atenção", Tone::Caution));
         assert_eq!(
             health.warnings,
             [
@@ -1292,7 +1427,7 @@ mod tests {
         );
         assert_eq!(health.advice, Some(BACKUP_ADVICE));
         let values: Vec<_> = health
-            .details
+            .counters
             .iter()
             .map(|detail| (detail.label, detail.value.as_str()))
             .collect();
@@ -1306,7 +1441,7 @@ mod tests {
         );
 
         let critical = health_of(unprofiled(vec![row(0x05, 150)]), DiskKind::Ssd);
-        assert_eq!(critical.label, "Atenção");
+        assert_eq!(critical.label, "Crítico");
         assert!(critical.warnings.contains(
             &"Quantidade alta de setores com defeito; copie seus dados e considere trocar o disco"
                 .to_string()
@@ -1316,7 +1451,7 @@ mod tests {
     #[test]
     fn interface_crc_errors_point_at_the_cable_not_the_drive() {
         let health = health_of(unprofiled(vec![row(0x05, 0), row(0xC7, 12)]), DiskKind::Ssd);
-        assert_eq!((health.label, health.tone), ("Atenção", Tone::Attention));
+        assert_eq!((health.label, health.tone), ("Atenção", Tone::Caution));
         assert_eq!(
             health.warnings,
             [
@@ -1324,10 +1459,10 @@ mod tests {
             ]
         );
         assert_eq!(health.advice, Some(CABLE_ADVICE));
-        assert_eq!(health.score.as_deref(), Some("100"), "not drive wear");
+        assert_eq!(health.score, Some(100), "not drive wear");
         assert!(
             health
-                .details
+                .counters
                 .iter()
                 .any(|detail| detail.label == "Erros de CRC na interface" && detail.value == "12")
         );
@@ -1344,6 +1479,9 @@ mod tests {
         let unreachable = card(stick.clone(), Reading::Failed(QueryErrorState::Unsupported));
         assert_eq!(unreachable.title, "Lexar USB Flash Drive");
         assert_eq!(unreachable.subtitle, "USB  ·  29,8 GiB");
+        // The list names the bus beside the name, so its subtitle keeps the capacity short.
+        assert!(unreachable.usb);
+        assert_eq!(unreachable.list_subtitle, "29,8 GiB");
         let Body::Message(message) = &unreachable.body else {
             panic!("an unreadable disk shows a message");
         };
@@ -1384,9 +1522,8 @@ mod tests {
 
         // A known kind over USB keeps its kind and names the bus.
         stick.kind = DiskKind::Ssd;
-        assert_eq!(
-            card(stick, Reading::Pending).subtitle,
-            "SSD  ·  USB  ·  29,8 GiB"
-        );
+        let known = card(stick, Reading::Pending);
+        assert_eq!(known.subtitle, "SSD  ·  USB  ·  29,8 GiB");
+        assert_eq!(known.list_subtitle, "SSD · 29,8 GiB");
     }
 }

@@ -5,10 +5,12 @@
 //! generic SATA SSD with no wear attribute and a USB stick whose adapter does
 //! not forward SMART.
 //! `chkdsk --snap out.png --scene saudavel` renders them without a disk.
+//! Two more scenes show Avançado open and the export confirmation.
 
 use crate::{
     collector::{DiskSnapshot, Reading, Update, ready_reading},
-    ui::{Dashboard, Scene},
+    export::{Failure, Outcome},
+    ui::{Dashboard, Scene, Toast},
 };
 use chkdsk_core::{
     history::{HealthSample, History},
@@ -31,6 +33,26 @@ pub const SCENES: &[Scene] = &[
     ("atencao-leve", |s| *s = dashboard(6)),
     ("ssd-generico", |s| *s = dashboard(7)),
     ("usb-sem-smart", |s| *s = dashboard(8)),
+    ("avancado-aberto", |s| {
+        *s = dashboard(1);
+        s.advanced = true;
+    }),
+    ("exportado", |s| {
+        *s = dashboard(0);
+        s.toast = Some(Toast {
+            outcome: Outcome::Saved {
+                name: "chkdsk-discos.json".into(),
+            },
+            until: None,
+        });
+    }),
+    ("exportar-falhou", |s| {
+        *s = dashboard(0);
+        s.toast = Some(Toast {
+            outcome: Outcome::Failed(Failure::Write),
+            until: None,
+        });
+    }),
     ("procurando", |s| *s = Dashboard::default()),
     ("descoberta", |s| {
         *s = Dashboard::default();
@@ -81,13 +103,15 @@ pub fn history(disk: &DiskIdentity, samples: &[(u64, f64)]) -> History {
 }
 
 pub fn disks() -> Vec<DiskSnapshot> {
-    let nvme = identity(
+    let mut nvme = identity(
         "interface:nvme-0",
         "Samsung SSD 990 PRO 1TB",
         DiskKind::Nvme,
         "NVMe",
         1_000_204_886_016,
     );
+    nvme.firmware = Some("4B2QJXD7".into());
+    nvme.serial = Some("S73VNJ0W412345".into());
     let mut healthy = Telemetry::default();
     healthy.apply_nvme(NvmeHealth {
         composite_temperature_kelvin: Some(311),
@@ -99,13 +123,15 @@ pub fn disks() -> Vec<DiskSnapshot> {
     });
     let healthy_history = history(&nvme, &[(33, 5.0), (1, 7.0)]);
 
-    let hdd = identity(
+    let mut hdd = identity(
         "interface:sata-1",
         "WDC WD10EZEX-08WN4A0",
         DiskKind::Hdd,
         "SATA",
         1_000_204_886_016,
     );
+    hdd.firmware = Some("01.01A01".into());
+    hdd.serial = Some("WD-WCC6Y0RZ1234".into());
     // Normalized values, declared thresholds and raw counts as a worn WD Blue reports them.
     let attributes = [
         (0x01, 100, 100, Some(51), 0),

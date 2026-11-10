@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod collector;
+mod export;
 #[cfg(any(test, feature = "scenes"))]
 mod fixtures;
 mod present;
@@ -8,7 +9,7 @@ mod ui;
 
 use chkdsk_windows::elevation;
 
-use rune::{App, AppSpec};
+use rune::{App, AppSpec, Titlebar};
 
 const TITLE: &str = concat!("chkdsk v", env!("CARGO_PKG_VERSION"));
 
@@ -43,20 +44,25 @@ fn main() {
         scenes: SCENES,
         families: FAMILIES,
         on_key: Some(ui::on_key),
+        poll: Some(ui::poll),
+        setup: Some(ui::setup),
         ..AppSpec::new(TITLE, (1100.0, 720.0), ui::Dashboard::default, ui::view)
-    });
+    })
+    // The window draws its own title bar; rune keeps the native resize edges, snap
+    // layouts and window menu, and draws the caption buttons.
+    .titlebar(Titlebar::new(ui::TITLEBAR_HEIGHT))
+    .on_focus(ui::on_focus);
     let handle = app.handle();
     // Collection starts after the first frame; headless captures never start it.
     let mut started = false;
-    let app = app.on_ready(move |_| {
+    let app = app.on_ready(move |window| {
+        // The Save dialog opens over this window; a recreated window reports itself again.
+        export::remember_owner(window);
         if !std::mem::replace(&mut started, true) {
             let handle = handle.clone();
             collector::spawn(move |update| {
                 let now = ui::now_unix();
-                handle.update_if(move |state, tx| {
-                    tx.instant();
-                    state.deliver(update, now, tx)
-                });
+                handle.update_if(move |state, tx| state.deliver(update, now, tx));
             });
         }
     });

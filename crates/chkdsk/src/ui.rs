@@ -1,30 +1,64 @@
-//! A janela: lista de discos à esquerda e, à direita, o painel do disco
-//! selecionado com a nota em destaque. A janela só desenha cartões já
-//! formatados (`present`); nenhuma E/S nem formatação acontece em `view`.
+//! A janela: a barra de título própria, a lista de discos sobre o fundo e o
+//! painel do disco selecionado, elevado e recuado das bordas. A janela só
+//! desenha cartões já formatados (`present`); nenhuma E/S nem formatação
+//! acontece em `view`.
+
+mod detail;
+#[cfg(feature = "scenes")]
+mod preview;
+mod scrollbar;
+mod titlebar;
 
 use crate::{
-    collector::Update,
-    present::{AttributeRow, Body, Card, Health, Tone},
+    collector::{DiskSnapshot, Update},
+    export::{self, Failure, Outcome},
+    present::{Card, Tone},
 };
 use rune::{
-    Align, Color, Cursor, Cx, El, Key, KeyEvent, Live, ScrollSpec, Tx, col, oklch, row, text,
+    Color, Cursor, Cx, El, HelpLook, Key, KeyEvent, Transition, Tx, Waker, col, el, oklch, row,
+    text,
     tok::{self, TextStyle},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use scrollbar::{Bars, Which};
+use std::{
+    sync::mpsc::{self, Receiver, Sender},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-const SIDEBAR_WIDTH: f32 = 272.0;
+/// Height of the title bar the window draws (`App::titlebar`).
+pub const TITLEBAR_HEIGHT: f32 = titlebar::HEIGHT;
 const SCROLL_STEP: f32 = 56.0;
 const DETAIL_KEY: &str = "detalhe";
+const LIST_KEY: &str = "lista";
+/// Below this window width the list and the panel give up some room.
+const NARROW_BELOW: f32 = 900.0;
+/// How long the export confirmation stays in the title bar.
+const TOAST_SECONDS: f64 = 5.0;
+
+// Spacing on a 4 pt grid.
+const S1: f32 = 4.0;
+const S2: f32 = 8.0;
+const S3: f32 = 12.0;
+const S4: f32 = 16.0;
+const S5: f32 = 20.0;
+const S6: f32 = 24.0;
+const S8: f32 = 32.0;
+
 /// The pill's tint of its own color; low enough for 4.5:1 text whatever the blend mode.
 const PILL_TINT: f32 = 0.08;
+/// The framed verdict is a larger area, so its tint is lighter: its reasons and advice
+/// sit on it and keep 4.5:1.
+const FRAME_TINT: f32 = 0.05;
 
-// Windows type ramp: Caption 12/16, Body 14/20, Subtitle 20/28, Display 72 (semibold, never bold).
+// Windows type ramp: Caption 12/16, Body 14/20, Subtitle 20/28 (semibold, never bold),
+// with a larger score in place of Display. Only the wordmark in the title bar is bold.
 const CAPTION: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0);
-const CAPTION_STRONG: TextStyle = TextStyle::new(12.0, 600.0).lh(16.0);
+const CAPTION_NUMBER: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0).features("'tnum' 1");
+const CAPTION_STRONG: TextStyle = TextStyle::new(12.0, 600.0).lh(16.0).features("'tnum' 1");
 const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(20.0).features("'tnum' 1");
 const BODY_STRONG: TextStyle = TextStyle::new(14.0, 600.0).lh(20.0).features("'tnum' 1");
 const SUBTITLE: TextStyle = TextStyle::new(20.0, 600.0).lh(28.0);
-const SCORE: TextStyle = TextStyle::new(72.0, 600.0).lh(80.0).features("'tnum' 1");
+const SCORE: TextStyle = TextStyle::new(64.0, 600.0).lh(72.0).features("'tnum' 1");
 
 /// A named state for headless captures (`--scene`).
 pub type Scene = (&'static str, fn(&mut Dashboard));
@@ -55,21 +89,71 @@ impl Notice {
     }
 }
 
+/// The export's confirmation in the title bar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Toast {
+    pub outcome: Outcome,
+    /// Window clock second at which it goes away; none stays.
+    pub until: Option<f64>,
+}
+
+/// Where the keyboard focus rests, so Tab knows where to go on from. Tab walks the
+/// disks one by one, then Avançado (when the open disk has it), then Exportar, and
+/// back to the first disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    Disk,
+    Advanced,
+    Export,
+}
+
+/// The export in flight: its thread answers through the channel and wakes the window.
+/// `None` is a closed dialog, which says nothing.
+struct Exporting {
+    sender: Sender<Option<Outcome>>,
+    receiver: Receiver<Option<Outcome>>,
+    waker: Option<Waker>,
+    saving: bool,
+}
+
 pub struct Dashboard {
     pub cards: Vec<Card>,
     pub selected: usize,
     pub notice: Notice,
-    /// Where the detail panel is scrolled, as the viewport reports it.
-    scroll: Live<f32>,
+    /// What `cards` were made from, for the export.
+    snapshots: Vec<DiskSnapshot>,
+    /// Avançado is open. Per window: never saved.
+    pub advanced: bool,
+    /// The window has the keyboard focus; the title bar dims without it.
+    focused: bool,
+    pub toast: Option<Toast>,
+    stop: Stop,
+    exporting: Exporting,
+    /// The Save dialog; tests put a scripted one here.
+    picker: Option<export::Picker>,
+    bars: Bars,
 }
 
 impl Default for Dashboard {
     fn default() -> Self {
+        let (sender, receiver) = mpsc::channel();
         Self {
             cards: Vec::new(),
             selected: 0,
             notice: Notice::Searching,
-            scroll: Live::new(0.0),
+            snapshots: Vec::new(),
+            advanced: false,
+            focused: true,
+            toast: None,
+            stop: Stop::Disk,
+            exporting: Exporting {
+                sender,
+                receiver,
+                waker: None,
+                saving: false,
+            },
+            picker: export::PICKER,
+            bars: Bars::default(),
         }
     }
 }
@@ -99,6 +183,7 @@ impl Dashboard {
                 let changed =
                     cards != self.cards || selected != self.selected || notice != self.notice;
                 (self.cards, self.selected, self.notice) = (cards, selected, notice);
+                self.snapshots = snapshots;
                 changed
             }
             // Only the empty window shows the notice; with disks listed it stays as is.
@@ -115,9 +200,18 @@ impl Dashboard {
     /// `apply` for the window: when the selection moves to another disk because
     /// the selected one vanished, the panel opens at its top, as `select` does.
     /// Whenever the selected row moves, the list scrolls to keep it visible.
+    /// A new set of disks lands at once; a reading that changes a disk's score
+    /// or status animates.
     pub fn deliver(&mut self, update: Update, now: u64, tx: &mut Tx) -> bool {
         let before = (self.selected, self.selected_id().map(str::to_owned));
+        let ids: Vec<String> = self.cards.iter().map(|card| card.id.clone()).collect();
         let changed = self.apply(update, now);
+        if self.cards.iter().map(|card| &card.id).ne(ids.iter()) {
+            tx.instant();
+        } else {
+            tx.animated();
+            tx.color_motion(tok::motion::CALM);
+        }
         let id = self.selected_id();
         if id != before.1.as_deref() {
             tx.scroll_to_instant(DETAIL_KEY, 0.0, 0.0);
@@ -138,6 +232,7 @@ impl Dashboard {
         if self.cards.is_empty() {
             return;
         }
+        self.stop = Stop::Disk;
         let index = index.min(self.cards.len() - 1);
         if index != self.selected {
             self.selected = index;
@@ -152,26 +247,206 @@ impl Dashboard {
         } else {
             self.selected.saturating_sub(1)
         };
-        self.select(index, tx);
+        self.show_disk(index, tx);
     }
 
     fn scroll_by(&self, delta: f32, tx: &mut Tx) {
-        tx.scroll_to(DETAIL_KEY, 0.0, (self.scroll.get() + delta).max(0.0));
+        tx.scroll_to(
+            DETAIL_KEY,
+            0.0,
+            (self.bars.detail.offset() + delta).max(0.0),
+        );
+    }
+
+    /// The open disk has an Avançado section to show.
+    pub fn has_advanced(&self) -> bool {
+        self.cards
+            .get(self.selected)
+            .is_some_and(Card::has_advanced)
+    }
+
+    /// Open or close Avançado; opening brings its content into view. A disk without
+    /// the section has nothing to toggle.
+    pub fn toggle_advanced(&mut self, tx: &mut Tx) {
+        if !self.has_advanced() {
+            return;
+        }
+        self.advanced = !self.advanced;
+        if self.advanced {
+            // The header goes to the top, with its content below it.
+            tx.scroll_key_to("avancado", S2);
+        }
+    }
+
+    /// The Export action can run: this platform has the Save dialog, there is
+    /// something to write and no dialog is open.
+    pub fn can_export(&self) -> bool {
+        export::SUPPORTED && !self.snapshots.is_empty() && !self.exporting.saving
+    }
+
+    /// Ask where to save and write every disk there. The dialog blocks, so it
+    /// and the file run on their own thread; `poll` takes the answer.
+    pub fn start_export(&mut self, tx: &mut Tx) {
+        if !self.can_export() {
+            return;
+        }
+        self.toast = None;
+        let Some(picker) = self.picker else {
+            return self.finish_export(Some(Outcome::Unavailable), tx);
+        };
+        self.exporting.saving = true;
+        let snapshots = self.snapshots.clone();
+        let (now, owner) = (now_unix(), export::owner_window());
+        let sender = self.exporting.sender.clone();
+        let waker = self.exporting.waker.clone();
+        let spawned = std::thread::Builder::new()
+            .name("chkdsk-export".into())
+            .spawn(move || {
+                // Whatever happens inside, the window hears an answer and stops saving.
+                let outcome = export::run_isolated(
+                    &snapshots,
+                    now,
+                    owner,
+                    Some(picker),
+                    export::stored_history,
+                );
+                let _ = sender.send(outcome);
+                if let Some(wake) = waker {
+                    wake();
+                }
+            });
+        if spawned.is_err() {
+            self.finish_export(Some(Outcome::Failed(Failure::Start)), tx);
+        }
+    }
+
+    /// The export ended: say how, unless the user only closed the dialog.
+    pub fn finish_export(&mut self, outcome: Option<Outcome>, tx: &mut Tx) {
+        self.exporting.saving = false;
+        self.toast = outcome.map(|outcome| {
+            let until = tx.clock() + TOAST_SECONDS;
+            tx.wake_at(until);
+            Toast {
+                outcome,
+                until: Some(until),
+            }
+        });
+    }
+
+    /// Tab goes through the disks, then Avançado and Exportar where they can be used,
+    /// and wraps around; Shift+Tab goes back. Every stop shows the focus ring.
+    fn tab(&mut self, forward: bool, tx: &mut Tx) {
+        let controls: Vec<Stop> = [
+            (Stop::Advanced, self.has_advanced()),
+            (Stop::Export, self.can_export()),
+        ]
+        .into_iter()
+        .filter_map(|(stop, usable)| usable.then_some(stop))
+        .collect();
+        let here = if self.stop == Stop::Disk || controls.contains(&self.stop) {
+            self.stop
+        } else {
+            Stop::Disk
+        };
+        let last = self.cards.len().saturating_sub(1);
+        let position = controls.iter().position(|stop| *stop == here);
+        let target = match (here, forward) {
+            (Stop::Disk, true) if self.selected < last => Stop::Disk,
+            (Stop::Disk, true) => controls.first().copied().unwrap_or(Stop::Disk),
+            (Stop::Disk, false) if self.selected > 0 => Stop::Disk,
+            (Stop::Disk, false) => controls.last().copied().unwrap_or(Stop::Disk),
+            (_, true) => position
+                .and_then(|index| controls.get(index + 1).copied())
+                .unwrap_or(Stop::Disk),
+            (_, false) => position
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|index| controls.get(index).copied())
+                .unwrap_or(Stop::Disk),
+        };
+        match target {
+            Stop::Disk if here == Stop::Disk => {
+                // Past the last disk with nothing else to visit, Tab stays put.
+                let next = if forward {
+                    (self.selected + 1).min(last)
+                } else {
+                    self.selected.saturating_sub(1)
+                };
+                self.show_disk(next, tx);
+            }
+            // Coming back from a control wraps to the far end of the list.
+            Stop::Disk => self.show_disk(if forward { 0 } else { last }, tx),
+            control => {
+                self.stop = control;
+                let key = if control == Stop::Advanced {
+                    "avancado"
+                } else {
+                    "exportar"
+                };
+                tx.focus(key, true);
+                // Avançado sits at the end of a long panel: bring it into view.
+                tx.scroll_into_view(key);
+            }
+        }
+    }
+
+    /// Select a disk from the keyboard and put the focus ring on its row.
+    fn show_disk(&mut self, index: usize, tx: &mut Tx) {
+        self.select(index, tx);
+        if let Some(id) = self.selected_id() {
+            tx.focus(row_key(id), true);
+        }
     }
 }
 
-/// The keys of the window: arrows and Tab switch disks (not with Ctrl, Alt or
-/// Super held, which belong to the system), Up and Down scroll the panel, `q`
-/// and Esc quit. Page keys are left to rune, which scrolls the panel.
+/// Runs at the start of every frame: takes an export's answer and ends a
+/// confirmation that has stayed long enough.
+pub fn poll(state: &mut Dashboard, clock: f64, tx: &mut Tx) -> bool {
+    let mut changed = false;
+    while let Ok(outcome) = state.exporting.receiver.try_recv() {
+        state.finish_export(outcome, tx);
+        changed = true;
+    }
+    if state
+        .toast
+        .as_ref()
+        .and_then(|toast| toast.until)
+        .is_some_and(|until| clock >= until)
+    {
+        state.toast = None;
+        changed = true;
+    }
+    changed
+}
+
+/// Keeps the waker the export thread calls when its dialog closes.
+pub fn setup(state: &mut Dashboard, waker: Waker) {
+    state.exporting.waker = Some(waker);
+}
+
+/// The window gained or lost the keyboard focus.
+pub fn on_focus(state: &mut Dashboard, focused: bool, _: &mut Tx) {
+    state.focused = focused;
+}
+
+/// The keys of the window: arrows switch disks, and Tab goes through the disks and
+/// then Avançado and Exportar (not with Ctrl, Alt or Super held, which belong to the
+/// system), Up and Down scroll the panel, `a` opens or closes Avançado when the disk
+/// has it, Ctrl+E exports, `q` and Esc quit. A focused control presses with Space or
+/// Return, which rune handles. Page keys are left to rune, which scrolls the panel.
 pub fn on_key(state: &mut Dashboard, event: &KeyEvent, tx: &mut Tx) -> bool {
     let mods = event.mods;
     let plain = !(mods.cmd || mods.ctrl || mods.alt || mods.logo);
+    if event.is_command('e') && !mods.alt && !mods.shift {
+        state.start_export(tx);
+        return true;
+    }
     match &event.key {
         Key::Escape => tx.quit(),
         Key::Text(text) if plain && text == "q" => tx.quit(),
+        Key::Text(text) if plain && text.eq_ignore_ascii_case("a") => state.toggle_advanced(tx),
         Key::Left if plain => state.step(false, tx),
         Key::Right if plain => state.step(true, tx),
-        Key::Tab if plain => state.step(!mods.shift, tx),
+        Key::Tab if plain => state.tab(!mods.shift, tx),
         Key::Up => state.scroll_by(-SCROLL_STEP, tx),
         Key::Down => state.scroll_by(SCROLL_STEP, tx),
         Key::Text(text) if plain && text == "k" => state.scroll_by(-SCROLL_STEP, tx),
@@ -187,106 +462,158 @@ pub fn now_unix() -> u64 {
         .map_or(0, |now| now.as_secs())
 }
 
+/// The window's colors. The window background holds the title bar and the list;
+/// the panel is the raised surface. Every status color keeps 4.5:1 as text on
+/// both, and 3:1 as a dot on the window background.
 struct Palette {
     theme: tok::Theme,
     accent: Color,
     healthy: Color,
+    caution: Color,
     attention: Color,
-    unknown: Color,
 }
 
 impl Palette {
     fn new(dark: bool, accent: Color) -> Self {
-        // Status colors keep 4.5:1 against the window and list backgrounds in both themes.
-        let (healthy, attention, unknown) = if dark {
+        let (healthy, caution, attention) = if dark {
             (
                 oklch(0.80, 0.16, 152.0),
+                oklch(0.82, 0.15, 82.0),
                 oklch(0.74, 0.17, 24.0),
-                oklch(0.84, 0.14, 88.0),
             )
         } else {
             (
                 oklch(0.45, 0.13, 152.0),
-                oklch(0.47, 0.19, 27.0),
-                oklch(0.46, 0.11, 72.0),
+                oklch(0.53, 0.14, 72.0),
+                oklch(0.47, 0.20, 25.0),
             )
         };
         Self {
             theme: tok::theme(dark),
             accent,
             healthy,
+            caution,
             attention,
-            unknown,
         }
     }
 
+    /// No usable data has no hue of its own: it is the quiet text color.
     fn tone(&self, tone: Tone) -> Color {
         match tone {
             Tone::Healthy => self.healthy,
+            Tone::Caution => self.caution,
             Tone::Attention => self.attention,
-            Tone::Unknown => self.unknown,
+            Tone::Unknown => self.theme.text_secondary,
         }
     }
 }
 
 pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
     let palette = Palette::new(cx.system_dark(), cx.accent());
-    let content = match state.cards.get(state.selected) {
+    let t = palette.theme;
+    cx.caption_color(t.text);
+    // Every pressable control takes focus, but Tab is the window's own (`State::tab`): it
+    // walks the disks, then Avançado and Exportar, so rune's traversal skips them all.
+    cx.web_focus();
+    cx.focus_ring(2.0, 2.0, t.text);
+    // Tooltips keep clear of the window edge, so they never cover the scroll bar, and
+    // sit far enough below their element that Exportar's clears the panel's top edge.
+    cx.help_look(HelpLook::system(cx.system_dark()).margin(S6).gap(S4));
+    let insets = cx.chrome_insets();
+    #[cfg(feature = "scenes")]
+    let insets = preview::insets(insets);
+    let narrow = cx
+        .layout_with("janela", |rect| rect[2] < NARROW_BELOW)
+        .unwrap_or(false);
+    let body = match state.cards.get(state.selected) {
         Some(card) => row()
             .grow(1.0)
             .min_h(0.0)
-            .child(sidebar(state, &palette))
-            .child(detail(card, &palette, &state.scroll)),
-        None => empty(state.notice, &palette),
+            .child(sidebar(state, &palette, narrow))
+            .child(detail::panel(state, card, &palette, narrow)),
+        None => row()
+            .grow(1.0)
+            .min_h(0.0)
+            .child(empty(state.notice, &palette)),
     };
-    col()
+    let window = col()
         .key("janela")
         .w_full()
         .h_full()
-        .fill(palette.theme.bg)
-        .child(content)
+        .fill(t.bg)
+        .child(titlebar::bar(
+            state,
+            &palette,
+            insets.leading,
+            insets.trailing,
+        ))
+        .child(body);
+    #[cfg(feature = "scenes")]
+    let window = window.children(preview::caption_buttons(&palette));
+    window
 }
 
 fn row_key(id: &str) -> String {
     format!("disco-{id}")
 }
 
-fn sidebar(state: &Dashboard, palette: &Palette) -> El {
+fn sidebar(state: &Dashboard, palette: &Palette, narrow: bool) -> El {
     let t = palette.theme;
-    let mut list = col().gap(4.0).padding(8.0);
+    let mut list = col().gap(S1).px(S3).pt(S1).pb(S3);
     for (index, card) in state.cards.iter().enumerate() {
         let selected = index == state.selected;
-        let dot = rune::el()
-            .w(8.0)
-            .h(8.0)
-            .radius(4.0)
-            .fill(card.tone().map_or(t.control_off, |tone| palette.tone(tone)));
-        let marker = rune::el()
-            .w(3.0)
-            .h(16.0)
-            .radius(1.5)
-            .ml(4.0)
-            .fill(if selected {
-                palette.accent
-            } else {
-                Color::TRANSPARENT
-            });
+        // A loading disk has no color yet: a ring, as visible as the dots.
+        let dot = match card.tone() {
+            Some(tone) => el().w(S2).h(S2).radius(S1).fill(palette.tone(tone)),
+            None => el().w(S2).h(S2).radius(S1).border(1.5, t.text_secondary),
+        };
+        // The highlight fades from one row to the next: a flying highlight is drawn above
+        // the whole window, so it would cover the text of every row it passes. The small
+        // accent marker has no text to cover, so it travels.
+        let highlight = selected.then(|| {
+            el().key("selecao")
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .radius(tok::radius::SM)
+                .fill(t.card)
+                .transition(Transition::opacity())
+        });
+        let marker = el().w(3.0).h(S4).ml(S1).children(selected.then(|| {
+            el().key("marcador")
+                .w(3.0)
+                .h(S4)
+                .radius(1.5)
+                .fill(palette.accent)
+                .matched("marcador")
+                .transition(Transition::opacity())
+        }));
         let status = card.status_label();
         let names = col()
             .grow(1.0)
             .min_w(0.0)
             .gap(2.0)
             .child(
-                text(card.list_name.clone())
-                    .font(if selected { BODY_STRONG } else { BODY })
-                    .color(t.text)
-                    .truncate(),
+                row()
+                    .gap(S2)
+                    // The smaller bus word sits on the name's baseline, not its top.
+                    .items_end()
+                    .child(
+                        text(card.list_name.clone())
+                            .font(if selected { BODY_STRONG } else { BODY })
+                            .color(t.text)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .children(
+                        card.usb
+                            .then(|| text("USB").font(CAPTION).color(t.text_secondary)),
+                    ),
             )
             .child(
                 row()
-                    .gap(8.0)
+                    .gap(S2)
                     .child(
-                        text(card.subtitle.clone())
+                        text(card.list_subtitle.clone())
                             .font(CAPTION)
                             .color(t.text_secondary)
                             .truncate()
@@ -302,44 +629,60 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
                 .label(format!("{}, {}, {status}", card.list_name, card.subtitle))
                 .checked(selected)
                 .h(56.0)
-                .px(8.0)
-                .gap(8.0)
+                .px(S2)
+                .gap(S2)
                 .center_y()
                 .radius(tok::radius::SM)
-                .fill(if selected {
-                    t.control_track
-                } else {
-                    Color::TRANSPARENT
-                })
                 .hover(t.hover)
+                .press(t.press)
                 .cursor(Cursor::Pointer)
+                .tab_index(-1)
                 .on_press_tx(move |s: &mut Dashboard, tx: &mut Tx| s.select(index, tx))
+                .children(highlight)
                 .child(marker)
                 .child(dot)
                 .child(names),
         );
     }
-    let panel = col()
+    col()
         .key("discos")
-        .w(SIDEBAR_WIDTH)
+        .w(if narrow { 248.0 } else { 272.0 })
         .h_full()
-        .fill(t.card)
         .child(
-            list.scroll(ScrollSpec {
+            list.scroll(rune::ScrollSpec {
                 stick_bottom: false,
             })
+            .key(LIST_KEY)
+            .scroll_edge_fade(S4)
+            // A row scrolled into view stops clear of the edge, so its focus ring is whole.
+            .scroll_margin(S4)
+            .on_scroll_offset(state.bars.list.follow())
             .grow(1.0)
             .min_h(0.0),
-        );
-    row()
-        .h_full()
-        .child(panel)
-        .child(rune::el().w(1.0).h_full().fill(t.separator))
+        )
+        .child(scrollbar::bar(Which::List, LIST_KEY, state, palette))
+}
+
+/// The raised panel's surface, shared by the detail and the empty states.
+fn raised(palette: &Palette) -> El {
+    let t = palette.theme;
+    col()
+        .grow(1.0)
+        .min_w(0.0)
+        .min_h(0.0)
+        .mt(S1)
+        .mr(S3)
+        .mb(S3)
+        .fill(t.card)
+        .radius(tok::radius::LG)
+        .border(1.0, t.card_border)
+        .shadow(2.0, 12.0, t.shadow_soft)
+        .clip_rounded(tok::radius::LG)
 }
 
 fn empty(notice: Notice, palette: &Palette) -> El {
     let t = palette.theme;
-    let mut message = col().gap(8.0).center_y().child(
+    let mut message = col().gap(S2).center_y().child(
         text(notice.title())
             .key("aviso")
             .font(SUBTITLE)
@@ -348,240 +691,7 @@ fn empty(notice: Notice, palette: &Palette) -> El {
     if let Some(hint) = notice.hint() {
         message = message.child(text(hint).font(BODY).color(t.text_secondary));
     }
-    col().grow(1.0).min_h(0.0).center().child(message)
-}
-
-fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
-    let t = palette.theme;
-    let mut page = col()
-        .w_full()
-        .max_w(720.0)
-        .padding(32.0)
-        .child(
-            text(card.title.clone())
-                .key("titulo")
-                .font(SUBTITLE)
-                .color(t.text)
-                .wrap(),
-        )
-        .child(
-            text(card.subtitle.clone())
-                .font(BODY)
-                .color(t.text_secondary)
-                .mt(4.0),
-        );
-    page = match &card.body {
-        Body::Loading => page.child(
-            text("Consultando o disco…")
-                .key("estado")
-                .font(BODY)
-                .color(t.text_secondary)
-                .mt(32.0),
-        ),
-        Body::Message(message) => page.child(
-            text(message.clone())
-                .key("estado")
-                .font(BODY)
-                .color(palette.unknown)
-                .wrap()
-                .mt(32.0),
-        ),
-        Body::Health(health) => health_body(page, health, palette),
-    };
-    let scroll = scroll.clone();
-    col()
-        .key(DETAIL_KEY)
-        .grow(1.0)
-        .min_w(0.0)
-        .min_h(0.0)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .on_scroll_offset(move |at| {
-            scroll.set(at.offset[1]);
-        })
-        .child(page)
-}
-
-fn health_body(page: El, health: &Health, palette: &Palette) -> El {
-    let t = palette.theme;
-    let tone = palette.tone(health.tone);
-    let pill = row()
-        .key("estado")
-        .px(12.0)
-        .py(4.0)
-        .radius(12.0)
-        .fill(tone.alpha(PILL_TINT))
-        .child(text(health.label).font(CAPTION_STRONG).color(tone));
-    // With no usable evidence there is no number to show, only the pill.
-    let hero = row().mt(32.0).center_y().flex_wrap();
-    let hero = match &health.score {
-        Some(score) => hero
-            .child(text(score.clone()).key("nota").font(SCORE).color(tone))
-            .child(
-                col()
-                    .gap(8.0)
-                    .ml(20.0)
-                    .child(pill)
-                    .child(text("saúde").font(CAPTION).color(t.text_secondary)),
-            ),
-        None => hero.child(pill),
-    };
-
-    let fact = |key: &'static str, label: &'static str, value: &str, style: TextStyle| {
-        row()
-            .key(key)
-            .gap(16.0)
-            .child(text(label).font(BODY).color(t.text_secondary).w(144.0))
-            .child(text(value.to_owned()).font(style).color(t.text).wrap())
-    };
-    let facts = col()
-        .mt(32.0)
-        .gap(12.0)
-        .child(fact(
-            "vida",
-            "Vida estimada",
-            &health.lifetime,
-            if health.lifetime_known {
-                BODY_STRONG
-            } else {
-                BODY
-            },
-        ))
-        .child(fact("desgaste", "Desgaste", &health.wear, BODY))
-        .child(fact(
-            "temperatura",
-            "Temperatura",
-            &health.temperature,
-            BODY,
-        ))
-        .child(fact("ligado", "Tempo ligado", &health.power_on, BODY))
-        .child(fact(
-            "leitura",
-            "Última leitura",
-            &health.last_reading,
-            BODY,
-        ));
-
-    // Counters the drive reports in the same way as every other drive.
-    let facts = health
-        .details
-        .iter()
-        .enumerate()
-        .fold(facts, |facts, (index, detail)| {
-            facts.child(
-                row()
-                    .key(format!("detalhe-{index}"))
-                    .gap(16.0)
-                    .child(
-                        text(detail.label)
-                            .font(BODY)
-                            .color(t.text_secondary)
-                            .w(144.0)
-                            .wrap(),
-                    )
-                    .child(text(detail.value.clone()).font(BODY).color(t.text).wrap()),
-            )
-        });
-
-    let status = text(health.status).key("situacao").wrap().mt(24.0);
-    let status = match health.status_tone {
-        Some(Tone::Attention) => status.font(BODY_STRONG).color(palette.attention),
-        Some(tone) => status.font(BODY).color(palette.tone(tone)),
-        None => status.font(BODY).color(t.text_secondary),
-    };
-    let mut page = page.child(hero).child(facts).child(status);
-    // The verdict above speaks in the tone; each reason is plain text behind a
-    // tone marker, and the advice is the quietest line.
-    for (index, warning) in health.warnings.iter().enumerate() {
-        let marker = rune::el()
-            .w(6.0)
-            .h(6.0)
-            .radius(3.0)
-            .mt(7.0)
-            .fill(palette.attention);
-        page = page.child(
-            row()
-                .key(format!("motivo-{index}"))
-                .gap(12.0)
-                .mt(if index == 0 { 16.0 } else { 8.0 })
-                .child(marker)
-                .child(
-                    text(warning.clone())
-                        .font(BODY)
-                        .color(t.text)
-                        .wrap()
-                        .grow(1.0),
-                ),
-        );
-    }
-    if let Some(advice) = health.advice {
-        page = page.child(
-            text(advice)
-                .key("conselho")
-                .font(BODY)
-                .color(t.text_secondary)
-                .wrap()
-                .mt(16.0),
-        );
-    }
-    if !health.attributes.is_empty() {
-        page = page.child(attributes(&health.attributes, palette));
-    }
-    page
-}
-
-fn attributes(rows: &[AttributeRow], palette: &Palette) -> El {
-    let t = palette.theme;
-    let line = |cells: [&str; 5], style: TextStyle, color: Color| {
-        let cell = |content: &str, width: f32, align: Align| {
-            text(content.to_owned())
-                .font(style)
-                .color(color)
-                .w(width)
-                .align(align)
-        };
-        row()
-            .gap(16.0)
-            .child(cell(cells[0], 40.0, Align::Start))
-            .child(cell(cells[1], 56.0, Align::End))
-            .child(cell(cells[2], 56.0, Align::End))
-            .child(cell(cells[3], 56.0, Align::End))
-            .child(text(cells[4].to_owned()).font(style).color(color).grow(1.0))
-    };
-    let mut table = col()
-        .key("atributos")
-        .mt(40.0)
-        .gap(8.0)
-        .child(text("Atributos ATA").font(BODY_STRONG).color(t.text))
-        .child(
-            text("Valores brutos definidos pelo fabricante, sem unidade atribuída.")
-                .font(CAPTION)
-                .color(t.text_secondary)
-                .wrap(),
-        )
-        .child(
-            line(
-                ["ID", "Atual", "Pior", "Limite", "Bruto"],
-                CAPTION,
-                t.text_secondary,
-            )
-            .mt(8.0),
-        );
-    for attribute in rows {
-        table = table.child(line(
-            [
-                &attribute.id,
-                &attribute.current,
-                &attribute.worst,
-                &attribute.threshold,
-                &attribute.raw,
-            ],
-            BODY,
-            t.text,
-        ));
-    }
-    table
+    raised(palette).center().ml(S3).child(message)
 }
 
 #[cfg(test)]

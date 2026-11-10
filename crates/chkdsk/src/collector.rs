@@ -320,7 +320,7 @@ pub fn history_path() -> PathBuf {
         .join("historico.json")
 }
 
-fn load_history(path: &Path) -> History {
+pub fn load_history(path: &Path) -> History {
     std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<History>(&bytes).ok())
