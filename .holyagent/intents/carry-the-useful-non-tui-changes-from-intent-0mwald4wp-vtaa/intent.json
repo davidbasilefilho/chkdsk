@@ -1,0 +1,14 @@
+{
+  "id": "intent-0mwald4wp-vtaa",
+  "slug": "carry-the-useful-non-tui-changes-from",
+  "objective": "Carry the useful, non-TUI changes from open PRs #2 (release-0.0.2) and #3 (codex/checkpoint/chkdsk-redesign-20261008) onto main as of the rune rewrite, then close both PRs.",
+  "requirements": [
+    "User words: \"there is a few prs opened, close them but get stuff from it if you find useful and/or beneficial\"",
+    "Both PRs target the old r3bl_tui UI; their TUI/theme/layout work is obsolete after the rune rewrite and is not ported",
+    "Port backend, telemetry, health scoring, model, parse, elevation, NVMe classification and release/CI hardening where they improve correctness and fit the current code",
+    "Work branch port-smart-fixes in worktree /home/user/chkdsk-port from origin/main (50eb54a, version 0.1.0)"
+  ],
+  "revision": 1,
+  "state": "Open",
+  "createdAt": "2026-11-10T11:13:11.450Z"
+}
