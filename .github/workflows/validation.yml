@@ -1,20 +1,81 @@
 name: validation
 
+# Reusable gate called by dev.yml (pushes and pull requests) and stable.yml
+# (releases); it has no triggers of its own, so a commit is validated once per run.
 on:
-  pull_request:
   workflow_call:
+    inputs:
+      ref:
+        description: Commit to validate
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  # CI needs neither the portable LLVM (the runner packages cover xwin) nor the commit hook.
+  MISE_DISABLE_TOOLS: github:llvm/llvm-project,prek
 
 jobs:
-  validation:
+  # Everything that does not execute Windows code: formatting, lint for the host
+  # and (through cargo-xwin) both Windows targets, host tests, release script self-check.
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends clang lld llvm libxkbcommon-dev libwayland-dev
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          install: true
+          cache: true
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-xwin
+      - name: Cache the Windows CRT and SDK downloaded by cargo-xwin
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/cargo-xwin
+          key: xwin-${{ runner.os }}-v1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: linux
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' }}
+      - run: mise run ci-linux
+
+  # The only part that needs a Windows machine: the Windows-only code paths.
+  windows:
     runs-on: windows-2022
+    timeout-minutes: 40
     permissions:
       contents: read
     env:
       MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
       MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:
           install: true
-      - run: mise run validation
+          cache: true
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: windows-tests
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' }}
+      - run: mise run tests
