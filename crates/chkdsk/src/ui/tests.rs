@@ -299,7 +299,9 @@ fn fixtures_cover_every_state() {
             None,
             Some(Tone::Unknown),
             Some(Tone::Unknown),
-            Some(Tone::Attention)
+            Some(Tone::Attention),
+            Some(Tone::Unknown),
+            Some(Tone::Unknown)
         ]
     );
 }
@@ -486,7 +488,8 @@ fn list_rows_follow_the_disk_not_its_position() {
         state.deliver(Update::Disks(disks), NOW, tx);
     });
     settle(&mut rt);
-    assert_eq!(rt.state.selected, 6, "the selection follows its disk");
+    let last = rt.state.cards.len() - 1;
+    assert_eq!(rt.state.selected, last, "the selection follows its disk");
     click(&mut rt, "disco-interface:usb-2");
     assert_eq!(rt.state.cards[rt.state.selected].id, "interface:usb-2");
 }
@@ -606,5 +609,51 @@ fn status_text_keeps_four_and_a_half_to_one_in_both_themes() {
             eprintln!("secondary {name} on {surface}: {ratio:.2}:1");
             assert!(ratio >= 4.5, "secondary {name} on {surface}: {ratio:.2}");
         }
+    }
+}
+
+#[test]
+fn a_generic_ssd_shows_hours_and_cycles_and_a_limited_assessment() {
+    for size in [(1100.0, 720.0), (760.0, 560.0)] {
+        let rt = runtime(fixtures::dashboard(7), size);
+        let shown = screen(&rt);
+        for text in [
+            "MACROVIP MV240GB",
+            "SSD  ·  223,6 GiB",
+            "Limitada",
+            "Tempo ligado",
+            "16956 h",
+            "Ciclos de energia",
+            "2098",
+            "Avaliação limitada: o disco não informa desgaste",
+            "Use o programa do fabricante do SSD",
+        ] {
+            assert!(shown.contains(text), "{size:?}: {text} is missing: {shown}");
+        }
+        let Body::Health(health) = &rt.state.cards[7].body else {
+            panic!("the generic SSD has a reading");
+        };
+        assert_eq!((health.label, health.tone), ("Limitada", Tone::Unknown));
+        assert!(
+            !shown.contains("backup"),
+            "{size:?}: no verdict, no backup advice"
+        );
+    }
+}
+
+#[test]
+fn a_usb_stick_without_smart_shows_identity_and_the_adapter_message_but_no_score() {
+    for size in [(1100.0, 720.0), (760.0, 560.0)] {
+        let rt = runtime(fixtures::dashboard(8), size);
+        let shown = screen(&rt);
+        for text in [
+            "Lexar USB Flash Drive",
+            "USB  ·  29,8 GiB",
+            "SMART indisponível por este adaptador USB",
+        ] {
+            assert!(shown.contains(text), "{size:?}: {text} is missing: {shown}");
+        }
+        assert!(!shown.contains("Tipo desconhecido"), "{size:?}: {shown}");
+        assert!(rt.find("nota").is_none(), "{size:?}: no hero number");
     }
 }

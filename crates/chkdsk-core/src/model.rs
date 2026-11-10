@@ -39,6 +39,11 @@ pub enum HealthWarningReason {
     AtaPendingSectors,
     AtaOfflineUncorrectable,
     AtaRawEncodingAmbiguous,
+    /// UDMA CRC errors: the cable or adapter, not the drive's media.
+    AtaInterfaceCrc,
+    /// A sector counter is high enough, or a normalized value low enough, to
+    /// put data at risk on a drive with no model profile.
+    AtaCountersCritical,
     EnduranceExhausted,
     NvmeMediaErrors,
     NvmeTemperatureThreshold,
@@ -160,12 +165,18 @@ impl Telemetry {
         self.ata_profile = profile
             .map(|profile| profile.family.to_owned())
             .or_else(|| hdd_profile.map(|profile| profile.family.to_owned()));
+        // A model match decodes its own layouts; a drive with none gets the
+        // vendor-independent smartmontools DEFAULT layouts instead.
+        let generic = (profile.is_none() && hdd_profile.is_none())
+            .then(|| crate::ata::generic_decode(&health));
         self.power_on_hours = self
             .power_on_hours
-            .or_else(|| crate::ata::hdd_power_on_hours(model, &health));
+            .or_else(|| crate::ata::hdd_power_on_hours(model, &health))
+            .or_else(|| generic.and_then(|generic| generic.power_on_hours));
         self.temperature_c = self
             .temperature_c
-            .or_else(|| crate::ata::hdd_temperature_c(model, &health));
+            .or_else(|| crate::ata::hdd_temperature_c(model, &health))
+            .or_else(|| generic.and_then(|generic| generic.temperature_c));
         let endurance = profile
             .and_then(|profile| {
                 crate::ata::unique_attribute(&health, profile.lifetime_used_attribute)
@@ -364,6 +375,46 @@ mod tests {
             QueryState::Success(AtaHealth { ref attributes, .. })
                 if attributes[2].raw == [0, 0, 1, 0, 0, 0]
         ));
+    }
+
+    #[test]
+    fn unprofiled_drives_get_the_default_hours_and_temperature_layouts_but_profiled_ones_keep_theirs()
+     {
+        let row = |id, raw| AtaAttribute {
+            id,
+            flags: 0,
+            current: 100,
+            worst: 100,
+            threshold: None,
+            raw,
+        };
+        let health = AtaHealth {
+            attributes: vec![
+                row(9, [0x3C, 0x42, 0, 0xAA, 0, 0]),
+                row(194, [41, 0, 20, 0, 55, 0]),
+            ],
+            thresholds_available: false,
+        };
+        let mut generic = Telemetry::default();
+        generic.apply_ata(health.clone(), Some("MACROVIP MV240GB"));
+        assert_eq!(generic.power_on_hours, Some(16_956));
+        assert_eq!(generic.temperature_c, Some(41));
+        assert_eq!(generic.ata_profile, None);
+
+        // A value an earlier source already set (the Windows property) wins.
+        let mut earlier = Telemetry {
+            temperature_c: Some(36),
+            ..Default::default()
+        };
+        earlier.apply_ata(health.clone(), Some("MACROVIP MV240GB"));
+        assert_eq!(earlier.temperature_c, Some(36));
+
+        // A model match decodes its own layouts: the WD profile rejects the
+        // ambiguous upper hours bytes rather than falling back to the default.
+        let mut wd = Telemetry::default();
+        wd.apply_ata(health, Some("WDC WD10EZEX-00WN4A0"));
+        assert_eq!(wd.power_on_hours, None);
+        assert_eq!(wd.temperature_c, Some(41));
     }
 
     #[test]
