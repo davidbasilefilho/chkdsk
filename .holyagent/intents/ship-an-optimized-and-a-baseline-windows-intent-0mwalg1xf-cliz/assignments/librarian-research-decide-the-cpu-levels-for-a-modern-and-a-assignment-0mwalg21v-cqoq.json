@@ -1,0 +1,44 @@
+{
+  "id": "assignment-0mwalg21v-cqoq",
+  "intentId": "intent-0mwalg1xf-cliz",
+  "intentRevision": 1,
+  "roleTask": "Librarian.research",
+  "slug": "decide-the-cpu-levels-for-a-modern-and-a",
+  "objective": "Decide the CPU levels for a modern and a baseline Windows build of a Rust app on x64 and arm64 (and x86 if relevant), following Bun's -baseline convention.",
+  "state": "Running",
+  "scope": [
+    "Bun's release assets and what its x64 vs x64-baseline (and any arm64/aarch64 baseline) builds target (CPU level, e.g. haswell/AVX2 vs nehalem/SSE4.2) — cite Bun docs, release notes or build scripts",
+    "Rust: target-cpu / target-feature values for x86_64-pc-windows-msvc (x86-64, x86-64-v2, x86-64-v3) and aarch64-pc-windows-msvc (default baseline features, available aarch64 target-cpu names and features such as v8.1a/v8.2a/lse/rcpc/dotprod), and for i686-pc-windows-msvc (pentium4/SSE2 default); how to pass them per target in cargo (RUSTFLAGS, CARGO_TARGET_<TRIPLE>_RUSTFLAGS, .cargo/config.toml) without affecting the other builds",
+    "Windows on Arm hardware floor: minimum ARMv8.x level required by Windows 11 (including 24H2) and by Windows 10 on Arm, with citations, to choose a sensible modern arm64 level and a baseline that still runs on older Windows-on-Arm devices"
+  ],
+  "constraints": [
+    "Read-only research; cite URLs for each fact and separate sourced facts from inference",
+    "Recommend concrete flags for: x64 (modern), x64-baseline, arm64 (modern), arm64-baseline, x86, x86-baseline, with the reason for each and whether a distinct x86 modern level makes sense",
+    "Report in under 500 words"
+  ],
+  "criteria": [
+    {
+      "text": "States what Bun's -baseline targets mean, with citations",
+      "blocking": true,
+      "dimension": "behavior"
+    },
+    {
+      "text": "Gives concrete Rust flags per variant with cited Windows hardware floors",
+      "blocking": true,
+      "dimension": "behavior"
+    }
+  ],
+  "evidence": [
+    "sources",
+    "recommendation"
+  ],
+  "ownershipPaths": [],
+  "dependencies": [],
+  "independentFrom": [],
+  "specialist": {
+    "model": "sonnet",
+    "effort": "medium",
+    "startedAt": "2026-11-10T11:15:27.715Z"
+  },
+  "createdAt": "2026-11-10T11:15:27.715Z"
+}
