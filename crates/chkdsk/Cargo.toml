@@ -1,0 +1,22 @@
+[package]
+name = "chkdsk"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+chkdsk-core.workspace = true
+chkdsk-windows.workspace = true
+rune.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+# Fixture disks for `--snap out.png --scene saudavel` and friends; no effect on the window.
+scenes = []

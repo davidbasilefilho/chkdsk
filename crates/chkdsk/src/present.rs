@@ -2,14 +2,14 @@
 //! mensagens do sistema operacional nunca são exibidos diretamente. Os cartões
 //! são montados quando um resultado chega, para que a janela só desenhe.
 
-use crate::{
-    backend::QueryErrorState,
-    collector::{DISCOVERY_INTERVAL, DiskSnapshot, Reading, Ready},
+use crate::collector::{DISCOVERY_INTERVAL, DiskSnapshot, Reading, Ready};
+use chkdsk_core::{
     health::{HealthOutcome, HealthScore, score_health},
     model::{
         AtaAttribute, AtaHealth, DiskIdentity, DiskKind, HealthWarningReason, QueryState, Telemetry,
     },
 };
+use chkdsk_windows::backend::QueryErrorState;
 use std::{collections::HashSet, time::Duration};
 
 /// The three colors of the palette: healthy, attention, no usable data.
@@ -286,7 +286,7 @@ fn warning_lines(health: &HealthScore, telemetry: &Telemetry) -> Vec<String> {
 /// The declared threshold of an attribute that can be judged: it appears once,
 /// holds a valid normalized value and declares a nonzero threshold.
 fn ata_threshold(ata: &AtaHealth, attribute: &AtaAttribute) -> Option<u8> {
-    if crate::ata::unique_attribute(ata, attribute.id).is_none()
+    if chkdsk_core::ata::unique_attribute(ata, attribute.id).is_none()
         || !(1..=254).contains(&attribute.current)
     {
         return None;
@@ -548,7 +548,7 @@ fn format_endurance_days(remaining_seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use chkdsk_core::{
         health::score_health,
         model::{AtaHealth, DiskIdentity, NvmeHealth},
     };

@@ -6,9 +6,11 @@
 
 use crate::{
     collector::{DiskSnapshot, Reading, Update, ready_reading},
+    ui::{Dashboard, Scene},
+};
+use chkdsk_core::{
     history::{HealthSample, History},
     model::{AtaAttribute, AtaHealth, DiskIdentity, DiskKind, NvmeHealth, QueryState, Telemetry},
-    ui::{Dashboard, Scene},
 };
 
 /// Fixed clock so captures never change from one run to the next.
@@ -220,7 +222,7 @@ pub fn disks() -> Vec<DiskSnapshot> {
             identity: pending,
         },
         DiskSnapshot {
-            reading: Reading::Failed(crate::backend::QueryErrorState::Transient),
+            reading: Reading::Failed(chkdsk_windows::backend::QueryErrorState::Transient),
             identity: failed,
         },
         DiskSnapshot {

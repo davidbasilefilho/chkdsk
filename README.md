@@ -45,15 +45,17 @@ Na raiz do repositório, em PowerShell:
 
 ```powershell
 mise install
-mise exec -- cargo run
+mise exec -- cargo run -p chkdsk
 ```
 
-O build usa [rune](https://github.com/anomalyco/rune) fixado em um commit exato (`rev` em `Cargo.toml`); atualize-o de propósito, nunca por branch. Fora do Windows o aplicativo compila e os testes rodam, mas a lista de discos fica vazia (a coleta nativa é só para Windows). No Linux, o rune precisa de `libxkbcommon-dev` e `libwayland-dev`; para renderizar sem GPU, `mesa-vulkan-drivers` com `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+O build usa [rune](https://github.com/anomalyco/rune) fixado em um commit exato (`rev` em `[workspace.dependencies]` do `Cargo.toml` da raiz); atualize-o de propósito, nunca por branch. Fora do Windows o aplicativo compila e os testes rodam, mas a lista de discos fica vazia (a coleta nativa é só para Windows). No Linux, o rune precisa de `libxkbcommon-dev` e `libwayland-dev`; para renderizar sem GPU, `mesa-vulkan-drivers` com `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
 
-Capturas sem disco real (discos de exemplo em `src/fixtures.rs`; cenas: `saudavel`, `atencao`, `indisponivel`, `carregando`, `falha`, `vazio`, `procurando`, `descoberta`):
+O código é um workspace Cargo em `crates/`: `chkdsk-core` (modelo, leitura dos dados SMART/NVMe, pontuação de saúde e histórico; lógica pura, sem dependências de plataforma), `chkdsk-windows` (acesso nativo aos discos e elevação UAC, com stubs fora do Windows) e `chkdsk` (o executável: coleta, textos, janela e as cenas de exemplo). Comandos que valem para tudo usam `--workspace`, por exemplo `cargo test --workspace`.
+
+Capturas sem disco real (discos de exemplo em `crates/chkdsk/src/fixtures.rs`; cenas: `saudavel`, `atencao`, `indisponivel`, `carregando`, `falha`, `vazio`, `procurando`, `descoberta`):
 
 ```powershell
-cargo run --features scenes -- --snap captura.png --scene saudavel --size 1100x720 --scale 2 --theme dark
+cargo run -p chkdsk --features scenes -- --snap captura.png --scene saudavel --size 1100x720 --scale 2 --theme dark
 ```
 
 Validação e compilação:

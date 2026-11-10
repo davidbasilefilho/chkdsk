@@ -88,10 +88,16 @@ def release_inputs(
     return sha, tag
 
 
-def manifest() -> tuple[str, str]:
-    with (ROOT / "Cargo.toml").open("rb") as stream:
-        package = tomllib.load(stream)["package"]
-    return package["name"], package["version"]
+BINARY_MANIFEST = Path("crates") / "chkdsk" / "Cargo.toml"
+
+
+def manifest(root: Path = ROOT) -> tuple[str, str]:
+    """Binary name from the binary crate, version from `[workspace.package]`."""
+    with (root / "Cargo.toml").open("rb") as stream:
+        version = tomllib.load(stream)["workspace"]["package"]["version"]
+    with (root / BINARY_MANIFEST).open("rb") as stream:
+        name = tomllib.load(stream)["package"]["name"]
+    return name, version
 
 
 def target_linker(architecture: str, tools_dir: Path) -> Path:
@@ -180,17 +186,17 @@ def check_linkers() -> None:
 
 def clippy_all() -> None:
     for architecture, target in TARGETS.items():
-        cargo_for(architecture, ["clippy", "--all-targets", "--all-features", "--target", target, "--", "-D", "warnings"])
+        cargo_for(architecture, ["clippy", "--workspace", "--all-targets", "--all-features", "--target", target, "--", "-D", "warnings"])
 
 
 def compile_all() -> None:
     for architecture, target in TARGETS.items():
-        cargo_for(architecture, ["check", "--all-targets", "--all-features", "--target", target])
+        cargo_for(architecture, ["check", "--workspace", "--all-targets", "--all-features", "--target", target])
 
 
 def build_target(architecture: str, name: str) -> Path:
     target = TARGETS[architecture]
-    cargo_for(architecture, ["build", "--release", "--target", target, "--bin", name])
+    cargo_for(architecture, ["build", "--release", "--package", name, "--target", target])
     executable = ROOT / "target" / target / "release" / f"{name}.exe"
     if not executable.is_file():
         raise FileNotFoundError(f"expected release executable was not produced: {executable}")
@@ -494,6 +500,14 @@ def publish(mode: str, sha: str, supplied_tag: str | None, assets_dir: Path) -> 
 
 
 def self_check() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        fixture = Path(directory)
+        (fixture / BINARY_MANIFEST).parent.mkdir(parents=True)
+        (fixture / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/*"]\n\n[workspace.package]\nversion = "1.2.3"\n')
+        (fixture / BINARY_MANIFEST).write_text('[package]\nname = "chkdsk"\nversion.workspace = true\n')
+        assert manifest(fixture) == ("chkdsk", "1.2.3")
+    assert manifest()[0] == "chkdsk", "the executable must stay chkdsk.exe"
+    version_parts(manifest()[1])
     assert tuple(TARGETS) == ("x64", "arm64")
     assert TARGETS == {
         "x64": "x86_64-pc-windows-msvc",
@@ -889,7 +903,7 @@ def main() -> int:
         elif args.command == "clippy":
             clippy_all()
         elif args.command == "tests":
-            cargo_for("x64", ["test", "--all-targets", "--all-features", "--target", TARGETS["x64"]])
+            cargo_for("x64", ["test", "--workspace", "--all-targets", "--all-features", "--target", TARGETS["x64"]])
         elif args.command == "compile":
             compile_all()
         elif args.command == "build":

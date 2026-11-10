@@ -88,7 +88,7 @@ impl HddCounter {
 
 /// Return an ATA row only when that ID appears exactly once. This is required
 /// before interpreting model-specific SMART data such as lifetime-used ID 202.
-pub(crate) fn unique_attribute(
+pub fn unique_attribute(
     health: &crate::model::AtaHealth,
     id: u8,
 ) -> Option<&crate::model::AtaAttribute> {
