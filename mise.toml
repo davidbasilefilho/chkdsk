@@ -60,16 +60,16 @@ run = "python scripts/release.py build --architecture arm64"
 
 [tasks.package-dev]
 description = "Package the complete development release using the current commit"
-run = 'python scripts/release.py package --mode dev --sha "{{ env.GITHUB_SHA }}" --output dist/release'
+run = 'python scripts/release.py package --mode dev --output dist/release'
 
 [tasks.publish-dev]
 description = "Verify and publish the development release for the current commit"
-run = 'python scripts/release.py publish --mode dev --sha "{{ env.GITHUB_SHA }}" --assets-dir dist/release'
+run = 'python scripts/release.py publish --mode dev --assets-dir dist/release'
 
 [tasks.package-stable]
 description = "Validate the current tag and package the complete stable release"
-run = 'python scripts/release.py package --mode stable --tag "{{ env.GITHUB_REF_NAME }}" --sha "{{ env.GITHUB_SHA }}" --output dist/release'
+run = 'python scripts/release.py package --mode stable --output dist/release'
 
 [tasks.publish-stable]
 description = "Verify and publish the stable release for the current tag and commit"
-run = 'python scripts/release.py publish --mode stable --tag "{{ env.GITHUB_REF_NAME }}" --sha "{{ env.GITHUB_SHA }}" --assets-dir dist/release'
+run = 'python scripts/release.py publish --mode stable --assets-dir dist/release'

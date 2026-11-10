@@ -1,6 +1,7 @@
 //! Fixture disks for headless captures and tests: one healthy NVMe with a
 //! lifetime estimate, one disk that needs attention, one whose health is
-//! unknown because the query was denied, one still loading and one that failed.
+//! unknown because the query was denied, one still loading, one that failed,
+//! one with too little data for a score and one that passes with soft warnings.
 //! `chkdsk --snap out.png --scene saudavel` renders them without a disk.
 
 use crate::{
@@ -22,6 +23,8 @@ pub const SCENES: &[Scene] = &[
     ("indisponivel", |s| *s = dashboard(2)),
     ("carregando", |s| *s = dashboard(3)),
     ("falha", |s| *s = dashboard(4)),
+    ("dados-insuficientes", |s| *s = dashboard(5)),
+    ("atencao-leve", |s| *s = dashboard(6)),
     ("procurando", |s| *s = Dashboard::default()),
     ("descoberta", |s| {
         *s = Dashboard::default();
@@ -167,6 +170,38 @@ pub fn disks() -> Vec<DiskSnapshot> {
         4_000_787_030_016,
     );
 
+    // A temperature alone is usable data but no evidence of health: no score.
+    let sparse = identity(
+        "interface:sata-5",
+        "Toshiba P300 2TB",
+        DiskKind::Hdd,
+        "SATA",
+        2_000_398_934_016,
+    );
+    let sparse_telemetry = Telemetry {
+        temperature_c: Some(38),
+        ..Default::default()
+    };
+
+    // No device-declared failure, but media errors: passes with a soft warning.
+    let worn = identity(
+        "interface:nvme-6",
+        "WD Blue SN570 1TB",
+        DiskKind::Nvme,
+        "NVMe",
+        1_000_204_886_016,
+    );
+    let mut warned = Telemetry::default();
+    warned.apply_nvme(NvmeHealth {
+        composite_temperature_kelvin: Some(318),
+        available_spare_percent: Some(100),
+        available_spare_threshold_percent: Some(10),
+        percentage_used: Some(21),
+        power_on_hours: Some(9_120),
+        media_errors: Some(12),
+        ..Default::default()
+    });
+
     vec![
         DiskSnapshot {
             reading: ready_reading(&nvme, healthy, &healthy_history),
@@ -187,6 +222,14 @@ pub fn disks() -> Vec<DiskSnapshot> {
         DiskSnapshot {
             reading: Reading::Failed(crate::backend::QueryErrorState::Transient),
             identity: failed,
+        },
+        DiskSnapshot {
+            reading: ready_reading(&sparse, sparse_telemetry, &History::default()),
+            identity: sparse,
+        },
+        DiskSnapshot {
+            reading: ready_reading(&worn, warned, &History::default()),
+            identity: worn,
         },
     ]
 }

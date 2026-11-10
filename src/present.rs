@@ -60,6 +60,8 @@ pub struct Health {
     pub last_reading: String,
     /// Device-reported failures and softer signals behind the score, one line each.
     pub warnings: Vec<String>,
+    /// What to do about an Atenção verdict; none otherwise.
+    pub advice: Option<&'static str>,
     pub attributes: Vec<AttributeRow>,
 }
 
@@ -174,6 +176,7 @@ impl Health {
                 .map(|timestamp| format!("há {}", format_duration(now.saturating_sub(timestamp))))
                 .unwrap_or_else(|| "indisponível".into()),
             warnings: warning_lines(&health, telemetry),
+            advice: (tone == Tone::Attention).then_some(BACKUP_ADVICE),
             attributes: match &telemetry.ata {
                 QueryState::Success(ata) => ata.attributes.iter().map(attribute_row).collect(),
                 _ => Vec::new(),
@@ -181,6 +184,8 @@ impl Health {
         }
     }
 }
+
+const BACKUP_ADVICE: &str = "Faça backup dos dados importantes.";
 
 /// Failures the device declared, then the softer signals behind the score.
 fn warning_lines(health: &HealthScore, telemetry: &Telemetry) -> Vec<String> {
@@ -222,8 +227,9 @@ fn warning_lines(health: &HealthScore, telemetry: &Telemetry) -> Vec<String> {
                 && attribute.flags & 1 != 0
             {
                 lines.push(format!(
-                    "Falha SMART iminente: atributo ATA {:02X} atingiu o limite ({}/{threshold})",
-                    attribute.id, attribute.current
+                    "Falha iminente, limite atingido: {}, {}",
+                    attribute_label(attribute.id),
+                    values_against(attribute.current, threshold)
                 ));
             }
         }
@@ -307,18 +313,47 @@ fn ata_threshold_lines(telemetry: &Telemetry, near: bool) -> Option<Vec<String>>
             };
             matches.then(|| {
                 let description = if near {
-                    "próximo do limite"
+                    "Próximo do limite"
                 } else {
-                    "atingiu o limite"
+                    "Limite atingido"
                 };
                 format!(
-                    "SMART ATA {description}: atributo {:02X} ({}/{threshold})",
-                    attribute.id, attribute.current
+                    "{description}: {}, {}",
+                    attribute_label(attribute.id),
+                    values_against(attribute.current, threshold)
                 )
             })
         })
         .collect();
     (!lines.is_empty()).then_some(lines)
+}
+
+/// `valor 41, limite 36`: the normalized value next to the threshold it is judged by.
+fn values_against(current: u8, threshold: u8) -> String {
+    // No-break spaces keep a number with its word when the line wraps.
+    format!("valor\u{a0}{current}, limite\u{a0}{threshold}")
+}
+
+/// `Setores realocados (05)`: the attribute's usual name where it is the same on
+/// every drive, so the number in the table can be found; otherwise only its ID.
+fn attribute_label(id: u8) -> String {
+    let name = match id {
+        0x01 => "Taxa de erros de leitura",
+        0x03 => "Tempo de aceleração do disco",
+        0x04 => "Ciclos de partida e parada",
+        0x05 => "Setores realocados",
+        0x07 => "Taxa de erros de posicionamento",
+        0x09 => "Horas ligado",
+        0x0A => "Tentativas de giro",
+        0x0C => "Ciclos de energia",
+        0xBB => "Erros incorrigíveis reportados",
+        0xC4 => "Eventos de realocação",
+        0xC5 => "Setores pendentes",
+        0xC6 => "Setores incorrigíveis offline",
+        0xC7 => "Erros de CRC na interface",
+        _ => "Atributo ATA",
+    };
+    format!("{name} ({id:02X})")
 }
 
 fn attribute_row(attribute: &AtaAttribute) -> AttributeRow {
@@ -928,8 +963,8 @@ mod tests {
         assert_eq!(
             health.warnings,
             [
-                "Falha SMART iminente: atributo ATA 05 atingiu o limite (30/36)",
-                "SMART ATA próximo do limite: atributo C4 (41/36)",
+                "Falha iminente, limite atingido: Setores realocados (05), valor\u{a0}30, limite\u{a0}36",
+                "Próximo do limite: Eventos de realocação (C4), valor\u{a0}41, limite\u{a0}36",
             ]
         );
         assert_eq!(

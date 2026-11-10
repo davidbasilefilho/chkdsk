@@ -470,13 +470,38 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
         None => status.font(BODY).color(t.text_secondary),
     };
     let mut page = page.child(hero).child(facts).child(status);
-    for warning in &health.warnings {
+    // The verdict above speaks in the tone; each reason is plain text behind a
+    // tone marker, and the advice is the quietest line.
+    for (index, warning) in health.warnings.iter().enumerate() {
+        let marker = rune::el()
+            .w(6.0)
+            .h(6.0)
+            .radius(3.0)
+            .mt(7.0)
+            .fill(palette.attention);
         page = page.child(
-            text(warning.clone())
-                .font(BODY_STRONG)
-                .color(palette.attention)
+            row()
+                .key(format!("motivo-{index}"))
+                .gap(12.0)
+                .mt(if index == 0 { 16.0 } else { 8.0 })
+                .child(marker)
+                .child(
+                    text(warning.clone())
+                        .font(BODY)
+                        .color(t.text)
+                        .wrap()
+                        .grow(1.0),
+                ),
+        );
+    }
+    if let Some(advice) = health.advice {
+        page = page.child(
+            text(advice)
+                .key("conselho")
+                .font(BODY)
+                .color(t.text_secondary)
                 .wrap()
-                .mt(8.0),
+                .mt(16.0),
         );
     }
     if !health.attributes.is_empty() {

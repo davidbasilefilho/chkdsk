@@ -31,6 +31,7 @@ const SCENES: &[ui::Scene] = fixtures::SCENES;
 const SCENES: &[ui::Scene] = &[];
 
 fn main() {
+    restrict_dll_search();
     if std::env::args().any(|arg| arg == "--version") {
         println!("chkdsk {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -70,6 +71,23 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+/// Load DLLs from System32 only, never from the executable's folder or the
+/// working directory, so a planted DLL next to a downloaded copy cannot run
+/// inside the elevated process. Runs first, before any other DLL is loaded.
+#[cfg(windows)]
+fn restrict_dll_search() {
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+    };
+    // SAFETY: plain flag call with no pointers; the process-wide setting is applied once at start.
+    unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+}
+
+#[cfg(not(windows))]
+fn restrict_dll_search() {}
 
 /// Elevate for SMART access. `Some(code)` when the process must exit instead of
 /// opening the window: the elevated copy took over, or elevation failed. A
