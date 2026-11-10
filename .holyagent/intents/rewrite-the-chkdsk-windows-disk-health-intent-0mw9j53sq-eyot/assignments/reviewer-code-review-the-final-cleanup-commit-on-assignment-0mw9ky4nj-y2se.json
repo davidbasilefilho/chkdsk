@@ -51,5 +51,33 @@
     "finishedAt": "2026-11-09T18:19:51.850Z"
   },
   "result": "result: N1, N2 and N3 are closed. I found no new blocking issues in the diff, and all three gates pass.\n\n**Built-in `/code-review`:** it ran, but on the wrong range. `0da10d6...HEAD` is empty here because HEAD `340e8ad` is not the commit it assumed. It reviewed the base rune-rewrite commits instead, so none of its 7 findings are in this diff. I rejected all of them as out of scope (not this diff, not regressions). They are listed under notes.\n\n**N1, closed:**\n- `src/main.rs:69-72` returns early after the stderr line when `rune::is_headless()` is true.\n- I read the rune source at rev 757bcb1 (`args.rs:208-216`): `--snap` makes `headless()` true, so the dialog is skipped.\n- The Windows MessageBox path is unchanged, and `--version` is untouched.\n\n**N2, closed:**\n- `src/ui.rs:117-130`: `deliver` compares the previous `(selected, id)` and calls `scroll_into_view(row_key(id))` when either changes.\n- `src/ui.rs:93-98`: a stale `DiscoveryFailed` becomes `Searching` once disks are listed.\n- `src/ui.rs:105-110`: a failed discovery only sets the notice while the card list is empty.\n- New tests in `src/ui/tests.rs` cover both: the selected row ends up on screen, and the notice clears and then reverts to `NoDisks`. I did not check that they fail on the base.\n\n**N3, closed:** `src/present.rs:202-216` builds the message with `retry_message(DISCOVERY_INTERVAL)`. The new test at `src/present.rs:511-518` checks both the formatting and the link to the constant.\n\n**New findings:**\n- Optional: `src/ui.rs:52-53` (`Notice::hint`) still hard-codes \"15 segundos\". This is the known leftover.\n- Optional: `scroll_into_view` also runs on the very first `Disks` update, when the selection goes from none to row 0. It is harmless, and a manually scrolled list would snap back only when the selected index shifts.\n\n**Gates** (run in `/home/user/chkdsk-rune`):\n- `cargo fmt --check`: exit 0\n- `cargo test`: exit 0, 52 passed, 0 failed\n- `cargo clippy --all-targets --all-features -- -D warnings`: exit 0\n\n**notes:** the built-in's findings against the base are worth a separate pass: `--version` prints nothing under the Windows GUI subsystem, `next_discovery` is advanced before the blocking call, `is_permission_error` matches `error 5x`, and `Key::Up`/`Key::Down` are missing the modifier guard.\n\nevidence:\n- States for each of N1-N3 whether it is closed, with file:line evidence: N1 `src/main.rs:69-72`; N2 `src/ui.rs:93-98,105-110,117-130`; N3 `src/present.rs:202-216`. All closed.\n- Any new blocking finding names file:line and a concrete failure scenario: none; two optional items above.\n- Reports the gate commands with exit codes and test counts: fmt 0, test 0 (52 passed), clippy 0.\n- checks-run: the three gates above, plus the rune `is_headless` source read.\n- findings: as above.\n",
+  "acceptance": {
+    "revision": 3,
+    "rationale": "Superseded by later accepted repairs and reviews; PR merged with green Windows CI",
+    "criteria": [
+      {
+        "criterion": "States for each of N1-N3 whether it is closed, with file:line evidence",
+        "support": "N1 `src/main.rs:69-72`; N2 `src/ui.rs:93-98,105-110,117-130`; N3 `src/present.rs:202-216`. All closed."
+      },
+      {
+        "criterion": "Any new blocking finding names file:line and a concrete failure scenario",
+        "support": "none; two optional items above."
+      },
+      {
+        "criterion": "Reports the gate commands with exit codes and test counts",
+        "support": "fmt 0, test 0 (52 passed), clippy 0."
+      }
+    ],
+    "evidence": [
+      {
+        "label": "checks-run",
+        "support": "the three gates above, plus the rune `is_headless` source read."
+      },
+      {
+        "label": "findings",
+        "support": "as above."
+      }
+    ]
+  },
   "createdAt": "2026-11-09T18:13:45.103Z"
 }
