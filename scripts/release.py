@@ -166,9 +166,64 @@ def manifest(root: Path = ROOT) -> tuple[str, str]:
     return name, version
 
 
+def target_tool(architecture: str, tools_dir: Path, tool: str) -> Path:
+    _, tool_arch = MSVC_ENV[architecture]
+    return tools_dir / "bin" / "Hostx64" / tool_arch / tool
+
+
 def target_linker(architecture: str, tools_dir: Path) -> Path:
-    _, linker_arch = MSVC_ENV[architecture]
-    return tools_dir / "bin" / "Hostx64" / linker_arch / "link.exe"
+    return target_tool(architecture, tools_dir, "link.exe")
+
+
+# Variables vcvarsall sets. They are dropped from the base environment so a
+# runner that already ran vcvarsall (or a previous architecture) cannot leak in.
+VCVARS_PREFIXES = ("VSCMD_", "VCINSTALLDIR", "VCTOOLS", "VSINSTALLDIR", "WINDOWSSDK", "UCRT", "UNIVERSALCRT", "EXTENSIONSDK")
+
+
+def pristine_environment(base: dict[str, str]) -> dict[str, str]:
+    """`base` without vcvars variables and without MSVC tool directories on PATH."""
+    environment = {key: value for key, value in base.items() if not key.upper().startswith(VCVARS_PREFIXES)}
+    path = environment.get("PATH")
+    if path:
+        entries = [entry for entry in path.split(os.pathsep) if entry and "\\vc\\tools\\msvc\\" not in entry.lower().replace("/", "\\")]
+        environment["PATH"] = os.pathsep.join(entries)
+    return environment
+
+
+def target_msvc_environment(architecture: str, vcvars_output: str, base: dict[str, str]) -> tuple[dict[str, str], Path]:
+    """Build the environment for one target from `set` output of vcvarsall run on `base`.
+
+    Pure: `base` is never mutated and nothing is shared between architectures.
+    The target's tool directory goes first on PATH because cc-rs resolves cl.exe
+    from PATH when VSCMD_ARG_TGT_ARCH matches the target; the x64 host directory
+    follows for the tools that run on the runner. CC/CXX/AR are pinned as well.
+    """
+    environment = dict(base)
+    for line in vcvars_output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key:
+            environment[key] = value
+
+    tools_dir_value = environment.get("VCToolsInstallDir")
+    if not tools_dir_value:
+        raise RuntimeError("vcvarsall did not set VCToolsInstallDir")
+    tools_dir = Path(tools_dir_value)
+    linker = target_linker(architecture, tools_dir)
+    host_linker = target_linker("x64", tools_dir)
+
+    # vcvarsall already put both directories on PATH; drop them there so the order set here is final.
+    stale = {str(linker.parent), str(host_linker.parent)}
+    rest = [entry for entry in environment.get("PATH", "").split(os.pathsep) if entry and entry not in stale]
+    ordered = [str(linker.parent), str(host_linker.parent), *rest]
+    environment["PATH"] = os.pathsep.join(dict.fromkeys(ordered))
+
+    environment[f"CARGO_TARGET_{target_key(TARGETS['x64'])}_LINKER"] = str(host_linker)
+    environment[f"CARGO_TARGET_{target_key(TARGETS[architecture])}_LINKER"] = str(linker)
+    triple = TARGETS[architecture].replace("-", "_")
+    environment[f"CC_{triple}"] = str(target_tool(architecture, tools_dir, "cl.exe"))
+    environment[f"CXX_{triple}"] = str(target_tool(architecture, tools_dir, "cl.exe"))
+    environment[f"AR_{triple}"] = str(target_tool(architecture, tools_dir, "lib.exe"))
+    return environment, linker
 
 
 def msvc_environment(architecture: str) -> tuple[dict[str, str], Path]:
@@ -197,6 +252,10 @@ def msvc_environment(architecture: str) -> tuple[dict[str, str], Path]:
     # for a different architecture merely because it appeared earlier on PATH.
     vcvars_arch, _ = MSVC_ENV[architecture]
     batch = f'call "{vcvarsall}" {vcvars_arch} >nul && set'
+    # Run it on a pristine base for this architecture only: vcvarsall prepends
+    # to PATH, so a base that already holds another architecture's tools would
+    # keep them ahead of this target's.
+    base = pristine_environment(os.environ.copy())
     # Pass cmd.exe's command tail as a raw command line. When the batch script
     # is an argument in a list, Python's Windows quoting wraps the entire
     # command for /c; cmd then misparses the embedded quoted path.
@@ -206,28 +265,14 @@ def msvc_environment(architecture: str) -> tuple[dict[str, str], Path]:
         capture_output=True,
         text=True,
         errors="replace",
+        env=base,
     ).stdout
-    environment = os.environ.copy()
-    for line in captured.splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key:
-            environment[key] = value
-
-    tools_dir_value = environment.get("VCToolsInstallDir")
-    if not tools_dir_value:
-        raise RuntimeError("vcvarsall did not set VCToolsInstallDir")
-    tools_dir = Path(tools_dir_value)
-    linker = target_linker(architecture, tools_dir)
-    host_linker = tools_dir / "bin" / "Hostx64" / "x64" / "link.exe"
-    if not linker.is_file():
-        raise FileNotFoundError(f"{architecture} MSVC linker not found: {linker}")
-    if not host_linker.is_file():
-        raise FileNotFoundError(f"x64 host MSVC linker not found: {host_linker}")
-
-    path_entries = [str(host_linker.parent), str(linker.parent), environment.get("PATH", "")]
-    environment["PATH"] = os.pathsep.join(entry for entry in path_entries if entry)
-    environment[f"CARGO_TARGET_{target_key(TARGETS['x64'])}_LINKER"] = str(host_linker)
-    environment[f"CARGO_TARGET_{target_key(TARGETS[architecture])}_LINKER"] = str(linker)
+    environment, linker = target_msvc_environment(architecture, captured, base)
+    tools_dir = Path(environment["VCToolsInstallDir"])
+    host_linker = target_linker("x64", tools_dir)
+    for tool in (linker, host_linker, target_tool(architecture, tools_dir, "cl.exe")):
+        if not tool.is_file():
+            raise FileNotFoundError(f"MSVC tool not found: {tool}")
     return environment, linker
 
 
@@ -872,6 +917,39 @@ def check_variants() -> None:
     assert variant_environment("arm64", {}) == {"CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS": ""}, "arm64 keeps the default CPU"
 
 
+def check_msvc_environment() -> None:
+    tools = Path("vs") / "VC" / "Tools" / "MSVC" / "14.44"
+    x64_dir = str(tools / "bin" / "Hostx64" / "x64")
+    arm64_dir = str(tools / "bin" / "Hostx64" / "arm64")
+    # What vcvarsall's `set` prints: x64 listed ahead of arm64, as on the runner.
+    vcvars = "\n".join([
+        f"PATH={x64_dir}{os.pathsep}{arm64_dir}{os.pathsep}tools",
+        f"VCToolsInstallDir={tools}",
+        "VSCMD_ARG_TGT_ARCH=arm64",
+    ])
+    base = {"PATH": f"{x64_dir}{os.pathsep}tools", "VSCMD_ARG_TGT_ARCH": "x64", "KEEP": "1"}
+    untouched = dict(base)
+    arm64, linker = target_msvc_environment("arm64", vcvars, base)
+    assert base == untouched, "the base environment must not be mutated"
+    assert arm64["PATH"].split(os.pathsep) == [arm64_dir, x64_dir, "tools"], "arm64 tools first, x64 host tools next, no duplicates"
+    assert Path(arm64["CC_aarch64_pc_windows_msvc"]) == tools / "bin" / "Hostx64" / "arm64" / "cl.exe"
+    assert Path(arm64["CXX_aarch64_pc_windows_msvc"]) == tools / "bin" / "Hostx64" / "arm64" / "cl.exe"
+    assert Path(arm64["AR_aarch64_pc_windows_msvc"]) == tools / "bin" / "Hostx64" / "arm64" / "lib.exe"
+    assert linker == tools / "bin" / "Hostx64" / "arm64" / "link.exe"
+    assert Path(arm64["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"]) == linker
+    assert Path(arm64["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"]) == tools / "bin" / "Hostx64" / "x64" / "link.exe"
+    assert not any(key.endswith("x86_64_pc_windows_msvc") for key in arm64), "arm64 pins no x64 compiler"
+    x64, _ = target_msvc_environment("x64", vcvars, base)
+    assert x64["PATH"].split(os.pathsep) == [x64_dir, arm64_dir, "tools"]
+    assert Path(x64["CC_x86_64_pc_windows_msvc"]) == tools / "bin" / "Hostx64" / "x64" / "cl.exe"
+    assert not any(key.endswith("aarch64_pc_windows_msvc") for key in x64), "x64 pins no arm64 compiler"
+    stacked = {
+        "PATH": os.pathsep.join(["\\VS\\VC\\Tools\\MSVC\\14.44\\bin\\Hostx64\\x64", "tools"]),
+        "VSCMD_ARG_TGT_ARCH": "arm64", "VCToolsInstallDir": "x", "WindowsSdkDir": "y", "KEEP": "1",
+    }
+    assert pristine_environment(stacked) == {"PATH": "tools", "KEEP": "1"}, "vcvars state and MSVC PATH entries are dropped"
+
+
 def check_dev_tags() -> None:
     sha = "50eb54a8d6a7b950bcca5406f250de6d3fac9eda"
     committed = 1794314702  # 2026-11-10 12:45:02 UTC
@@ -1160,6 +1238,7 @@ def self_check() -> None:
     ]
     assert [path.name for path in expected_assets("v0.2.3", "chkdsk", Path("out"))][-1] == "SHA256SUMS.txt"
     check_variants()
+    check_msvc_environment()
     check_dev_tags()
     check_zerover()
     check_plans()
