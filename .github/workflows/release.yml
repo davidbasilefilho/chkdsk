@@ -3,6 +3,11 @@ name: release
 # Reusable build, sign and publish pipeline shared by dev.yml (pre-releases) and
 # stable.yml (stable releases). Callers decide whether a commit needs a release;
 # nothing here builds a commit twice because every artifact feeds the same publish job.
+#
+# Signing is an explicit decision made once, by the config job: `signed` (SignPath
+# is configured and this is a push to dev or main), `unconfigured` (SignPath is not
+# set up) or `disabled` (pull requests run unreviewed code and never sign). Publishing
+# needs that decision; when it is `signed`, a failed or skipped signing stops the release.
 on:
   workflow_call:
     inputs:
@@ -29,25 +34,36 @@ env:
   MISE_DISABLE_TOOLS: github:llvm/llvm-project,prek
 
 jobs:
-  # Job conditions cannot read secrets, so this job turns "signing is configured"
-  # into an output. Pull requests from forks have no secrets and never sign.
+  # Job conditions cannot read secrets, so this job turns the signing decision
+  # into an output. Only a push to dev or main may sign; anything else (pull
+  # requests above all) is `disabled` without looking at the secret. A half
+  # configured SignPath (only the organization ID or only the token) fails here
+  # instead of silently publishing unsigned.
   config:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
     outputs:
-      sign: ${{ steps.signing.outputs.sign }}
+      signing: ${{ steps.signing.outputs.signing }}
     steps:
       - id: signing
         env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
         run: |
-          if [ -n "$SIGNPATH_ORGANIZATION_ID" ] && [ -n "$SIGNPATH_API_TOKEN" ]; then
-            echo "sign=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "sign=false" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" != push ] || { [ "$REF" != refs/heads/dev ] && [ "$REF" != refs/heads/main ]; }; then
+            echo "signing=disabled" >> "$GITHUB_OUTPUT"
+            echo "Only pushes to dev and main are signed; the executables are published unsigned."
+          elif [ -n "$SIGNPATH_ORGANIZATION_ID" ] && [ -n "$SIGNPATH_API_TOKEN" ]; then
+            echo "signing=signed" >> "$GITHUB_OUTPUT"
+          elif [ -z "$SIGNPATH_ORGANIZATION_ID" ] && [ -z "$SIGNPATH_API_TOKEN" ]; then
+            echo "signing=unconfigured" >> "$GITHUB_OUTPUT"
             echo "SignPath is not configured; the executables are published unsigned."
+          else
+            echo "::error::SignPath is half configured: set both the SIGNPATH_ORGANIZATION_ID variable and the SIGNPATH_API_TOKEN secret, or neither."
+            exit 1
           fi
 
   # One native MSVC build per asset; each variant has its own target directory and cache.
@@ -95,10 +111,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Optional Authenticode signing through SignPath, before checksums are written.
+  # Authenticode signing through SignPath, before checksums are written.
   sign:
     needs: [config, build]
-    if: ${{ needs.config.outputs.sign == 'true' }}
+    if: ${{ needs.config.outputs.signing == 'signed' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -134,9 +150,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Publishes only with a signing decision: signed releases need the sign job to
+  # have succeeded, the others need it to have been skipped on purpose.
   publish:
-    needs: [build, sign]
-    if: ${{ !cancelled() && needs.build.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.sign.result) }}
+    needs: [config, build, sign]
+    if: ${{ !cancelled() && needs.config.result == 'success' && needs.build.result == 'success' && (needs.config.outputs.signing == 'signed' && needs.sign.result == 'success' || needs.config.outputs.signing != 'signed' && needs.sign.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -145,29 +163,34 @@ jobs:
       MODE: ${{ inputs.mode }}
       RELEASE_SHA: ${{ inputs.sha }}
       RELEASE_TAG: ${{ inputs.tag }}
-      GH_TOKEN: ${{ github.token }}
+      SIGNING: ${{ needs.config.outputs.signing }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.sha }}
           persist-credentials: false
       - name: Download the signed executables
-        if: ${{ needs.sign.result == 'success' }}
+        if: ${{ needs.config.outputs.signing == 'signed' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: signed-exes
           path: dist/release
       - name: Download the executables
-        if: ${{ needs.sign.result != 'success' }}
+        if: ${{ needs.config.outputs.signing != 'signed' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: exe-*
           merge-multiple: true
           path: dist/release
-      - name: Write checksums and publish the verified release
-        run: |
-          python3 scripts/release.py checksums --mode "$MODE" --assets-dir dist/release
-          python3 scripts/release.py publish --mode "$MODE" --assets-dir dist/release
+      - name: Write checksums
+        run: python3 scripts/release.py checksums --mode "$MODE" --assets-dir dist/release
+      - name: Publish the verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py publish --mode "$MODE" --assets-dir dist/release --signing "$SIGNING"
+      # Never deletes the release published above, a draft or a stable release.
       - name: Prune old development pre-releases
         if: ${{ inputs.mode == 'dev' }}
-        run: python3 scripts/release.py prune --keep 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py prune --keep 10 --exclude-tag "$RELEASE_TAG"

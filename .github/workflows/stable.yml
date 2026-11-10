@@ -3,12 +3,15 @@ name: stable
 # Merging the dev -> main pull request (a squash merge) publishes the stable
 # release automatically: v<version> comes from Cargo.toml, which the pull request
 # check forced above the previous stable tag. Release runs are never cancelled.
+# Signing and the unsigned-release decision live in release.yml.
 on:
   push:
     branches: [main]
 
+# One group per commit: a shared queue would silently drop all but the newest
+# pending run when merges to main arrive in quick succession.
 concurrency:
-  group: stable-release
+  group: stable-${{ github.sha }}
   cancel-in-progress: false
 
 permissions: {}
@@ -51,7 +54,8 @@ jobs:
       mode: stable
       sha: ${{ needs.plan.outputs.sha }}
       tag: ${{ needs.plan.outputs.tag }}
-    secrets: inherit
+    secrets:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
     permissions:
       contents: write
       actions: read
@@ -66,7 +70,6 @@ jobs:
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
       RELEASED_SHA: ${{ needs.plan.outputs.sha }}
       RELEASED_TAG: ${{ needs.plan.outputs.tag }}
     steps:
@@ -76,6 +79,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Merge the release commit into dev without changing dev's content
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git fetch --no-tags origin "$RELEASED_SHA"
           if git merge-base --is-ancestor "$RELEASED_SHA" HEAD; then
@@ -85,8 +90,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git merge -s ours --no-edit -m "chore: merge main into dev after $RELEASED_TAG" "$RELEASED_SHA"
+          # The token travels in the environment (GIT_CONFIG_*), never in argv, where
+          # any process on the runner could read it.
           header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          if ! git -c "http.extraheader=$header" push origin HEAD:dev; then
+          echo "::add-mask::$header"
+          if ! GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="$header" git push origin HEAD:dev; then
             echo "::error::Could not push the back-merge to dev. Allow github-actions to push to dev (branch protection bypass), or merge main into dev locally with 'git merge -s ours' and a merge commit; a squash-merged pull request cannot record the ancestry."
             exit 1
           fi

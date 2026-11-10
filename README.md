@@ -76,20 +76,30 @@ No Linux (e no CI), `mise run ci-linux` roda formatação, a autoverificação d
 
 ### CI e fluxo de branches
 
-Todo PR vai para `dev`; só `dev` vai para `main`. Os merges são squash, então o workflow de release registra `main` em `dev` com um merge `-s ours` (veja abaixo). Nenhum outro branch dispara workflows (`holyagent/**` e branches de checkpoint incluídos).
+Todo PR vai para `dev`; só `dev` vai para `main`. Os merges são squash, então o workflow de release registra `main` em `dev` com um merge `-s ours` (veja abaixo). Nenhum outro branch dispara workflows, e PRs cujo branch de origem é `holyagent/**` ou de checkpoint (`checkpoint/**`, `*/checkpoint/*`) não executam nada.
 
 | Workflow | Quando | O que faz |
 | --- | --- | --- |
-| `dev` | push em `dev`; PR para `dev` ou `main` | `plan` decide o que rodar; `validation`; `prerelease`; no PR para `main`, o job `version` |
+| `dev` | push em `dev`; PR para `dev` ou `main` | `plan` decide o que rodar; `validation`; `prerelease` (no PR para `main`, só depois do job `version`); `checks` reúne o resultado de todos |
 | `validation` | chamado por `dev` e `stable` | `linux` (fmt, Clippy host e xwin, testes, autoverificação) e `windows` (testes no Windows) |
-| `release` | chamado por `dev` e `stable` | `build` (x64, x64-baseline e arm64, em paralelo), `sign` (opcional), `publish` |
+| `release` | chamado por `dev` e `stable` | `config` (decide a assinatura), `build` (x64, x64-baseline e arm64, em paralelo), `sign` (quando configurado), `publish` |
 | `stable` | push em `main` | `plan`, `validation`, `release` e `backmerge` |
 
-O job `plan` pula tudo quando o PR só muda documentação (`*.md`, `docs/`, `LICENSE`), quando um push em `dev` já é coberto por um PR aberto de `dev` e, nos pré-releases, para PRs de forks e commits que já têm release. A verificação é feita dentro do job, e não por `paths-ignore`, para que os checks obrigatórios continuem reportando. Execuções de PR cancelam as anteriores do mesmo PR; releases estáveis nunca são canceladas. Configure `dev / version`, `dev / validation / linux` e `dev / validation / windows` como checks obrigatórios.
+O job `plan` pula tudo quando o PR só muda documentação (`*.md`, `docs/`, `LICENSE`) em relação à base do PR inteiro (`pull_request.base.sha`, não só o último push), quando um push em `dev` já é coberto por um PR aberto de `dev` e, nos pré-releases, para PRs de forks e commits que já têm release. A verificação é feita dentro dos jobs, e não por `paths-ignore`, para que o check obrigatório continue reportando.
+
+**Check obrigatório.** Configure como obrigatório em `dev` e em `main` somente o check `checks` (job `checks` do workflow `dev`, exibido como `dev / checks (pull_request)`). Ele roda sempre e só fica verde quando `plan` teve sucesso e `version`, `validation` e `prerelease` tiveram sucesso ou foram pulados de propósito (segundo as saídas de `plan`); falha ou cancelamento de qualquer job o deixa vermelho. Não exija `validation / linux`, `validation / windows` nem `version` separadamente: eles não existem quando o job é pulado, e um check obrigatório ausente bloqueia o PR para sempre.
+
+**Concorrência.** Cada push em `dev` e em `main` tem o próprio grupo (por SHA), então nenhuma execução é cancelada nem descartada da fila. Um PR cancela as execuções anteriores do mesmo PR; como a publicação é retomável (rascunho primeiro, assets verificados antes de publicar, rascunho existente reaproveitado), cancelar uma execução durante a publicação deixa no máximo um rascunho não publicado, que a poda nunca apaga.
 
 #### Assinatura com SignPath (opcional)
 
-Quando a variável `SIGNPATH_ORGANIZATION_ID` e o segredo `SIGNPATH_API_TOKEN` existem, o job `sign` envia os três `.exe` ao [SignPath](https://signpath.io) antes de gerar os checksums; sem eles, o passo é pulado e os executáveis saem sem assinatura. Em *Settings > Secrets and variables > Actions*, defina:
+O job `config` decide a assinatura uma vez, e a publicação exige essa decisão:
+
+- `signed`: push em `dev` ou `main` com a variável `SIGNPATH_ORGANIZATION_ID` e o segredo `SIGNPATH_API_TOKEN` definidos. O job `sign` envia os três `.exe` ao [SignPath](https://signpath.io) antes de gerar os checksums, e se a assinatura falhar ou for pulada nada é publicado.
+- `unconfigured`: nem a variável nem o segredo existem. Os executáveis saem sem assinatura (também em releases estáveis) e as notas do release dizem isso. Definir só um dos dois faz o job `config` falhar.
+- `disabled`: execuções de PR rodam código não revisado; nunca assinam e nunca recebem o segredo (o workflow `dev` o repassa vazio fora de pushes), e as notas do release dizem que o build não é assinado.
+
+Em *Settings > Secrets and variables > Actions*, defina:
 
 - variável `SIGNPATH_ORGANIZATION_ID`: ID da organização;
 - variável `SIGNPATH_PROJECT_SLUG`: slug do projeto;
@@ -97,15 +107,15 @@ Quando a variável `SIGNPATH_ORGANIZATION_ID` e o segredo `SIGNPATH_API_TOKEN` e
 - variável `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG`: slug da configuração de artefato (um zip com `*.exe` na raiz);
 - segredo `SIGNPATH_API_TOKEN`: token da API.
 
-No SignPath, o projeto precisa confiar neste repositório como *trusted build system* (GitHub.com). PRs de forks não recebem segredos e nunca assinam.
+No SignPath, o projeto precisa confiar neste repositório como *trusted build system* (GitHub.com). PRs, de forks ou não, nunca assinam.
 
 ## Releases
 
 O projeto segue [ZeroVer](https://0ver.org/): a versão major é sempre `0` (`0.y.z`, sem sufixos), e `[workspace.package] version` no `Cargo.toml` da raiz é a única fonte da versão.
 
-- **Pré-releases.** Cada commit de um push em `dev` ou da ponta de um PR (para `dev` ou `main`) gera, no máximo uma vez, um pré-release `v{versão}-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}` (por exemplo `v0.1.0-dev.2026-11-10.12-45-02.g50eb54a`). Data e hora são as do commit, em UTC; como os campos têm largura fixa, a ordem alfabética e a ordem de precedência SemVer são cronológicas. Depois de publicar, o workflow apaga os pré-releases de desenvolvimento (e suas tags) além dos 10 mais recentes; releases estáveis nunca são apagados.
-- **Versão.** Um PR para `main` só pode sair de `dev` e precisa elevar a versão para um valor ZeroVer maior que a última tag estável `v*`; o check `dev / version` falha caso contrário.
-- **Release estável.** O merge em `main` cria a tag `v{versão}` (se ainda não existir), compila, verifica, assina (se configurado) e publica automaticamente. Se a tag já existe em outro commit, o release é recusado. Em seguida, o job `backmerge` faz `git merge -s ours` do commit de release em `dev`; se `dev` não aceitar o push de `github-actions`, o job falha com instruções.
+- **Pré-releases.** Cada commit de um push em `dev` ou da ponta de um PR (para `dev` ou `main`) gera, no máximo uma vez, um pré-release `v{versão}-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}` (por exemplo `v0.1.0-dev.2026-11-10.12-45-02.g50eb54a`). Data e hora são as do commit, em UTC; como os campos têm largura fixa, a ordem alfabética e a ordem de precedência SemVer são cronológicas dentro de uma mesma versão, e todos ficam abaixo da tag estável `v{versão}` dessa versão. Depois de publicar, o workflow apaga os pré-releases de desenvolvimento já publicados (e suas tags) além dos 10 mais recentes; o release que acabou de ser publicado, os rascunhos e os releases estáveis nunca são apagados.
+- **Versão.** Um PR para `main` só pode sair de `dev` e precisa elevar a versão para um valor ZeroVer maior que a última tag estável `v*`; o job `version`, que o check `checks` exige, falha caso contrário.
+- **Release estável.** O merge em `main` cria a tag `v{versão}` (se ainda não existir), compila, verifica, assina (se configurado; sem SignPath configurado, publica sem assinatura e avisa nas notas) e publica automaticamente. Se a tag já existe em outro commit, o release é recusado. Em seguida, o job `backmerge` faz `git merge -s ours` do commit de release em `dev`; se `dev` não aceitar o push de `github-actions`, o job falha com instruções.
 
 Os executáveis têm estes nomes (o sufixo `-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}` aparece somente em builds de desenvolvimento) e vêm com `SHA256SUMS.txt`:
 
@@ -115,7 +125,7 @@ chkdsk-{versão}[-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}]-windows-x64-baseline.exe
 chkdsk-{versão}[-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}]-windows-arm64.exe
 ```
 
-`mise run release-check` valida localmente as regras de tag, ZeroVer, planejamento, poda e nomes de artefatos, sem publicar.
+`mise run release-check` valida localmente as regras de tag, ZeroVer, planejamento, o check obrigatório, poda, notas de assinatura, `--locked` e nomes de artefatos, sem publicar.
 
 ## Licença
 
