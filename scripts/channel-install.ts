@@ -14,7 +14,7 @@ function gh(route: string, flags: string[] = []) {
   } catch { throw Error("GitHub request failed: " + route + " (check read access and availability)"); }
 }
 
-const api: Api = {
+export const api: Api = {
   get: route => JSON.parse(gh(route).toString()),
   pages<T>(route: string, key?: string): T[] {
     const result: T[] = [];
@@ -28,7 +28,7 @@ const api: Api = {
   },
 };
 
-function download(selection: Selection, dir: string) {
+export function download(selection: Selection, dir: string) {
   if (selection.artifact) {
     const zip = join(dir, "distribution.zip");
     const bytes = gh("actions/artifacts/" + selection.artifact.id + "/zip");

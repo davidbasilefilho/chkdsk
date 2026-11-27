@@ -98,3 +98,18 @@ test("a new HEAD or artifact while downloading cannot replace the selected versi
   f.pulls[1].state="closed";
   expect(() => checkCurrent(before,select(f.api,"pr"))).toThrow("changed");
 });
+
+test("only successful same-repository dev pushes and PR validation runs can trigger publication", async () => {
+  const { publicationChannel } = await import("./channels");
+  const f = fixture();
+  const runs = f.api.pages<import("./channels").Run>("actions/workflows/");
+  const dev = runs[0];
+  const pr = runs[1];
+  expect(publicationChannel(dev, repository)).toBe("dev");
+  expect(publicationChannel(pr, repository)).toBe("pr-1");
+  expect(publicationChannel({ ...dev, head_branch: "main" }, repository)).toBeUndefined();
+  expect(publicationChannel({ ...pr, head_repository: { full_name: "other/fork" } }, repository)).toBeUndefined();
+  expect(publicationChannel({ ...pr, conclusion: "cancelled" }, repository)).toBeUndefined();
+  expect(publicationChannel({ ...pr, head_sha: dev.head_sha }, repository)).toBeUndefined();
+  expect(publicationChannel({ ...pr, path: ".github/workflows/other.yml" }, repository)).toBeUndefined();
+});

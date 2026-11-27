@@ -13,7 +13,7 @@ export interface Api {
 }
 interface Ref { ref: string; sha: string; repo: { full_name: string } | null }
 interface Pull { number: number; state: string; draft: boolean; head: Ref; base: Ref }
-interface Run {
+export interface Run {
   id: number; path: string; event: string; head_branch: string; head_sha: string; status: string; conclusion: string;
   run_attempt: number; run_started_at: string; head_repository: { full_name: string };
   pull_requests: {number: number; head: {sha: string}; base: {sha: string; ref: string}}[];
@@ -80,6 +80,16 @@ function preview(api: Api, channel: string, sha: string, branch: string, pull?: 
 function eligible(p: Pull) {
   return p.state === "open" && !p.draft && ["main", "dev"].includes(p.base.ref)
     && p.base.repo?.full_name === repository && p.head.repo?.full_name === repository;
+}
+
+export function publicationChannel(run: Run, repositoryName: string): string | undefined {
+  if (run.path !== workflow || !fullSha.test(run.head_sha) || run.status !== "completed"
+    || run.conclusion !== "success" || run.head_repository?.full_name !== repositoryName) return;
+  if (run.event === "push" && run.head_branch === "dev") return "dev";
+  if (run.event !== "pull_request" || run.pull_requests.length !== 1) return;
+  const pull = run.pull_requests[0];
+  if (pull.head.sha === run.head_sha && ["dev", "main"].includes(pull.base.ref)
+    && Number.isSafeInteger(pull.number) && pull.number > 0) return "pr-" + pull.number;
 }
 
 export function select(api: Api, channel: string): Selection {
