@@ -2,7 +2,7 @@
 rust = { version = "stable", components = ["rustfmt", "clippy"], targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] }
 python = "3.12"
 "github:llvm/llvm-project" = { version = "llvmorg-23.1.2", matching = "clang+llvm", matching_regex = "\\.tar\\.xz$" }
-prek = "latest"
+hk = "2.14.0"
 
 [tasks.fmt]
 description = "Check Rust formatting"
@@ -41,7 +41,7 @@ run = [
 
 [tasks.setup-hook]
 description = "Install the repository pre-commit hook"
-run = "prek install"
+run = "hk install --mise"
 
 [tasks.release]
 description = "Build optimized x64-baseline and ARM64 executables"

@@ -194,15 +194,27 @@ def write_checksums(assets: list[Path], checksum_path: Path) -> None:
             stream.write(f"{hashlib.sha256(asset.read_bytes()).hexdigest()}  {asset.name}\n")
 
 
+def verify_pe_machine(binary: Path, architecture: str) -> None:
+    machine = {"x64": 0x8664, "arm64": 0xAA64}[architecture]
+    with binary.open("rb") as stream:
+        dos = stream.read(64)
+        if len(dos) != 64 or dos[:2] != b"MZ":
+            raise ValueError(f"missing DOS header: {binary.name}")
+        offset = int.from_bytes(dos[60:64], "little")
+        stream.seek(offset)
+        header = stream.read(6)
+    if offset < 64 or header != b"PE\0\0" + machine.to_bytes(2, "little"):
+        raise ValueError(f"expected {architecture} PE header: {binary.name}")
+
+
 def verify_assets(assets_dir: Path, expected: list[Path]) -> None:
     required = {path.name for path in expected}
     actual = {path.name for path in assets_dir.iterdir() if path.is_file()}
     if actual != required:
         raise ValueError(f"release asset set mismatch: expected {sorted(required)}, found {sorted(actual)}")
     binaries = expected[:-1]
-    for binary in binaries:
-        if binary.stat().st_size == 0:
-            raise ValueError(f"release asset is empty: {binary.name}")
+    for architecture, binary in zip(TARGETS, binaries, strict=True):
+        verify_pe_machine(binary, architecture)
     expected_lines = [f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}" for path in binaries]
     found_lines = (assets_dir / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines()
     if found_lines != expected_lines:
@@ -569,6 +581,19 @@ def self_check() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         asset_paths = [Path(directory) / name for name in ("one.exe", "two.exe", "SHA256SUMS.txt")]
+        for binary, machine in zip(asset_paths[:2], (0x8664, 0xAA64), strict=True):
+            binary.write_bytes(b"MZ" + bytes(58) + (64).to_bytes(4, "little")
+                               + b"PE\0\0" + machine.to_bytes(2, "little"))
+        write_checksums(asset_paths[:2], asset_paths[-1])
+        verify_assets(Path(directory), asset_paths)
+        asset_paths[1].write_bytes(asset_paths[0].read_bytes())
+        write_checksums(asset_paths[:2], asset_paths[-1])
+        try:
+            verify_assets(Path(directory), asset_paths)
+        except ValueError as error:
+            assert "expected arm64 PE header" in str(error)
+        else:
+            raise AssertionError("x64 executable accepted as an ARM64 asset")
         for path, content in zip(asset_paths, (b"one", b"two", b"checksums"), strict=True):
             path.write_bytes(content)
         remote = {

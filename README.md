@@ -25,7 +25,7 @@ Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o
 
 ## Desenvolvimento
 
-O ambiente de desenvolvimento usa [mise](https://mise.jdx.dev/) para provisionar Rust estável, `rustfmt`, Clippy, Python 3.12, `prek` e uma distribuição LLVM portátil fixada no projeto. LLVM não é necessário para executar o aplicativo. A compilação Windows requer os componentes do Visual Studio Build Tools (toolset MSVC e Windows SDK) para x64 e ARM64; mise instala os componentes Rust, mas não substitui o linker/SDK MSVC.
+O ambiente de desenvolvimento usa [mise](https://mise.jdx.dev/) para provisionar Rust estável, `rustfmt`, Clippy, Python 3.12, `hk` e uma distribuição LLVM portátil fixada no projeto. LLVM não é necessário para executar o aplicativo. A compilação Windows requer os componentes do Visual Studio Build Tools (toolset MSVC e Windows SDK) para x64 e ARM64; mise instala os componentes Rust, mas não substitui o linker/SDK MSVC.
 
 Na raiz do repositório, em PowerShell:
 
@@ -54,7 +54,7 @@ mise run setup-hook
 mise run release
 ```
 
-`validation` confere formatação, regras de release, linkers MSVC, Clippy, testes x64 e compilação nas duas arquiteturas. `setup-hook` instala o hook local do `prek`, que verifica `rustfmt`. `release` gera builds otimizados; também existem `release-x64-baseline` e `release-arm64`.
+`validation` confere formatação, regras de release, linkers MSVC, Clippy, testes x64 e compilação nas duas arquiteturas. Se você já instalou o hook antigo, execute `prek uninstall` antes de migrar. `setup-hook` instala o pre-commit local do hk. A cada commit, ele executa `mise run fmt` e `mise run clippy` no projeto inteiro, inclusive quando apenas a documentação muda. `release` gera builds otimizados; também existem `release-x64-baseline` e `release-arm64`.
 
 ## Releases
 
