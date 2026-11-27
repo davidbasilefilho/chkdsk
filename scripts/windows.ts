@@ -31,6 +31,19 @@ export function linkerFor(arch: Architecture, tools: string): string {
   return join(tools, "bin", "Hostx64", arch, "link.exe");
 }
 
+// Cargo may compile host build scripts while compiling C or C++ for ARM64.
+// Select each tool by target triple so cc-rs never infers the target from PATH.
+export function nativeTools(arch: Architecture, tools: string) {
+  const dir = dirname(linkerFor(arch, tools));
+  const triple = targets[arch].replaceAll("-", "_");
+  return {
+    ["CC_" + triple]: join(dir, "cl.exe"),
+    ["CXX_" + triple]: join(dir, "cl.exe"),
+    ["AR_" + triple]: join(dir, "lib.exe"),
+    ["CARGO_TARGET_" + triple.toUpperCase() + "_LINKER"]: join(dir, "link.exe"),
+  };
+}
+
 export function msvc(arch: Architecture) {
   if (process.platform !== "win32") throw Error("MSVC target tasks must run on Windows");
   const vswhere = join(process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)",
@@ -55,8 +68,7 @@ export function msvc(arch: Architecture) {
   const host = linkerFor("x64", env.VCTOOLSINSTALLDIR);
   for (const file of [host, linker]) if (!existsSync(file)) throw Error("MSVC linker not found: " + file);
   env.PATH = [dirname(host), dirname(linker), env.PATH].filter(Boolean).join(";");
-  env.CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = host;
-  env["CARGO_TARGET_" + targets[arch].toUpperCase().replaceAll("-", "_") + "_LINKER"] = linker;
+  Object.assign(env, nativeTools("x64", env.VCTOOLSINSTALLDIR), nativeTools(arch, env.VCTOOLSINSTALLDIR));
   return { env, linker };
 }
 

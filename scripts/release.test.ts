@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { assetPaths, checksums, digest, tagFor, verifyAssets } from "./assets";
 import { publishRelease, type Release } from "./github";
-import { CommandError, linkerFor, targets } from "./windows";
+import { CommandError, linkerFor, nativeTools, targets } from "./windows";
 
 const sha = "abcdef0123456789";
 const tag = "v1.2.3-dev-abcdef0";
@@ -26,6 +26,17 @@ test("MSVC host and target linker paths and triples", () => {
   expect(targets).toEqual({ x64: "x86_64-pc-windows-msvc", arm64: "aarch64-pc-windows-msvc" });
   for (const arch of ["x64", "arm64"] as const)
     expect(linkerFor(arch, "VC")).toBe(join("VC", "bin", "Hostx64", arch, "link.exe"));
+});
+
+test("host and target C toolchains stay distinct during ARM64 builds", () => {
+  const env = { ...nativeTools("x64", "VC"), ...nativeTools("arm64", "VC") };
+  for (const [arch, triple] of [["x64", "x86_64_pc_windows_msvc"], ["arm64", "aarch64_pc_windows_msvc"]]) {
+    const dir = join("VC", "bin", "Hostx64", arch);
+    expect(env["CC_" + triple]).toBe(join(dir, "cl.exe"));
+    expect(env["CXX_" + triple]).toBe(join(dir, "cl.exe"));
+    expect(env["AR_" + triple]).toBe(join(dir, "lib.exe"));
+    expect(env["CARGO_TARGET_" + triple.toUpperCase() + "_LINKER"]).toBe(join(dir, "link.exe"));
+  }
 });
 
 test("tags, filenames, SHA and SemVer", () => {
