@@ -198,6 +198,14 @@ impl Health {
                 crate::locale::tr("Fonte", "Source"),
                 Some("NVMe SMART / Health Information".into()),
             );
+            field(
+                "NVMe Percentage Used",
+                n.percentage_used.map(|v| format!("{v}%")),
+            );
+            field(
+                crate::locale::tr("Tempo ligado NVMe", "NVMe power-on time"),
+                n.power_on_hours.map(|v| format!("{v} h")),
+            );
             for (key, value) in [
                 (
                     crate::locale::tr(
@@ -239,6 +247,18 @@ impl Health {
             field(
                 crate::locale::tr("Fonte", "Source"),
                 Some("Windows StorageReliabilityCounter".into()),
+            );
+            field(
+                "Windows Wear",
+                counters.wear.filter(|v| *v <= 100).map(|v| format!("{v}%")),
+            );
+            field(
+                "Windows Temperature",
+                counters.temperature.map(|v| format!("{v} °C")),
+            );
+            field(
+                "Windows PowerOnHours",
+                counters.power_on_hours.map(|v| format!("{v} h")),
             );
             field(
                 crate::locale::tr("Erros de leitura não corrigidos", "Uncorrected read errors"),

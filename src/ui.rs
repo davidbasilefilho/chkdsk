@@ -227,6 +227,7 @@ pub fn now_unix() -> u64 {
 struct Palette {
     theme: tok::Theme,
     accent: Color,
+    pending: Color,
     healthy: Color,
     attention: Color,
     unknown: Color,
@@ -251,6 +252,7 @@ impl Palette {
         Self {
             theme: tok::theme(dark),
             accent,
+            pending: brand_ink(dark),
             healthy,
             attention,
             unknown,
@@ -363,9 +365,7 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
         let selected = !state.settings_open && index == state.selected;
         let dot = rune::el().w(8.0).h(8.0).radius(4.0).fill(
             card.tone()
-                .map_or(brand_ink(palette.theme.bg == tok::theme(true).bg), |tone| {
-                    palette.tone(tone)
-                }),
+                .map_or(palette.pending, |tone| palette.tone(tone)),
         );
         let marker = rune::el()
             .w(3.0)

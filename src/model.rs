@@ -90,7 +90,7 @@ pub struct Telemetry {
     pub reliability: Option<Reliability>,
     pub nvme: QueryState<NvmeHealth>,
     pub ata: QueryState<AtaHealth>,
-    /// Wear consumed, 0..=100. Only populate when the device/model mapping
+    /// Wear consumed. NVMe can report more than 100 after rated endurance. Only populate when the device/model mapping
     /// establishes the semantics; never infer it from an ATA attribute ID.
     pub endurance_percent: Option<f64>,
     pub power_on_hours: Option<u64>,
@@ -111,7 +111,7 @@ impl Telemetry {
 
     /// Populate common fields from a successfully parsed NVMe health log.
     pub fn apply_nvme(&mut self, health: NvmeHealth) {
-        self.endurance_percent = health.percentage_used.map(|v| f64::from(v.min(100)));
+        self.endurance_percent = health.percentage_used.map(f64::from);
         self.power_on_hours = health.power_on_hours.and_then(|v| u64::try_from(v).ok());
         self.temperature_c = health
             .composite_temperature_kelvin
