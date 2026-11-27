@@ -1,0 +1,68 @@
+name: PR 12 build and fixture smoke
+on: push
+permissions:
+  contents: read
+env:
+  SOURCE_SHA: 98d5f0e25db80b2630b0d1c81e29f8e5e0eec980
+jobs:
+  package:
+    runs-on: windows-2022
+    env:
+      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
+      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: jdx/mise-action@v5
+        with:
+          install: true
+      - name: Package stable binaries
+        run: |
+          if ((git rev-parse HEAD) -ne $env:SOURCE_SHA) { throw "Wrong checkout" }
+          mise exec -- bun scripts/release.ts package --mode stable --sha $env:SOURCE_SHA --output dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chkdsk-0.1.0-98d5f0e
+          path: dist/release/
+          if-no-files-found: error
+      - name: Render a fixture with the scenes-enabled build
+        run: |
+          mise exec -- bun scripts/release.ts cargo --architecture x64 -- build --release --features scenes --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $output = Join-Path $PWD fixture.png
+          & .\target\x86_64-pc-windows-msvc\release\chkdsk.exe --snap $output --scene saudavel --size 1100x720 --scale 1 --theme dark | Out-Host
+          if ($LASTEXITCODE -or !(Test-Path $output)) { throw "Fixture render failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixture-98d5f0e
+          path: fixture.png
+  smoke:
+    if: always() && !cancelled()
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            suffix: x64-baseline
+            machine: AMD64
+          - runner: windows-11-arm
+            suffix: arm64
+            machine: ARM64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: chkdsk-0.1.0-98d5f0e
+      - name: Check native version and manifest
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne '${{ matrix.machine }}') { throw "Unexpected host" }
+          foreach ($line in Get-Content SHA256SUMS.txt) {
+            $hash, $name = $line -split '  ', 2
+            if ((Get-FileHash -Algorithm SHA256 $name).Hash -ne $hash) { throw "Hash mismatch" }
+          }
+          $version = & .\chkdsk-0.1.0-windows-${{ matrix.suffix }}.exe --version | Out-String
+          if ($LASTEXITCODE -or $version.Trim() -ne 'chkdsk 0.1.0') { throw "Bad version: $version" }
+          Write-Output "$env:PROCESSOR_ARCHITECTURE $version"
