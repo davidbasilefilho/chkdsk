@@ -6,7 +6,9 @@ A janela funciona em português do Brasil ou inglês, conforme os idiomas de exi
 
 ## Como instalo?
 
-Abra a [página de Releases](https://github.com/davidbasilefilho/disksonar/releases) e baixe o executável para seu Windows.
+A estável atual é a `v0.0.1`. Para instalar, siga o [guia de download direto e verificação SHA-256](docs/releases.md#instalar-a-estável-v001).
+
+Os builds atuais de `dev` e de PRs oferecem estes perfis na [página de Releases](https://github.com/davidbasilefilho/disksonar/releases).
 
 | Perfil | Sufixo do executável | Quando usar |
 | --- | --- | --- |
