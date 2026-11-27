@@ -17,9 +17,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 65
     env:
-      CHANNEL: pr-15
-      SOURCE_SHA: 0047b57abcfe771ab07f1b9b5809eff5f9fa2c73
-      VALIDATION_RUN: 46043571708
+      CHANNEL: dev
+      SOURCE_SHA: 021838e8a7707038418fb2db576a33f7e1070296
+      VALIDATION_RUN: 46045700444
       PROFILES: ${{ matrix.profiles }}
       MISE_DISABLE_TOOLS: rust,bun,hk,github:llvm/llvm-project
     steps:
