@@ -43,9 +43,13 @@ jobs:
       - name: Run installed executable through mise
         run: |
           foreach ($spec in @($env:x64_baseline, $env:x64)) {
+            $key = $spec.Split("@")[-1]
+            $root = Join-Path $env:LOCALAPPDATA "disksonar/packages/$key"
+            $spec = "github:davidbasilefilho/disksonar@path:$root"
+            Get-FileHash (Join-Path $root bin/disksonar.exe)
             $version = mise x $spec -- disksonar.exe --version | Out-String
             if ($LASTEXITCODE -or $version.Trim() -ne 'disksonar 0.1.0') { throw "Installed GUI failed" }
-            $image = "installed-" + $spec.Split("@")[-1] + ".png"
+            $image = "installed-" + $key + ".png"
             mise x $spec -- disksonar.exe --scene settings --snap $image --size 440x640 | Out-Host
             if ($LASTEXITCODE) { throw "Installed fixture failed" }
           }
