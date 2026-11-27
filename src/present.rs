@@ -15,6 +15,7 @@ use std::time::Duration;
 pub enum Tone {
     Healthy,
     Attention,
+    Critical,
     Unknown,
 }
 
@@ -28,6 +29,7 @@ pub struct Card {
     pub title: String,
     pub subtitle: String,
     pub body: Body,
+    unsupported: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +60,7 @@ pub struct Health {
     pub last_reading: String,
     pub warnings: Vec<&'static str>,
     pub attributes: Vec<AttributeRow>,
+    pub details: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,22 +84,30 @@ impl Card {
             DiskKind::Hdd => "HD",
             DiskKind::Ssd => "SSD",
             DiskKind::Nvme => "NVMe",
-            DiskKind::Unknown => "Tipo desconhecido",
+            DiskKind::Unknown => crate::locale::tr("Tipo desconhecido", "Unknown type"),
         };
         let capacity = identity
             .capacity_bytes
             .map(format_bytes)
-            .unwrap_or_else(|| "capacidade indisponível".into());
+            .unwrap_or_else(|| {
+                crate::locale::tr("capacidade indisponível", "capacity unavailable").into()
+            });
         let body = match &snapshot.reading {
             Reading::Pending => Body::Loading,
             Reading::Failed(state) => Body::Message(query_error_message(*state)),
-            Reading::Ready(ready) => Body::Health(Box::new(Health::new(identity.kind, ready, now))),
+            Reading::Ready(ready) => Body::Health(Box::new(Health::new(identity, ready, now))),
         };
         Card {
             id: identity.id.clone(),
-            list_name: model.unwrap_or("Disco").into(),
-            title: model.unwrap_or("Modelo desconhecido").into(),
+            list_name: model.unwrap_or(crate::locale::tr("Disco", "Drive")).into(),
+            title: model
+                .unwrap_or(crate::locale::tr("Modelo desconhecido", "Unknown model"))
+                .into(),
             subtitle: format!("{kind}  ·  {capacity}"),
+            unsupported: matches!(
+                &snapshot.reading,
+                Reading::Failed(QueryErrorState::Unsupported)
+            ),
             body,
         }
     }
@@ -104,8 +115,11 @@ impl Card {
     /// The word next to the disk in the list, so color is never the only signal.
     pub fn status_label(&self) -> &'static str {
         match &self.body {
-            Body::Loading => "Lendo…",
-            Body::Message(_) => "Indisponível",
+            Body::Loading => crate::locale::tr("Lendo…", "Reading…"),
+            Body::Message(_) if self.unsupported => {
+                crate::locale::tr("Não suportado", "Unsupported")
+            }
+            Body::Message(_) => crate::locale::tr("Indisponível", "Unavailable"),
             Body::Health(health) => health.label,
         }
     }
@@ -121,22 +135,48 @@ impl Card {
 }
 
 impl Health {
-    fn new(kind: DiskKind, ready: &Ready, now: u64) -> Self {
+    fn new(identity: &crate::model::DiskIdentity, ready: &Ready, now: u64) -> Self {
         let telemetry = &ready.telemetry;
-        let health = score_health(kind, telemetry);
+        let health = score_health(identity.kind, telemetry);
         let (label, tone) = match health.outcome {
-            HealthOutcome::Pass => ("Saudável", Tone::Healthy),
-            HealthOutcome::Fail => ("Atenção", Tone::Attention),
-            HealthOutcome::Unknown => ("Indisponível", Tone::Unknown),
+            HealthOutcome::Pass => (crate::locale::tr("Saudável", "Healthy"), Tone::Healthy),
+            HealthOutcome::Fail
+                if matches!(telemetry.overall_failure, QueryState::Success(true)) =>
+            {
+                (crate::locale::tr("Crítico", "Critical"), Tone::Critical)
+            }
+            HealthOutcome::Fail => (crate::locale::tr("Atenção", "Attention"), Tone::Attention),
+            HealthOutcome::Unknown => (
+                crate::locale::tr("Indisponível", "Unavailable"),
+                Tone::Unknown,
+            ),
         };
-        let score = (health.outcome != HealthOutcome::Unknown).then(|| health.score.to_string());
+        let score = telemetry
+            .endurance_percent
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(|used| format!("{:.0}%", (100.0 - used).max(0.0)));
         let warnings = match &telemetry.nvme {
             QueryState::Success(nvme) => [
-                (1, "Reserva NVMe crítica"),
-                (2, "Temperatura NVMe crítica"),
-                (4, "Confiabilidade NVMe degradada"),
-                (8, "Mídia NVMe somente leitura"),
-                (16, "Aviso de memória NVMe"),
+                (
+                    1,
+                    crate::locale::tr("Reserva NVMe crítica", "NVMe spare capacity critical"),
+                ),
+                (
+                    2,
+                    crate::locale::tr("Temperatura NVMe crítica", "NVMe temperature critical"),
+                ),
+                (
+                    4,
+                    crate::locale::tr("Confiabilidade NVMe degradada", "NVMe reliability degraded"),
+                ),
+                (
+                    8,
+                    crate::locale::tr("Mídia NVMe somente leitura", "NVMe media is read-only"),
+                ),
+                (
+                    16,
+                    crate::locale::tr("Aviso de memória NVMe", "NVMe volatile memory warning"),
+                ),
             ]
             .into_iter()
             .filter(|(bit, _)| nvme.critical_warning & bit != 0)
@@ -144,6 +184,74 @@ impl Health {
             .collect(),
             _ => Vec::new(),
         };
+        let mut details = Vec::new();
+        let mut field = |name: &str, value: Option<String>| {
+            if let Some(value) = value {
+                details.push((name.to_owned(), value));
+            }
+        };
+        field(crate::locale::tr("Modelo", "Model"), identity.model.clone());
+        field("Firmware", identity.firmware.clone());
+        field(crate::locale::tr("Barramento", "Bus"), identity.bus.clone());
+        if let QueryState::Success(n) = &telemetry.nvme {
+            field(
+                crate::locale::tr("Fonte", "Source"),
+                Some("NVMe SMART / Health Information".into()),
+            );
+            for (key, value) in [
+                (
+                    crate::locale::tr(
+                        "Unidades lidas (512.000 bytes)",
+                        "Units read (512,000 bytes)",
+                    ),
+                    n.data_units_read,
+                ),
+                (
+                    crate::locale::tr(
+                        "Unidades gravadas (512.000 bytes)",
+                        "Units written (512,000 bytes)",
+                    ),
+                    n.data_units_written,
+                ),
+                (
+                    crate::locale::tr("Ciclos de energia", "Power cycles"),
+                    n.power_cycles,
+                ),
+                (
+                    crate::locale::tr("Erros de mídia", "Media errors"),
+                    n.media_errors,
+                ),
+                (
+                    crate::locale::tr("Entradas no log de erros", "Error log entries"),
+                    n.error_log_entries,
+                ),
+            ] {
+                field(key, value.map(|v| v.to_string()));
+            }
+        }
+        if matches!(telemetry.ata, QueryState::Success(_)) {
+            field(
+                crate::locale::tr("Fonte", "Source"),
+                Some("ATA SMART READ DATA".into()),
+            );
+        }
+        if let Some(counters) = &telemetry.reliability {
+            field(
+                crate::locale::tr("Fonte", "Source"),
+                Some("Windows StorageReliabilityCounter".into()),
+            );
+            field(
+                crate::locale::tr("Erros de leitura não corrigidos", "Uncorrected read errors"),
+                counters.read_errors_uncorrected.map(|v| v.to_string()),
+            );
+            field(
+                crate::locale::tr(
+                    "Erros de gravação não corrigidos",
+                    "Uncorrected write errors",
+                ),
+                counters.write_errors_uncorrected.map(|v| v.to_string()),
+            );
+        }
         Health {
             tone,
             label,
@@ -151,27 +259,42 @@ impl Health {
             lifetime: ready
                 .remaining_seconds
                 .map(format_endurance_days)
-                .unwrap_or_else(|| "aguardando histórico".into()),
+                .unwrap_or_else(|| {
+                    if telemetry.endurance_percent.is_some() {
+                        crate::locale::tr("aguardando histórico", "awaiting history")
+                    } else {
+                        crate::locale::tr("indisponível", "unavailable")
+                    }
+                    .into()
+                }),
             lifetime_known: ready.remaining_seconds.is_some(),
             status: telemetry_status(telemetry),
             status_tone: status_tone(telemetry),
             wear: telemetry
                 .endurance_percent
                 .map(|wear| format!("{wear:.0}%"))
-                .unwrap_or_else(|| "indisponível".into()),
+                .unwrap_or_else(|| crate::locale::tr("indisponível", "unavailable").into()),
             temperature: telemetry
                 .temperature_c
                 .map(|value| format!("{value} °C"))
-                .unwrap_or_else(|| "indisponível".into()),
+                .unwrap_or_else(|| crate::locale::tr("indisponível", "unavailable").into()),
             power_on: telemetry
                 .power_on_hours
                 .map(|value| format!("{} h", compact_number(value)))
-                .unwrap_or_else(|| "indisponível".into()),
+                .unwrap_or_else(|| crate::locale::tr("indisponível", "unavailable").into()),
             last_reading: ready
                 .last_sample_unix
-                .map(|timestamp| format!("há {}", format_duration(now.saturating_sub(timestamp))))
-                .unwrap_or_else(|| "indisponível".into()),
+                .map(|timestamp| {
+                    let elapsed = format_duration(now.saturating_sub(timestamp));
+                    if crate::locale::english() {
+                        format!("{elapsed} ago")
+                    } else {
+                        format!("há {elapsed}")
+                    }
+                })
+                .unwrap_or_else(|| crate::locale::tr("indisponível", "unavailable").into()),
             warnings,
+            details,
             attributes: match &telemetry.ata {
                 QueryState::Success(ata) => ata.attributes.iter().map(attribute_row).collect(),
                 _ => Vec::new(),
@@ -197,18 +320,32 @@ fn attribute_row(attribute: &AtaAttribute) -> AttributeRow {
 }
 
 const PERMISSION_MESSAGE: &str =
-    "Permissão insuficiente para consultar o dispositivo. Tente executar como administrador.";
+    "Permissão insuficiente para consultar o dispositivo. Algumas leituras estão indisponíveis.";
 
 pub fn query_error_message(state: QueryErrorState) -> String {
     match state {
-        QueryErrorState::Permission => PERMISSION_MESSAGE.into(),
-        QueryErrorState::Unsupported => "Leitura de saúde não compatível com o dispositivo".into(),
+        QueryErrorState::Permission => crate::locale::tr(
+            PERMISSION_MESSAGE,
+            "Permission denied for this drive. Some readings are unavailable.",
+        )
+        .into(),
+        QueryErrorState::Unsupported => crate::locale::tr(
+            "Leitura de saúde não compatível com o dispositivo",
+            "Drive health reporting is unsupported",
+        )
+        .into(),
         QueryErrorState::Transient | QueryErrorState::Partial => retry_message(DISCOVERY_INTERVAL),
     }
 }
 
 /// The retry is the next discovery, so the promised wait is that interval.
 fn retry_message(interval: Duration) -> String {
+    if crate::locale::english() {
+        return format!(
+            "Could not read drive health data. Retrying within {} seconds.",
+            interval.as_secs()
+        );
+    }
     format!(
         "Não foi possível consultar os dados de saúde. Uma nova tentativa acontece em até {} segundos.",
         interval.as_secs()
@@ -227,33 +364,51 @@ fn telemetry_has_usable_data(telemetry: &Telemetry) -> bool {
 fn telemetry_status(telemetry: &Telemetry) -> &'static str {
     if !telemetry_has_usable_data(telemetry) {
         if any_permission_failure(telemetry) {
-            return PERMISSION_MESSAGE;
+            return crate::locale::tr(
+                PERMISSION_MESSAGE,
+                "Permission denied for this drive. Some readings are unavailable.",
+            );
         }
         if matches!(&telemetry.nvme, QueryState::Unsupported)
             || matches!(&telemetry.ata, QueryState::Unsupported)
             || matches!(&telemetry.overall_failure, QueryState::Unsupported)
         {
-            return "Leitura SMART não compatível";
+            return crate::locale::tr(
+                "Leitura SMART não compatível",
+                "SMART reporting is unsupported",
+            );
         }
         if matches!(&telemetry.nvme, QueryState::Failed { .. })
             || matches!(&telemetry.ata, QueryState::Failed { .. })
             || matches!(&telemetry.overall_failure, QueryState::Failed { .. })
         {
-            return "Falha ao ler dados SMART";
+            return crate::locale::tr("Falha ao ler dados SMART", "Could not read SMART data");
         }
-        return "Dados de saúde indisponíveis";
+        return crate::locale::tr(
+            "Dados de saúde indisponíveis",
+            "Drive health data unavailable",
+        );
     }
     if any_permission_failure(telemetry) {
-        return "Dados parciais; permissão insuficiente em algumas consultas";
+        return crate::locale::tr(
+            "Dados parciais; permissão insuficiente em algumas consultas",
+            "Partial data. Some queries require additional permissions.",
+        );
     }
     if matches!(&telemetry.overall_failure, QueryState::Success(true)) {
-        return "O dispositivo relatou uma falha";
+        return crate::locale::tr(
+            "O dispositivo relatou uma falha",
+            "The drive reported a failure",
+        );
     }
     if matches!(&telemetry.overall_failure, QueryState::Success(false))
         && !matches!(&telemetry.nvme, QueryState::Unsupported)
         && !matches!(&telemetry.ata, QueryState::Unsupported)
     {
-        return "Sem falha geral relatada pelo dispositivo";
+        return crate::locale::tr(
+            "Sem falha geral relatada pelo dispositivo",
+            "The drive reported no overall failure",
+        );
     }
     if matches!(
         &telemetry.nvme,
@@ -263,9 +418,12 @@ fn telemetry_status(telemetry: &Telemetry) -> &'static str {
         QueryState::Unsupported | QueryState::Failed { .. }
     ) || matches!(&telemetry.overall_failure, QueryState::Failed { .. })
     {
-        return "Dados de saúde parcialmente disponíveis";
+        return crate::locale::tr(
+            "Dados de saúde parcialmente disponíveis",
+            "Some drive health data is unavailable",
+        );
     }
-    "Dados SMART disponíveis"
+    crate::locale::tr("Dados SMART disponíveis", "SMART data available")
 }
 
 /// A device-reported failure is as loud as the pill; a permission gap only warns.
@@ -273,13 +431,13 @@ fn status_tone(telemetry: &Telemetry) -> Option<Tone> {
     if any_permission_failure(telemetry) {
         Some(Tone::Unknown)
     } else if matches!(&telemetry.overall_failure, QueryState::Success(true)) {
-        Some(Tone::Attention)
+        Some(Tone::Critical)
     } else {
         None
     }
 }
 
-fn any_permission_failure(telemetry: &Telemetry) -> bool {
+pub(crate) fn any_permission_failure(telemetry: &Telemetry) -> bool {
     failed_permission(&telemetry.nvme)
         || failed_permission(&telemetry.ata)
         || failed_permission(&telemetry.overall_failure)
@@ -302,9 +460,17 @@ fn is_permission_error(message: &str) -> bool {
 
 fn compact_number(value: u64) -> String {
     if value >= 1_000_000_000 {
-        format!("{} bi", decimal_pt(value as f64 / 1_000_000_000.0))
+        format!(
+            "{} {}",
+            decimal_pt(value as f64 / 1_000_000_000.0),
+            crate::locale::tr("bi", "B")
+        )
     } else if value >= 1_000_000 {
-        format!("{} mi", decimal_pt(value as f64 / 1_000_000.0))
+        format!(
+            "{} {}",
+            decimal_pt(value as f64 / 1_000_000.0),
+            crate::locale::tr("mi", "M")
+        )
     } else {
         value.to_string()
     }
@@ -326,7 +492,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn decimal_pt(value: f64) -> String {
-    format!("{value:.1}").replace('.', ",")
+    format!("{value:.1}").replace('.', crate::locale::tr(",", "."))
 }
 
 fn format_duration(seconds: u64) -> String {
@@ -334,32 +500,32 @@ fn format_duration(seconds: u64) -> String {
     if days >= 365 {
         let years = days / 365;
         if years == 1 {
-            "1 ano".into()
+            crate::locale::tr("1 ano", "1 year").into()
         } else {
-            format!("{years} anos")
+            format!("{years} {}", crate::locale::tr("anos", "years"))
         }
     } else if days >= 30 {
         let months = days / 30;
         if months == 1 {
-            "1 mês".into()
+            crate::locale::tr("1 mês", "1 month").into()
         } else {
-            format!("{months} meses")
+            format!("{months} {}", crate::locale::tr("meses", "months"))
         }
     } else if days == 1 {
-        "1 dia".into()
+        crate::locale::tr("1 dia", "1 day").into()
     } else if days > 0 {
-        format!("{days} dias")
+        format!("{days} {}", crate::locale::tr("dias", "days"))
     } else {
-        "menos de 1 dia".into()
+        crate::locale::tr("menos de 1 dia", "less than one day").into()
     }
 }
 
 fn format_endurance_days(remaining_seconds: u64) -> String {
     let days = remaining_seconds / 86_400;
     if days == 1 {
-        "1 dia".into()
+        crate::locale::tr("1 dia", "1 day").into()
     } else {
-        format!("{days} dias")
+        format!("{days} {}", crate::locale::tr("dias", "days"))
     }
 }
 
@@ -436,7 +602,7 @@ mod tests {
         assert_eq!(health.score, None);
         assert!(!health.lifetime_known);
         assert_eq!(health.status, "Dados de saúde indisponíveis");
-        assert_eq!(health.lifetime, "aguardando histórico");
+        assert_eq!(health.lifetime, "indisponível");
         assert_eq!(health.wear, "indisponível");
         assert_eq!(health.last_reading, "indisponível");
     }
@@ -465,7 +631,9 @@ mod tests {
             (worn, "Atenção", Tone::Attention),
             (Telemetry::default(), "Indisponível", Tone::Unknown),
         ] {
-            let expected = score_health(DiskKind::Nvme, &telemetry);
+            let expected = telemetry
+                .endurance_percent
+                .map(|used| format!("{:.0}%", 100.0 - used));
             let mut disk = identity("nvme");
             disk.kind = DiskKind::Nvme;
             let card = card(disk, ready(telemetry));
@@ -475,7 +643,7 @@ mod tests {
             };
             assert_eq!((health.label, health.tone), (label, tone));
             if tone != Tone::Unknown {
-                assert_eq!(health.score, Some(expected.score.to_string()));
+                assert_eq!(health.score, expected);
             } else {
                 assert_eq!(health.score, None);
             }
@@ -604,7 +772,7 @@ mod tests {
             panic!("a reading must produce a health body");
         };
         assert_eq!(health.status, "O dispositivo relatou uma falha");
-        assert_eq!(health.status_tone, Some(Tone::Attention));
+        assert_eq!(health.status_tone, Some(Tone::Critical));
 
         let calm = Telemetry {
             overall_failure: QueryState::Success(false),

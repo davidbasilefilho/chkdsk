@@ -48,6 +48,16 @@ pub enum Update {
     DiscoveryFailed,
 }
 
+impl Update {
+    pub fn needs_permission(&self) -> bool {
+        matches!(self, Self::Disks(disks) if disks.iter().any(|disk|match &disk.reading {
+            Reading::Failed(QueryErrorState::Permission) => true,
+            Reading::Ready(ready) => crate::present::any_permission_failure(&ready.telemetry),
+            _ => false,
+        }))
+    }
+}
+
 /// Telemetry plus what the history says about the disk.
 pub fn ready_reading(identity: &DiskIdentity, telemetry: Telemetry, history: &History) -> Reading {
     Reading::Ready(Box::new(Ready {
@@ -235,13 +245,13 @@ enum Message {
 
 /// Start the collector thread. It sleeps between discoveries; `deliver` is
 /// called from it with every change the window should show.
-pub fn spawn(deliver: impl Fn(Update) + Send + 'static) {
+pub fn spawn(deliver: impl FnMut(Update) + Send + 'static) {
     let _ = thread::Builder::new()
         .name("coleta".into())
         .spawn(move || run(history_path(), deliver));
 }
 
-fn run(path: PathBuf, deliver: impl Fn(Update)) {
+fn run(path: PathBuf, mut deliver: impl FnMut(Update)) {
     let history = load_history(&path);
     let mut collector = Collector::new(history, spawn_history_writer(path));
     let (sender, receiver) = mpsc::channel();

@@ -6,6 +6,7 @@ pub mod collector;
 pub mod fixtures;
 pub mod health;
 pub mod history;
+pub mod locale;
 pub mod model;
 pub mod parse;
 pub mod present;

@@ -40,17 +40,26 @@ pub enum Notice {
 impl Notice {
     fn title(self) -> &'static str {
         match self {
-            Notice::Searching => "Procurando discos…",
-            Notice::NoDisks => "Nenhum disco encontrado",
-            Notice::DiscoveryFailed => "Não foi possível localizar os discos",
+            Notice::Searching => crate::locale::tr("Procurando discos…", "Searching for drives…"),
+            Notice::NoDisks => crate::locale::tr("Nenhum disco encontrado", "No drives found"),
+            Notice::DiscoveryFailed => crate::locale::tr(
+                "Não foi possível localizar os discos",
+                "Could not discover drives",
+            ),
         }
     }
 
     fn hint(self) -> Option<&'static str> {
         match self {
             Notice::Searching => None,
-            Notice::NoDisks => Some("Conecte um disco; a lista é atualizada a cada 15 segundos."),
-            Notice::DiscoveryFailed => Some("Uma nova tentativa acontece em até 15 segundos."),
+            Notice::NoDisks => Some(crate::locale::tr(
+                "Conecte um disco; a lista é atualizada a cada 15 segundos.",
+                "Connect a drive. This list refreshes every 15 seconds.",
+            )),
+            Notice::DiscoveryFailed => Some(crate::locale::tr(
+                "Uma nova tentativa acontece em até 15 segundos.",
+                "Discovery will retry within 15 seconds.",
+            )),
         }
     }
 }
@@ -58,6 +67,8 @@ impl Notice {
 pub struct Dashboard {
     pub cards: Vec<Card>,
     pub selected: usize,
+    advanced: bool,
+    menu_open: bool,
     pub notice: Notice,
     /// Where the detail panel is scrolled, as the viewport reports it.
     scroll: Live<f32>,
@@ -68,6 +79,8 @@ impl Default for Dashboard {
         Self {
             cards: Vec::new(),
             selected: 0,
+            advanced: false,
+            menu_open: false,
             notice: Notice::Searching,
             scroll: Live::new(0.0),
         }
@@ -138,9 +151,14 @@ impl Dashboard {
         if self.cards.is_empty() {
             return;
         }
+        if self.menu_open {
+            self.menu_open = false;
+            tx.focus("disk-menu", true);
+        }
         let index = index.min(self.cards.len() - 1);
         if index != self.selected {
             self.selected = index;
+            self.advanced = false;
             tx.scroll_to_instant(DETAIL_KEY, 0.0, 0.0);
         }
         tx.scroll_into_view(row_key(&self.cards[index].id));
@@ -167,11 +185,15 @@ pub fn on_key(state: &mut Dashboard, event: &KeyEvent, tx: &mut Tx) -> bool {
     let mods = event.mods;
     let plain = !(mods.cmd || mods.ctrl || mods.alt || mods.logo);
     match &event.key {
+        Key::Escape if state.menu_open => {
+            state.menu_open = false;
+            tx.focus("disk-menu", true);
+        }
         Key::Escape => tx.quit(),
         Key::Text(text) if plain && text == "q" => tx.quit(),
         Key::Left if plain => state.step(false, tx),
         Key::Right if plain => state.step(true, tx),
-        Key::Tab if plain => state.step(!mods.shift, tx),
+
         Key::Up => state.scroll_by(-SCROLL_STEP, tx),
         Key::Down => state.scroll_by(SCROLL_STEP, tx),
         Key::Text(text) if plain && text == "k" => state.scroll_by(-SCROLL_STEP, tx),
@@ -223,32 +245,80 @@ impl Palette {
     fn tone(&self, tone: Tone) -> Color {
         match tone {
             Tone::Healthy => self.healthy,
-            Tone::Attention => self.attention,
-            Tone::Unknown => self.unknown,
+            Tone::Critical => self.attention,
+            Tone::Attention => self.unknown,
+            Tone::Unknown => self.theme.text_secondary,
         }
     }
 }
 
 pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
     let palette = Palette::new(cx.system_dark(), cx.accent());
+    cx.reduced_motion(cx.system_reduced_motion());
+    let compact = cx.layout_size("janela").is_some_and(|size| size[0] < 680.0);
+    let menu = row()
+        .key("disk-menu")
+        .role("button")
+        .focusable(true)
+        .expanded(state.menu_open)
+        .label(crate::locale::tr("Menu de discos", "Drive menu"))
+        .padding(8.0)
+        .cursor(Cursor::Pointer)
+        .on_press_tx(|s: &mut Dashboard, tx: &mut Tx| {
+            s.menu_open = !s.menu_open;
+            if s.menu_open
+                && let Some(id) = s.selected_id()
+            {
+                tx.focus(row_key(id), true);
+            }
+        })
+        .child(text(crate::locale::tr("☰  Discos", "☰  Drives")).color(palette.theme.text));
     let content = match state.cards.get(state.selected) {
+        Some(card) if compact => {
+            let panel = if state.menu_open {
+                sidebar(state, &palette)
+            } else {
+                detail(card, &palette, &state.scroll, state.advanced)
+            };
+            col().grow(1.0).min_h(0.0).child(menu).child(panel)
+        }
         Some(card) => row()
             .grow(1.0)
             .min_h(0.0)
             .child(sidebar(state, &palette))
-            .child(detail(card, &palette, &state.scroll)),
+            .child(detail(card, &palette, &state.scroll, state.advanced)),
         None => empty(state.notice, &palette),
     };
-    col()
+    let frame = if cx.system_reduced_motion() {
+        col().instant_changes()
+    } else {
+        col()
+    };
+    frame
         .key("janela")
         .w_full()
         .h_full()
-        .fill(palette.theme.bg)
+        .fill(palette.theme.card)
+        .child(
+            row()
+                .h(40.0)
+                .window_drag()
+                .center_y()
+                .pl(cx.chrome_insets().leading + 16.0)
+                .pr(cx.chrome_insets().trailing)
+                .child(text("chkdsk").font(BODY_STRONG).color(palette.theme.text)),
+        )
         .child(content)
 }
 
+pub fn disk_key(id: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hash = DefaultHasher::new();
+    id.hash(&mut hash);
+    hash.finish()
+}
 fn row_key(id: &str) -> String {
-    format!("disco-{id}")
+    format!("disco-{:016x}", disk_key(id))
 }
 
 fn sidebar(state: &Dashboard, palette: &Palette) -> El {
@@ -298,6 +368,7 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
         list = list.child(
             row()
                 .key(row_key(&card.id))
+                .focusable(true)
                 .role("tab")
                 .label(format!("{}, {}, {status}", card.list_name, card.subtitle))
                 .checked(selected)
@@ -315,8 +386,8 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
                 .cursor(Cursor::Pointer)
                 .on_press_tx(move |s: &mut Dashboard, tx: &mut Tx| s.select(index, tx))
                 .child(marker)
-                .child(dot)
-                .child(names),
+                .child(names)
+                .child(dot.self_start().mt(10.0)),
         );
     }
     let panel = col()
@@ -351,11 +422,10 @@ fn empty(notice: Notice, palette: &Palette) -> El {
     col().grow(1.0).min_h(0.0).center().child(message)
 }
 
-fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
+fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>, advanced: bool) -> El {
     let t = palette.theme;
     let mut page = col()
         .w_full()
-        .max_w(720.0)
         .padding(32.0)
         .child(
             text(card.title.clone())
@@ -372,7 +442,7 @@ fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
         );
     page = match &card.body {
         Body::Loading => page.child(
-            text("Consultando o disco…")
+            text(crate::locale::tr("Consultando o disco…", "Reading drive…"))
                 .key("estado")
                 .font(BODY)
                 .color(t.text_secondary)
@@ -386,11 +456,16 @@ fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
                 .wrap()
                 .mt(32.0),
         ),
-        Body::Health(health) => health_body(page, health, palette),
+        Body::Health(health) => health_body(page, health, palette, advanced),
     };
     let scroll = scroll.clone();
     col()
+        .radius(12.0)
+        .mr(8.0)
+        .mb(8.0)
+        .fill(t.bg)
         .key(DETAIL_KEY)
+        .ml(8.0)
         .grow(1.0)
         .min_w(0.0)
         .min_h(0.0)
@@ -403,7 +478,7 @@ fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
         .child(page)
 }
 
-fn health_body(page: El, health: &Health, palette: &Palette) -> El {
+fn health_body(page: El, health: &Health, palette: &Palette, advanced: bool) -> El {
     let t = palette.theme;
     let tone = palette.tone(health.tone);
     let pill = row()
@@ -414,18 +489,24 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
         .fill(tone.alpha(PILL_TINT))
         .child(text(health.label).font(CAPTION_STRONG).color(tone));
     // With no usable evidence there is no number to show, only the pill.
-    let hero = row().mt(32.0).center_y().flex_wrap();
+    let hero = col().mt(24.0).child(pill.self_start());
     let hero = match &health.score {
-        Some(score) => hero
-            .child(text(score.clone()).key("nota").font(SCORE).color(tone))
+        Some(value) => hero
+            .child(text(value.clone()).key("nota").font(SCORE).color(tone))
             .child(
-                col()
-                    .gap(8.0)
-                    .ml(20.0)
-                    .child(pill)
-                    .child(text("saúde").font(CAPTION).color(t.text_secondary)),
+                text(crate::locale::tr("de saúde", "health"))
+                    .font(CAPTION)
+                    .color(t.text_secondary),
+            )
+            .child(
+                text(crate::locale::tr(
+                    "Resistência nominal restante do SSD",
+                    "Remaining rated SSD endurance",
+                ))
+                .font(CAPTION)
+                .color(t.text_secondary),
             ),
-        None => hero.child(pill),
+        None => hero,
     };
 
     let fact = |key: &'static str, label: &'static str, value: &str, style: TextStyle| {
@@ -440,7 +521,7 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
         .gap(12.0)
         .child(fact(
             "vida",
-            "Vida estimada",
+            crate::locale::tr("Vida estimada", "Estimated endurance"),
             &health.lifetime,
             if health.lifetime_known {
                 BODY_STRONG
@@ -448,17 +529,27 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
                 BODY
             },
         ))
-        .child(fact("desgaste", "Desgaste", &health.wear, BODY))
+        .child(fact(
+            "desgaste",
+            crate::locale::tr("Desgaste", "Wear used"),
+            &health.wear,
+            BODY,
+        ))
         .child(fact(
             "temperatura",
-            "Temperatura",
+            crate::locale::tr("Temperatura", "Temperature"),
             &health.temperature,
             BODY,
         ))
-        .child(fact("ligado", "Tempo ligado", &health.power_on, BODY))
+        .child(fact(
+            "ligado",
+            crate::locale::tr("Tempo ligado", "Power-on time"),
+            &health.power_on,
+            BODY,
+        ))
         .child(fact(
             "leitura",
-            "Última leitura",
+            crate::locale::tr("Última leitura", "Last reading"),
             &health.last_reading,
             BODY,
         ));
@@ -479,8 +570,43 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
                 .mt(8.0),
         );
     }
-    if !health.attributes.is_empty() {
-        page = page.child(attributes(&health.attributes, palette));
+    if !health.attributes.is_empty() || !health.details.is_empty() {
+        page = page.child(
+            row()
+                .key("advanced")
+                .role("button")
+                .focusable(true)
+                .expanded(advanced)
+                .label(crate::locale::tr(
+                    "Informações avançadas",
+                    "Advanced information",
+                ))
+                .cursor(Cursor::Pointer)
+                .padding(12.0)
+                .on_press_tx(|state: &mut Dashboard, _: &mut Tx| state.advanced = !state.advanced)
+                .child(
+                    text(if advanced {
+                        crate::locale::tr("▾  Informações avançadas", "▾  Advanced information")
+                    } else {
+                        crate::locale::tr("▸  Informações avançadas", "▸  Advanced information")
+                    })
+                    .font(BODY_STRONG)
+                    .color(t.text),
+                ),
+        );
+        if advanced {
+            for (name, value) in &health.details {
+                page = page.child(
+                    text(format!("{name} · {value}"))
+                        .font(BODY)
+                        .color(t.text)
+                        .wrap(),
+                );
+            }
+            if !health.attributes.is_empty() {
+                page = page.child(attributes(&health.attributes, palette));
+            }
+        }
     }
     page
 }
@@ -506,14 +632,33 @@ fn attributes(rows: &[AttributeRow], palette: &Palette) -> El {
         .key("atributos")
         .mt(40.0)
         .gap(8.0)
-        .child(text("Atributos ATA").font(BODY_STRONG).color(t.text))
         .child(
-            text("Valores brutos definidos pelo fabricante, sem unidade atribuída.")
-                .font(CAPTION)
-                .color(t.text_secondary)
-                .wrap(),
+            text(crate::locale::tr("Atributos ATA", "ATA attributes"))
+                .font(BODY_STRONG)
+                .color(t.text),
         )
-        .child(line(["ID", "Atual", "Pior", "Bruto"], CAPTION, t.text_secondary).mt(8.0));
+        .child(
+            text(crate::locale::tr(
+                "Valores brutos definidos pelo fabricante, sem unidade atribuída.",
+                "Vendor-defined raw values. Units are unknown.",
+            ))
+            .font(CAPTION)
+            .color(t.text_secondary)
+            .wrap(),
+        )
+        .child(
+            line(
+                [
+                    "ID",
+                    crate::locale::tr("Atual", "Current"),
+                    crate::locale::tr("Pior", "Worst"),
+                    crate::locale::tr("Bruto", "Raw"),
+                ],
+                CAPTION,
+                t.text_secondary,
+            )
+            .mt(8.0),
+        );
     for attribute in rows {
         table = table.child(line(
             [

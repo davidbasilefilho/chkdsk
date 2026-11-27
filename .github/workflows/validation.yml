@@ -61,7 +61,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: windows-dev-${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Run the packaged terminal and graphical interfaces
+      - name: Run the packaged graphical interface
         env:
           PROFILES: ${{ matrix.profiles }}
         run: |
@@ -70,17 +70,16 @@ jobs:
             if ((Get-FileHash -Algorithm SHA256 $name).Hash -ne $hash) { throw "Checksum mismatch for $name" }
           }
           foreach ($profile in $env:PROFILES.Split(',')) {
-            $gui = (Get-Item "*-gui-windows-$profile.exe").FullName
-            $tui = (Get-Item "*-tui-windows-$profile.exe").FullName
-            foreach ($exe in @($gui, $tui)) {
-              $stamp = & $exe --build-profile | Out-String
-              if ($LASTEXITCODE -or $stamp.Trim() -ne "chkdsk-cpu:$profile;") { throw "Profile mismatch: $exe" }
+            $gui = (Get-Item "*-windows-$profile.exe").FullName
+            $stamp = & $gui --build-profile | Out-String
+            if ($LASTEXITCODE -or $stamp.Trim() -ne "chkdsk-cpu:$profile;") { throw "Profile mismatch: $gui" }
+            foreach ($scene in @("saudavel", "macrovip")) {
+              foreach ($size in @("1100x720", "440x640")) {
+                $image = "fixture-$scene-$profile-$size.png"
+                & $gui --scene $scene --snap $image --size $size --scale 1 --theme dark | Out-Host
+                if ($LASTEXITCODE -or !(Test-Path $image)) { throw "Graphical fixture failed: $image" }
+              }
             }
-            $text = & $tui --fixture | Out-String
-            if ($LASTEXITCODE -or $text -notmatch 'Temperatura' -or $text -notmatch 'NVMe') { throw "Terminal fixture failed" }
-            $image = "fixture-$profile.png"
-            & $gui --scene saudavel --snap $image --size 1100x720 --scale 1 --theme dark | Out-Host
-            if ($LASTEXITCODE -or !(Test-Path $image)) { throw "Graphical fixture failed" }
           }
       - uses: actions/upload-artifact@v4
         with:

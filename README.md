@@ -1,24 +1,28 @@
 # chkdsk
 
-Painel de saúde de discos para Windows, escrito em Rust, com uma janela nativa em português brasileiro (pt_BR), desenhada com [rune](https://github.com/anomalyco/rune). Consulta telemetria SMART/Health, apresenta uma nota heurística conservadora e mantém histórico local para tendências de desgaste. O aplicativo não depende de serviços externos durante a execução.
+Painel de saúde de discos para Windows, escrito em Rust, com uma janela nativa em português brasileiro ou inglês, conforme a ordem dos idiomas de exibição do Windows, desenhada com [rune](https://github.com/anomalyco/rune). Consulta telemetria SMART/Health, apresenta o estado informado pelo diagnóstico e mantém histórico local para tendências de desgaste. O aplicativo não depende de serviços externos durante a execução.
 
 > Este projeto não é o `chkdsk` do Windows. Não verifica nem repara sistemas de arquivos, não agenda reparos e não substitui `chkdsk.exe`; também não executa varredura de superfície. Para evitar conflito com a ferramenta do sistema, inicie o executável deste projeto pelo caminho completo.
 
 ## Executar
 
-A GUI requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a nota em destaque, vida estimada, desgaste, temperatura, tempo ligado, última leitura e, em discos ATA, os atributos SMART brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. A TUI abre no terminal e usa o mesmo coletor e cálculo de saúde. Use ←/→ para escolher um disco, ↑/↓ para rolar e q ou Esc para sair. A opção `--fixture` imprime uma leitura de exemplo e encerra antes de iniciar a coleta. O runtime não requer Rust, mise ou acesso à rede.
+A GUI requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a resistência nominal restante quando medida, vida estimada, desgaste, temperatura, tempo ligado, última leitura e, em discos ATA, os atributos SMART brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. O runtime não requer Rust, mise ou acesso à rede.
+
+O painel mostra a porcentagem de resistência restante quando há desgaste medido. Em SSDs NVMe, a origem é Percentage Used. Quando uma leitura direta está incompleta, o painel também consulta os contadores de confiabilidade do Windows associados ao mesmo caminho de disco. Um desgaste informado de zero é diferente de um campo ausente. A especificação pública do MACROVIP MV240GB não documenta as unidades dos atributos SMART por firmware. O valor bruto de 09 fica em **Informações avançadas**. [Ficha do fabricante](https://macrovip.com/en/produto/ssd-macrovip-premium-240gb-2-5-sata-3-mv240gb/)
+
+Quando uma consulta requer privilégios adicionais, o aplicativo oferece uma tentativa de elevação pelo consentimento normal do Windows. Se o usuário cancelar, a janela continua disponível com os dados obtidos. As cenas de teste e capturas usam somente fixtures.
 
 ## Pontuação e limites
 
 - A nota de 0 a 100 é determinística, mas não representa probabilidade de falha nem certificação do disco. Com evidência utilizável, notas acima de 50 são classificadas como saudáveis e notas até 50 como atenção; sem evidência utilizável, o estado é **Indisponível** e nenhuma nota é exibida.
 - Para NVMe, a heurística considera percentual de desgaste usado, reserva disponível e avisos críticos reportados pelo dispositivo; condições críticas aplicam limites máximos à nota. Não há padrão portátil confiável para interpretar universalmente atributos ATA brutos: eles podem ser exibidos, mas não afetam a nota sem mapeamento específico e verificado por modelo.
-- A ETA é uma extrapolação indicativa até 100% de desgaste usado, baseada no segmento atual de histórico desde a leitura mais antiga após o último reset/regressão do contador até a mais recente. Exige aumento positivo observado ao longo do tempo; leituras iguais, regressivas ou dados insuficientes não estabelecem tendência. HDDs não recebem previsão. A ETA não prevê falhas nem garante vida útil.
+- A ETA é uma extrapolação indicativa até 100% de desgaste usado, baseada no segmento atual de histórico desde a leitura mais antiga após o último reset/regressão do contador até a mais recente. Exige pelo menos 24 horas entre observações e aumento positivo de até dez pontos percentuais por dia; leituras iguais, regressivas ou dados insuficientes não estabelecem tendência. HDDs não recebem previsão. A ETA não prevê falhas nem garante vida útil.
 - O histórico fica em `%APPDATA%\chkdsk\historico.json` (ou na pasta temporária do usuário quando `%APPDATA%` não está definido). Mantém até 35 dias por disco: amostras por hora nos sete dias mais recentes e por dia antes disso. Uma regressão do contador de desgaste descarta o histórico anterior daquele disco para iniciar uma nova linha de base.
 - O aplicativo não altera discos e normalmente não precisa de privilégios elevados. Windows, driver, controlador ou adaptador USB podem bloquear consultas SMART; elevar privilégios não torna disponível uma telemetria que o dispositivo ou controlador não fornece.
 
 ## Controles
 
-- `←` / `→` ou `Tab` / `Shift+Tab`: alternar entre discos.
+- `←` / `→` : alternar entre discos.
 - `↑` / `↓` (ou `k` / `j`): rolar o painel do disco; `Page Up`, `Page Down`, `Home` e `End` também rolam.
 - Clique em um disco da lista para selecioná-lo; a roda do mouse rola o painel sob o ponteiro.
 - `q` ou `Esc`: sair. Fechar a janela também encerra o aplicativo.
@@ -58,34 +62,34 @@ mise run release
 
 ## Releases
 
-Tags estáveis seguem exatamente `v{versão}` e não aceitam versão SemVer pré-lançamento. Builds de desenvolvimento usam `v{versão}-dev-{sha7}`. Cada pacote contém seis executáveis independentes com o prefixo `chkdsk-{versão}[-dev-{sha7}]-` e um arquivo `SHA256SUMS.txt`.
+Tags estáveis seguem exatamente `v{versão}` e não aceitam versão SemVer pré-lançamento. Builds de desenvolvimento usam `v{versão}-dev-{sha7}`. Cada pacote contém três executáveis independentes com o prefixo `chkdsk-{versão}[-dev-{sha7}]-` e um arquivo `SHA256SUMS.txt`.
 
-| Perfil | Terminal | Janela gráfica | Requisito de CPU |
-| --- | --- | --- | --- |
-| ARM64 | `tui-windows-arm64.exe` | `gui-windows-arm64.exe` | Windows ARM64, AArch64 com NEON; Rust usa o alvo MSVC ARM64 genérico. |
-| x64 | `tui-windows-x64.exe` | `gui-windows-x64.exe` | x86-64-v3 com AVX/AVX2 e suporte do sistema ao estado AVX. Inclui SSE3, SSSE3, SSE4.1/4.2, POPCNT, CMPXCHG16B, F16C, FMA, BMI1/2, LZCNT e MOVBE. |
-| x64-baseline | `tui-windows-x64-baseline.exe` | `gui-windows-x64-baseline.exe` | Alvo genérico x86-64 com SSE2; dispensa AVX. Aplicam-se também os requisitos mínimos do Windows instalado. |
+| Perfil | Executável (sufixo) | Requisitos |
+| --- | --- | --- |
+| ARM64 | `windows-arm64.exe` | Windows ARM64, AArch64 com NEON; Rust usa o alvo MSVC ARM64 genérico. |
+| x64 | `windows-x64.exe` | x86-64-v3 com AVX/AVX2 e suporte do sistema ao estado AVX. Inclui SSE3, SSSE3, SSE4.1/4.2, POPCNT, CMPXCHG16B, F16C, FMA, BMI1/2, LZCNT e MOVBE. |
+| x64-baseline | `windows-x64-baseline.exe` | Alvo genérico x86-64 com SSE2; dispensa AVX. Aplicam-se também os requisitos mínimos do Windows instalado. |
 
 Na dúvida sobre a CPU x64, escolha o baseline. Rust usa `-Ctarget-cpu=x86-64-v3` ou `-Ctarget-cpu=x86-64` em compilações separadas. O código C/C++ compilado com MSVC recebe `/arch:AVX2` ou `/arch:SSE2` para o mesmo alvo. Rotinas especializadas de dependências podem selecionar instruções adicionais em tempo de execução pela CPU. Bun executa as tarefas de desenvolvimento; os binários distribuídos são nativos Rust. [Perfis de geração de código do Rust](https://doc.rust-lang.org/rustc/codegen-options/index.html#target-cpu) · [Seleção de ISA no MSVC](https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64)
 
-Para ensaiar o pacote sem publicar, execute `mise exec -- bun scripts/release.ts package --mode dev --sha (git rev-parse HEAD) --output dist/release` no PowerShell. Use um diretório de saída vazio. O empacotamento e a publicação conferem os seis nomes, seus hashes, os cabeçalhos PE, os subsistemas gráfico/console e o perfil de CPU compilado. A CI do PR executa os arquivos empacotados com fixtures em runners Windows x64 e ARM64. Os fluxos dev e estável reutilizam essas verificações antes de publicar.
+Para ensaiar o pacote sem publicar, execute `mise exec -- bun scripts/release.ts package --mode dev --sha (git rev-parse HEAD) --output dist/release` no PowerShell. Use um diretório de saída vazio. O empacotamento e a publicação conferem os três nomes, seus hashes, os cabeçalhos PE, o subsistema gráfico e o perfil de CPU compilado. A CI do PR executa os arquivos empacotados com fixtures em runners Windows x64 e ARM64. Os fluxos dev e estável reutilizam essas verificações antes de publicar.
 
 ### Instalação por canal com mise
 
 Em um checkout **confiável de `main`**, instale o mise e o GitHub CLI (`gh`). Para artefatos do Actions, autentique o CLI com acesso de leitura a Actions e Contents. No Windows, o instalador usa o `tar.exe` do sistema. Escolha explicitamente a interface e a CPU:
 
 ```powershell
-mise run channel-install latest gui x64-baseline
-mise run channel-install dev tui arm64
-mise run channel-install pr-13 gui x64
-mise run channel-install pr tui x64-baseline
+mise run channel-install latest x64-baseline
+mise run channel-install dev arm64
+mise run channel-install pr-13 x64
+mise run channel-install pr x64-baseline
 ```
 
-Cada comando verifica os seis arquivos e o manifesto e registra **apenas a variante escolhida** como uma versão local do backend GitHub usando `mise link`. O comando imprime a linha `mise x github:davidbasilefilho/chkdsk@… -- chkdsk-gui.exe` ou `chkdsk-tui.exe` com o identificador imutável. Acrescente `--version` para conferir. Para atualizar, rode novamente o instalador do canal. Para voltar, execute a linha de uma instalação anterior. O nome com a interface evita colisão com o utilitário de sistema. Consulte [mise link](https://mise.jdx.dev/cli/link.html) e a [API de artefatos do GitHub](https://docs.github.com/en/rest/actions/artifacts).
+Cada comando verifica os três arquivos e o manifesto e registra **apenas a variante escolhida** como uma versão local do backend GitHub usando `mise link`. O comando imprime a linha `mise x github:davidbasilefilho/chkdsk@… -- chkdsk-dashboard.exe` com o identificador imutável. Acrescente `--version` para conferir. Para atualizar, rode novamente o instalador do canal. Para voltar, execute a linha de uma instalação anterior. O nome com a interface evita colisão com o utilitário de sistema. Consulte [mise link](https://mise.jdx.dev/cli/link.html) e a [API de artefatos do GitHub](https://docs.github.com/en/rest/actions/artifacts).
 
 | Canal | Fonte verificada na instalação |
 | --- | --- |
-| `latest` | Ponteiro aprovado em `channels/latest.json` de `main`, tag estável, commit pertencente a `main` e release publicada com sete assets (seis executáveis e o manifesto). |
+| `latest` | Ponteiro aprovado em `channels/latest.json` de `main`, tag estável, commit pertencente a `main` e release publicada com quatro assets (três executáveis e o manifesto). |
 | `dev` | HEAD atual da branch real `dev`, com o build e os dois testes nativos verdes no evento **push** desse SHA. |
 | `pr-N` | HEAD atual do PR aberto N, fora de rascunho, no próprio repositório, para `main` ou `dev`. Requer uma execução **pull_request** associada ao número, base e SHA. |
 | `pr` | Entre os PRs elegíveis e verificados acima, o de maior data de **committer** do HEAD. Em caso de empate, vence o maior número de PR. |
@@ -94,6 +98,6 @@ Os canais de teste consultam a API em modo leitura. O identificador do artefato,
 
 **Ativação de dev.** A branch existente `dev` tem histórico próprio. Depois do merge desta mudança, reconcilie o novo `main` com `dev` em um PR separado, preservando os commits exclusivos e substituindo os workflows antigos de publicação de `dev`. O primeiro push validado desse resultado ativa o canal. Para rollback de `dev`, reverta em Git e valide o novo HEAD. A mesma regra vale para atualizar ou reverter o código de um PR.
 
-**Promoção estável.** Configure o environment `stable` com aprovação obrigatória e restrição à branch `main`, proteja `main` e as tags estáveis contra reescrita. Depois de aprovação explícita, use uma tag SemVer estável no commit de `main` escolhido e revise o par tag/SHA em `channels/latest.json` via PR. Execute `stable release` manualmente a partir de `main` com esses valores. O job de escrita usa a fonte confiável do dispatch e confere a origem novamente antes de publicar. Para rollback do canal, revise o ponteiro em `main` para uma release anterior elegível. Isso não requer editar essa release. O ponteiro inicial conserva `v0.0.1`: a instalação de seis variantes fica indisponível enquanto a estável aprovada usar o formato antigo.
+**Promoção estável.** Configure o environment `stable` com aprovação obrigatória e restrição à branch `main`, proteja `main` e as tags estáveis contra reescrita. Depois de aprovação explícita, use uma tag SemVer estável no commit de `main` escolhido e revise o par tag/SHA em `channels/latest.json` via PR. Execute `stable release` manualmente a partir de `main` com esses valores. O job de escrita usa a fonte confiável do dispatch e confere a origem novamente antes de publicar. Para rollback do canal, revise o ponteiro em `main` para uma release anterior elegível. Isso não requer editar essa release. O ponteiro inicial conserva `v0.0.1`: a instalação de três variantes fica indisponível enquanto a estável aprovada usar o formato antigo.
 
-**Teste.** `mise run release-check` cobre seleção, ordenação, ref/artefato obsoleto e o formato dos pacotes. Para um teste conectado, use `mise run channel-install pr-N tui x64-baseline` depois da CI verde e execute a linha impressa com `--fixture`. Para a GUI use `--scene saudavel --snap teste.png`. A expiração dos artefatos de teste segue a retenção do Actions; as releases estáveis usam os assets do GitHub Releases.
+**Teste.** `mise run release-check` cobre seleção, ordenação, ref/artefato obsoleto e o formato dos pacotes. Para um teste conectado, use `mise run channel-install pr-N x64-baseline` depois da CI verde e execute a linha impressa com `--scene saudavel --snap teste.png`. A expiração dos artefatos de teste segue a retenção do Actions; as releases estáveis usam os assets do GitHub Releases.

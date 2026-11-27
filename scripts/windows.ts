@@ -96,7 +96,7 @@ export function build(profile: Profile, name: string) {
   }
   console.log("Building", profile, "with Rust CPU", cpu, "and MSVC", env["CFLAGS_" + target.replaceAll("-", "_")] ?? "ARM64 default");
   run(["cargo", "build", "--locked", "--release", "--features", "scenes", "--target", target,
-    "--target-dir", directory, "--bin", name, "--bin", name + "-tui"], false, env);
+    "--target-dir", directory, "--bin", name], false, env);
   const output = join(directory, target, "release");
-  return { gui: join(output, name + ".exe"), tui: join(output, name + "-tui.exe") };
+  return join(output, name + ".exe");
 }

@@ -63,19 +63,19 @@ export function checkCurrent(before: Selection, after: Selection) {
 }
 
 function install(args: string[]) {
-  const [channel, ui, profile] = args;
-  if (args.length !== 3 || !["gui", "tui"].includes(ui) || !["x64", "x64-baseline", "arm64"].includes(profile))
-    throw Error("Usage: mise run channel-install CHANNEL gui|tui arm64|x64|x64-baseline");
+  const [channel, profile] = args;
+  if (args.length !== 2 || !["x64", "x64-baseline", "arm64"].includes(profile))
+    throw Error("Usage: mise run channel-install CHANNEL arm64|x64|x64-baseline");
   const selected = select(api, channel);
-  const key = [selected.sha, selected.artifact?.id ?? selected.release, ui, profile].join("-");
+  const key = [selected.sha, selected.artifact?.id ?? selected.release, profile].join("-");
   const store = join(process.env.LOCALAPPDATA ?? join(homedir(), ".local", "share"), "chkdsk", "packages");
   const target = join(store, key);
   const temp = mkdtempSync(join(tmpdir(), "chkdsk-download-"));
   try {
     download(selected, temp);
-    const name = selected.names.find(n => n.endsWith("-" + ui + "-windows-" + profile + ".exe"))!;
+    const name = selected.names.find(n => n.endsWith("-windows-" + profile + ".exe"))!;
     const source = join(temp, name);
-    const binName = "chkdsk-" + ui + ".exe";
+    const binName = "chkdsk-dashboard.exe";
     mkdirSync(store, { recursive: true });
     const staging = mkdtempSync(join(store, ".install-"));
     try {

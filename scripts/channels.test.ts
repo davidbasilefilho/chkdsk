@@ -47,12 +47,12 @@ function fixture() {
   return {api,runs,jobs,pulls,state,release};
 }
 
-test("dev accepts only its verified push HEAD and latest only the approved six-file release", () => {
+test("dev accepts only its verified push HEAD and latest only the approved three-executable release", () => {
   const f = fixture();
   expect(select(f.api,"dev").sha).toBe(sha);
   expect(select(f.api,"latest").release).toBe(40);
   f.release.assets.pop();
-  expect(() => select(f.api,"latest")).toThrow("six-executable");
+  expect(() => select(f.api,"latest")).toThrow("three-executable");
   f.state.branch = newer;
   expect(() => select(f.api,"dev")).toThrow("current validation");
 });

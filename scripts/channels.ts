@@ -94,7 +94,7 @@ export function select(api: Api, channel: string): Selection {
     const names = assetPaths("", "chkdsk", tag.slice(1), "stable", sha).map(f => basename(f));
     requireChannel(release.assets.length === names.length && names.every(n =>
       release.assets.filter(a => a.name === n && a.state === "uploaded" && sha256.test(a.digest)).length === 1),
-      "Approved stable release has no verified six-executable distribution");
+      "Approved stable release has no verified three-executable distribution");
     return { channel, sha, names, release: release.id, assets: release.assets.map(({id,name,state,digest}) => ({id,name,state,digest})).sort((a,b) => a.id-b.id) };
   }
   if (channel === "dev") return preview(api, channel, api.get<{commit: {sha: string}}>("branches/dev").commit.sha, "dev");

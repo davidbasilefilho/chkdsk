@@ -44,7 +44,7 @@ description = "Install the repository pre-commit hook"
 run = "hk install --mise"
 
 [tasks.release]
-description = "Build six optimized terminal and GUI executables"
+description = "Build three optimized GUI executables"
 run = [
   { task = "release-x64-baseline" },
   { task = "release-x64" },

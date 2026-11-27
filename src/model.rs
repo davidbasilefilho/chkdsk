@@ -75,7 +75,19 @@ pub struct AtaHealth {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Reliability {
+    pub wear: Option<u8>,
+    pub power_on_hours: Option<u64>,
+    pub temperature: Option<i16>,
+    pub read_errors_uncorrected: Option<u64>,
+    pub write_errors_uncorrected: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Telemetry {
+    #[serde(default)]
+    pub reliability: Option<Reliability>,
     pub nvme: QueryState<NvmeHealth>,
     pub ata: QueryState<AtaHealth>,
     /// Wear consumed, 0..=100. Only populate when the device/model mapping
@@ -88,6 +100,15 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
+    pub fn apply_reliability(&mut self, counters: Reliability) {
+        self.endurance_percent = self
+            .endurance_percent
+            .or(counters.wear.filter(|w| *w <= 100).map(f64::from));
+        self.power_on_hours = self.power_on_hours.or(counters.power_on_hours);
+        self.temperature_c = self.temperature_c.or(counters.temperature);
+        self.reliability = Some(counters);
+    }
+
     /// Populate common fields from a successfully parsed NVMe health log.
     pub fn apply_nvme(&mut self, health: NvmeHealth) {
         self.endurance_percent = health.percentage_used.map(|v| f64::from(v.min(100)));
@@ -98,5 +119,22 @@ impl Telemetry {
         let failed = health.critical_warning & ((1 << 0) | (1 << 2) | (1 << 3)) != 0;
         self.overall_failure = QueryState::Success(failed);
         self.nvme = QueryState::Success(health);
+    }
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+    #[test]
+    fn supported_zero_and_missing_wear_are_distinct() {
+        for (json, expected) in [
+            (r#"{"Wear":0}"#, Some(0.0)),
+            (r#"{"Wear":null}"#, None),
+            ("{}", None),
+        ] {
+            let mut telemetry = Telemetry::default();
+            telemetry.apply_reliability(serde_json::from_str(json).unwrap());
+            assert_eq!(telemetry.endurance_percent, expected);
+        }
     }
 }

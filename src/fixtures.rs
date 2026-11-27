@@ -17,6 +17,7 @@ const DAY: u64 = 86_400;
 // Only the `scenes` feature puts it in the binary; tests build the same fixtures directly.
 #[cfg_attr(not(feature = "scenes"), allow(dead_code))]
 pub const SCENES: &[Scene] = &[
+    ("macrovip", |s| *s = macrovip()),
     ("saudavel", |s| *s = dashboard(0)),
     ("atencao", |s| *s = dashboard(1)),
     ("indisponivel", |s| *s = dashboard(2)),
@@ -183,4 +184,44 @@ pub fn disks() -> Vec<DiskSnapshot> {
             identity: failed,
         },
     ]
+}
+
+pub fn macrovip() -> Dashboard {
+    let identity = identity(
+        "fixture:macrovip",
+        "MACROVIP MV240GB",
+        DiskKind::Ssd,
+        "SATA",
+        240_000_000_000,
+    );
+    let attributes = [
+        (0x09, 0x42B6u64),
+        (0x0C, 0x846),
+        (0xA9, 0x64),
+        (0xC2, 0x1E),
+        (0xF1, 0x93B01),
+        (0xF2, 0xD453D),
+        (0xF9, 0x1A29A8),
+        (0xC4, 0),
+        (0xC5, 0),
+        (0xC6, 0),
+        (0xC7, 0),
+    ]
+    .into_iter()
+    .map(|(id, value)| AtaAttribute {
+        id,
+        current: 100,
+        worst: 100,
+        flags: 0,
+        raw: value.to_le_bytes()[..6].try_into().unwrap(),
+    })
+    .collect();
+    let telemetry = Telemetry {
+        ata: QueryState::Success(AtaHealth { attributes }),
+        ..Default::default()
+    };
+    let reading = ready_reading(&identity, telemetry, &History::default());
+    let mut dashboard = Dashboard::default();
+    dashboard.apply(Update::Disks(vec![DiskSnapshot { identity, reading }]), NOW);
+    dashboard
 }
