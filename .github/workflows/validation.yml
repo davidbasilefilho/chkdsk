@@ -15,18 +15,20 @@ jobs:
       MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: jdx/mise-action@v5
         with:
           install: true
       - run: mise run validation
 
   distribution:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/dev'
     runs-on: windows-2022
     permissions:
       contents: read
     env:
-      SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
       MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
     steps:
@@ -58,7 +60,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: windows-dev-${{ github.event.pull_request.head.sha }}
+          name: windows-dev-${{ github.event.pull_request.head.sha || github.sha }}
       - name: Run the packaged terminal and graphical interfaces
         env:
           PROFILES: ${{ matrix.profiles }}

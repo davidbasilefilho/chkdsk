@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { assetPaths, manifest, packageAssets, tagFor, verifyAssets } from "./assets";
+import { requireStableApproval } from "./stable-approval";
 import { publishRelease } from "./github";
 import { architectures, profiles, type Profile, build, cargo, msvc, root, targets, type Architecture } from "./windows";
 
@@ -34,7 +35,7 @@ function main([command, ...argv]: string[]) {
   if (command === "cargo" && !architectures.includes(arch)) throw new UsageError("--architecture requires x64 or arm64");
   switch (command) {
     case "self-check": {
-      const result = Bun.spawnSync([process.execPath, "test", "./scripts/release.test.ts"], { cwd: root, stdout: "inherit", stderr: "inherit" });
+      const result = Bun.spawnSync([process.execPath, "test", "./scripts/release.test.ts", "./scripts/channels.test.ts"], { cwd: root, stdout: "inherit", stderr: "inherit" });
       if (result.exitCode !== 0) throw Error("release self-check failed");
       console.log("release self-check passed: lookup recovery, draft identity/prerelease repair, asset content, and publication verification");
       return;
@@ -68,6 +69,10 @@ function main([command, ...argv]: string[]) {
   const repo = process.env.GITHUB_REPOSITORY;
   if (!repo) throw Error("GITHUB_REPOSITORY is required to publish");
   const dev = mode === "dev";
+  if (!dev) {
+    if (process.env.STABLE_SHA !== sha || process.env.STABLE_TAG !== tag) throw Error("Stable arguments differ from dispatch approval");
+    requireStableApproval();
+  }
   publishRelease(repo, tag, sha, dev, dev ? `Development build for commit ${sha.slice(0, 7)}.` : `Stable chkdsk release ${version}.`, files);
 }
 
