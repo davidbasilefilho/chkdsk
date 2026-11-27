@@ -1,8 +1,9 @@
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { assetPaths, manifest, packageAssets, tagFor, verifyAssets } from "./assets";
+import { requireStableApproval } from "./stable-approval";
 import { publishRelease } from "./github";
-import { architectures, build, cargo, msvc, root, targets, type Architecture } from "./windows";
+import { architectures, profiles, type Profile, build, cargo, msvc, root, targets, type Architecture } from "./windows";
 
 const commands = ["self-check", "linker-check", "clippy", "tests", "compile", "build", "package", "publish", "cargo"];
 const usage = "usage: bun scripts/release.ts {" + commands.join(",") + "}";
@@ -30,10 +31,11 @@ function main([command, ...argv]: string[]) {
     args = parseArgs({ args: argv, options: Object.fromEntries(options.map(name => [name, { type: "string" }])) }).values;
   } catch (error) { throw new UsageError(String(error)); }
   const arch = args.architecture as Architecture;
-  if (architectureOption && !architectures.includes(arch)) throw new UsageError("--architecture requires x64 or arm64");
+  if (command === "build" && !profiles.includes(args.architecture as Profile)) throw new UsageError("--architecture requires arm64, x64 or x64-baseline");
+  if (command === "cargo" && !architectures.includes(arch)) throw new UsageError("--architecture requires x64 or arm64");
   switch (command) {
     case "self-check": {
-      const result = Bun.spawnSync([process.execPath, "test", "./scripts/release.test.ts"], { cwd: root, stdout: "inherit", stderr: "inherit" });
+      const result = Bun.spawnSync([process.execPath, "test", "./scripts/release.test.ts", "./scripts/channels.test.ts"], { cwd: root, stdout: "inherit", stderr: "inherit" });
       if (result.exitCode !== 0) throw Error("release self-check failed");
       console.log("release self-check passed: lookup recovery, draft identity/prerelease repair, asset content, and publication verification");
       return;
@@ -53,7 +55,7 @@ function main([command, ...argv]: string[]) {
     case "cargo":
       if (!rest.length) throw Error("cargo command is required after --");
       return cargo(arch, rest);
-    case "build": return console.log("built " + build(arch, manifest().name));
+    case "build": return console.log("built", build(args.architecture as Profile, manifest().name));
   }
   const { mode, sha } = args;
   if (mode !== "stable" && mode !== "dev") throw new UsageError("--mode requires dev or stable");
@@ -67,7 +69,11 @@ function main([command, ...argv]: string[]) {
   const repo = process.env.GITHUB_REPOSITORY;
   if (!repo) throw Error("GITHUB_REPOSITORY is required to publish");
   const dev = mode === "dev";
-  publishRelease(repo, tag, sha, dev, dev ? `Development build for commit ${sha.slice(0, 7)}.` : `Stable chkdsk release ${version}.`, files);
+  if (!dev) {
+    if (process.env.STABLE_SHA !== sha || process.env.STABLE_TAG !== tag) throw Error("Stable arguments differ from dispatch approval");
+    requireStableApproval();
+  }
+  publishRelease(repo, tag, sha, dev, dev ? `Development build for commit ${sha.slice(0, 7)}.` : `Stable disksonar release ${version}.`, files);
 }
 
 try { main(process.argv.slice(2)); }

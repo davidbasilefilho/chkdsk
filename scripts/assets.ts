@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { architectures, build, root } from "./windows";
+import { profiles, build, root } from "./windows";
 
 export type Mode = "dev" | "stable";
 export function manifest() {
@@ -25,8 +25,8 @@ export function tagFor(mode: Mode, version: string, sha: string, supplied?: stri
 }
 
 export function assetPaths(dir: string, name: string, version: string, mode: Mode, sha: string) {
-  const prefix = name + "-" + version + (mode === "dev" ? "-dev-" + sha.slice(0, 7).toLowerCase() : "") + "-windows-";
-  return [prefix + "x64-baseline.exe", prefix + "arm64.exe", "SHA256SUMS.txt"].map(file => join(dir, file));
+  const prefix = name + "-" + version + (mode === "dev" ? "-dev-" + sha.slice(0, 7).toLowerCase() : "") + "-";
+  return [...profiles.map(profile => prefix + "windows-" + profile + ".exe"), "SHA256SUMS.txt"].map(file => join(dir, file));
 }
 
 export function digest(file: string) {
@@ -34,27 +34,36 @@ export function digest(file: string) {
 }
 
 export function checksums(files: string[]) {
-  return files.slice(0, 2).map(file => digest(file) + "  " + basename(file)).join("\n") + "\n";
+  return files.slice(0, -1).map(file => digest(file) + "  " + basename(file)).join("\n") + "\n";
 }
 
 export function verifyAssets(dir: string, files: string[]) {
   const actual = readdirSync(dir, { withFileTypes: true }).filter(entry => entry.isFile() || entry.isSymbolicLink()).map(entry => entry.name);
   if (actual.length !== files.length || files.some(file => !actual.includes(basename(file)))) throw Error("release asset set mismatch");
-  for (const [index, machine] of [0x8664, 0xaa64].entries()) {
+  const seen = new Set<string>();
+  for (const [index, profile] of profiles.entries()) {
+    const machine = profile === "arm64" ? 0xaa64 : 0x8664;
     const data = readFileSync(files[index]);
     if (data.length < 64 || data.toString("ascii", 0, 2) !== "MZ") throw Error("missing DOS header: " + basename(files[index]));
     const offset = data.readUInt32LE(60);
-    if (offset < 64 || offset + 6 > data.length || data.readUInt32LE(offset) !== 0x4550 || data.readUInt16LE(offset + 4) !== machine)
-      throw Error("expected " + architectures[index] + " PE header: " + basename(files[index]));
+    if (offset < 64 || offset + 94 > data.length || data.readUInt32LE(offset) !== 0x4550 || data.readUInt16LE(offset + 4) !== machine)
+      throw Error("expected " + profile + " PE header: " + basename(files[index]));
+    if (data.readUInt16LE(offset + 24) !== 0x20b || data.readUInt16LE(offset + 92) !== 2)
+      throw Error("unexpected PE subsystem for " + basename(files[index]));
+    const stamps = profiles.filter(p => data.includes(Buffer.from("disksonar-cpu:" + p + ";")));
+    if (stamps.length !== 1 || stamps[0] !== profile) throw Error("incorrect compiled CPU profile: " + basename(files[index]));
+    const hash = digest(files[index]);
+    if (seen.has(hash)) throw Error("duplicate executable: " + basename(files[index]));
+    seen.add(hash);
   }
-  const found = readFileSync(files[2], "utf8").replaceAll("\r\n", "\n").replace(/\n$/, "");
-  if (checksums(files).trimEnd() !== found) throw Error("release checksum manifest does not match the two executable assets");
+  const found = readFileSync(files[profiles.length], "utf8").replaceAll("\r\n", "\n").replace(/\n$/, "");
+  if (checksums(files).trimEnd() !== found) throw Error("release checksum manifest does not match the three executable assets");
 }
 
 export function packageAssets(dir: string, files: string[], name: string, tag: string) {
   mkdirSync(dir, { recursive: true });
-  for (const [index, arch] of architectures.entries()) copyFileSync(build(arch, name), files[index]);
-  writeFileSync(files[2], checksums(files));
+  for (const [index, profile] of profiles.entries()) copyFileSync(build(profile, name), files[index]);
+  writeFileSync(files[profiles.length], checksums(files));
   verifyAssets(dir, files);
   console.log(`verified release assets for ${tag}: ${files.map(file => basename(file)).join(", ")}`);
 }

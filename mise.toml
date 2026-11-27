@@ -44,14 +44,19 @@ description = "Install the repository pre-commit hook"
 run = "hk install --mise"
 
 [tasks.release]
-description = "Build optimized x64-baseline and ARM64 executables"
+description = "Build three optimized GUI executables"
 run = [
   { task = "release-x64-baseline" },
+  { task = "release-x64" },
   { task = "release-arm64" },
 ]
 
 [tasks.release-x64-baseline]
-description = "Build the optimized x64-baseline executable"
+description = "Build the baseline x64 executables"
+run = "bun scripts/release.ts build --architecture x64-baseline"
+
+[tasks.release-x64]
+description = "Build the modern x64 executables"
 run = "bun scripts/release.ts build --architecture x64"
 
 [tasks.release-arm64]
@@ -73,3 +78,7 @@ run = 'bun scripts/release.ts package --mode stable --tag "{{ env.GITHUB_REF_NAM
 [tasks.publish-stable]
 description = "Verify and publish the stable release for the current tag and commit"
 run = 'bun scripts/release.ts publish --mode stable --tag "{{ env.GITHUB_REF_NAME }}" --sha "{{ env.GITHUB_SHA }}" --assets-dir dist/release'
+
+[tasks.channel-install]
+description = "Install a verified Windows channel and variant as an immutable mise version"
+run = "bun scripts/channel-install.ts"

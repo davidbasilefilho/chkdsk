@@ -1,51 +1,77 @@
 name: stable release
 
 on:
-  push:
-    tags:
-      - "v*"
-      - "!*-dev-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Approved stable tag in channels/latest.json
+        required: true
+        type: string
+      sha:
+        description: Full target commit of the approved tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+concurrency:
+  group: stable-promotion
+  cancel-in-progress: false
+env:
+  STABLE_TAG: ${{ inputs.tag }}
+  STABLE_SHA: ${{ inputs.sha }}
 
 jobs:
   build:
+    if: github.ref == 'refs/heads/main'
     runs-on: windows-2022
-    permissions:
-      contents: read
     env:
       MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
       MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          install: true
-      - name: Validate tag and build all stable executables
-        run: mise run package-stable
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.5
+      - name: Check reviewed pointer, tag, ancestry and dispatch ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/stable-approval.ts
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: jdx/mise-action@v5
+      - run: mise exec -- bun scripts/release.ts package --mode stable --tag $env:STABLE_TAG --sha $env:STABLE_SHA --output dist/release
       - uses: actions/upload-artifact@v4
         with:
-          name: release-assets
+          name: stable-${{ inputs.sha }}
           path: dist/release/*
           if-no-files-found: error
 
   publish:
     needs: build
-    runs-on: windows-2022
+    runs-on: ubuntu-latest
+    environment: stable
     permissions:
       contents: write
-    env:
-      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
-      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          install: true
-      - uses: actions/download-artifact@v4
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          name: release-assets
+          bun-version: 1.4.5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: stable-${{ inputs.sha }}
           path: dist/release
-      - name: Verify assets and publish the completed draft
+      - name: Recheck promotion and verify all bytes before publishing
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: mise run publish-stable
+        run: |
+          bun scripts/stable-approval.ts
+          bun scripts/release.ts publish --mode stable --tag "$STABLE_TAG" --sha "$STABLE_SHA" --assets-dir dist/release

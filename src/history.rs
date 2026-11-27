@@ -290,7 +290,7 @@ impl History {
                 samples_used: points.len(),
             });
         }
-        if elapsed == 0 {
+        if elapsed < 86_400 {
             return None;
         }
         // Repeated or non-increasing readings do not establish a trend. A
@@ -299,6 +299,9 @@ impl History {
             return None;
         }
         let rate_per_second = increase / elapsed as f64;
+        if rate_per_second * 86_400.0 > 10.0 {
+            return None;
+        }
         let remaining = ((100.0 - current).max(0.0) / rate_per_second).ceil();
         if !remaining.is_finite() {
             return None;
@@ -457,9 +460,10 @@ mod tests {
                 point.disk_id != "ssd-a" || point.endurance_percent.unwrap() < 80.0
             })
         );
-        let estimate = restored.estimate_endurance("ssd-a").unwrap();
-        assert_eq!(estimate.samples_used, 2);
-        assert_eq!(estimate.wear_percent_per_day, 86_400.0 / 3_680.0);
+        assert!(
+            restored.estimate_endurance("ssd-a").is_none(),
+            "sub-day jumps do not establish a calendar trend"
+        );
     }
 
     #[test]

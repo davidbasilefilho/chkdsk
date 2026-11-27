@@ -4,21 +4,23 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { assetPaths, checksums, digest, tagFor, verifyAssets } from "./assets";
 import { publishRelease, type Release } from "./github";
-import { CommandError, linkerFor, nativeTools, targets } from "./windows";
+import { CommandError, linkerFor, nativeTools, profiles, targets } from "./windows";
 
 const sha = "abcdef0123456789";
 const tag = "v1.2.3-dev-abcdef0";
 let dir: string, files: string[];
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "chkdsk-test-"));
-  files = assetPaths(dir, "chkdsk", "1.2.3", "dev", sha);
-  for (const [index, machine] of [0x8664, 0xaa64].entries()) {
-    const pe = Buffer.alloc(70);
-    pe.write("MZ"); pe.writeUInt32LE(64, 60); pe.write("PE", 64); pe.writeUInt16LE(machine, 68);
+  dir = mkdtempSync(join(tmpdir(), "disksonar-test-"));
+  files = assetPaths(dir, "disksonar", "1.2.3", "dev", sha);
+  for (const [index, profile] of profiles.entries()) {
+    const pe = Buffer.alloc(256);
+    pe.write("MZ"); pe.writeUInt32LE(64, 60); pe.write("PE", 64); pe.writeUInt16LE(profile === "arm64" ? 0xaa64 : 0x8664, 68);
+    pe.writeUInt16LE(0x20b, 88); pe.writeUInt16LE(2, 156);
+    pe.write("disksonar-cpu:" + profile + ";", 180);
     writeFileSync(files[index], pe);
   }
-  writeFileSync(files[2], checksums(files));
+  writeFileSync(files[profiles.length], checksums(files));
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -48,20 +50,21 @@ test("tags, filenames, SHA and SemVer", () => {
   expect(() => tagFor("dev", "1.2.3+meta", sha)).toThrow();
   expect(() => tagFor("dev", "1.2.3", "no-sha")).toThrow();
   for (const mode of ["dev", "stable"] as const) {
-    const prefix = mode === "dev" ? "chkdsk-1.2.3-dev-abcdef0" : "chkdsk-1.2.3";
-    expect(assetPaths(dir, "chkdsk", "1.2.3", mode, sha).map(file => basename(file))).toEqual([
-      prefix + "-windows-x64-baseline.exe", prefix + "-windows-arm64.exe", "SHA256SUMS.txt",
+    const prefix = mode === "dev" ? "disksonar-1.2.3-dev-abcdef0" : "disksonar-1.2.3";
+    expect(assetPaths(dir, "disksonar", "1.2.3", mode, sha).map(file => basename(file))).toEqual([
+      ...["windows-arm64", "windows-x64", "windows-x64-baseline"].map(suffix => prefix + "-" + suffix + ".exe"),
+      "SHA256SUMS.txt",
     ]);
   }
 });
 
 test("local release set, hashes, PE architecture and bounds", () => {
   verifyAssets(dir, files);
-  writeFileSync(files[2], "bad");
+  writeFileSync(files[profiles.length], "bad");
   expect(() => verifyAssets(dir, files)).toThrow("checksum");
-  copyFileSync(files[0], files[1]);
-  writeFileSync(files[2], checksums(files));
-  expect(() => verifyAssets(dir, files)).toThrow("arm64");
+  copyFileSync(files[2], files[1]);
+  writeFileSync(files[profiles.length], checksums(files));
+  expect(() => verifyAssets(dir, files)).toThrow("compiled CPU profile");
   const binary = readFileSync(files[0]);
   binary.writeUInt32LE(0xffffffff, 60);
   writeFileSync(files[0], binary);
@@ -157,7 +160,7 @@ test("repair draft mode, delete obsolete and replace only missing or invalid ass
   expect(f.commands.filter(args => args.includes("PATCH"))).toHaveLength(2);
   expect(f.commands.find(args => args.includes("PATCH"))).toContain("draft=true");
   expect(f.commands.find(args => args.includes("delete-asset"))).toContain("obsolete");
-  expect(f.commands.find(args => args.includes("upload"))!.slice(4, 6)).toEqual(files.slice(1));
+  expect(f.commands.find(args => args.includes("upload"))!.slice(4, 6)).toEqual([files[1], files[profiles.length]]);
 });
 
 test("same-size corruption and absent digest require content verification", () => {

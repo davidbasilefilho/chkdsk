@@ -40,24 +40,40 @@ pub enum Notice {
 impl Notice {
     fn title(self) -> &'static str {
         match self {
-            Notice::Searching => "Procurando discos…",
-            Notice::NoDisks => "Nenhum disco encontrado",
-            Notice::DiscoveryFailed => "Não foi possível localizar os discos",
+            Notice::Searching => crate::locale::tr("Procurando discos…", "Searching for drives…"),
+            Notice::NoDisks => crate::locale::tr("Nenhum disco encontrado", "No drives found"),
+            Notice::DiscoveryFailed => crate::locale::tr(
+                "Não foi possível localizar os discos",
+                "Could not discover drives",
+            ),
         }
     }
 
     fn hint(self) -> Option<&'static str> {
         match self {
             Notice::Searching => None,
-            Notice::NoDisks => Some("Conecte um disco; a lista é atualizada a cada 15 segundos."),
-            Notice::DiscoveryFailed => Some("Uma nova tentativa acontece em até 15 segundos."),
+            Notice::NoDisks => Some(crate::locale::tr(
+                "Conecte um disco; a lista é atualizada a cada 15 segundos.",
+                "Connect a drive. This list refreshes every 15 seconds.",
+            )),
+            Notice::DiscoveryFailed => Some(crate::locale::tr(
+                "Uma nova tentativa acontece em até 15 segundos.",
+                "Discovery will retry within 15 seconds.",
+            )),
         }
     }
 }
 
 pub struct Dashboard {
+    pub preferences: crate::settings::Settings,
+    pub system_motion_off: Option<bool>,
+    pub preferences_path: Option<std::path::PathBuf>,
+    settings_open: bool,
+    save_failed: bool,
     pub cards: Vec<Card>,
     pub selected: usize,
+    advanced: bool,
+    menu_open: bool,
     pub notice: Notice,
     /// Where the detail panel is scrolled, as the viewport reports it.
     scroll: Live<f32>,
@@ -66,8 +82,15 @@ pub struct Dashboard {
 impl Default for Dashboard {
     fn default() -> Self {
         Self {
+            preferences: Default::default(),
+            system_motion_off: None,
+            preferences_path: None,
+            settings_open: false,
+            save_failed: false,
             cards: Vec::new(),
             selected: 0,
+            advanced: false,
+            menu_open: false,
             notice: Notice::Searching,
             scroll: Live::new(0.0),
         }
@@ -75,6 +98,10 @@ impl Default for Dashboard {
 }
 
 impl Dashboard {
+    pub fn show_settings(&mut self) {
+        self.settings_open = true;
+        self.menu_open = false;
+    }
     /// Take what the collector found. The selected disk stays selected while it
     /// is still there. True when something visible changed.
     pub fn apply(&mut self, update: Update, now: u64) -> bool {
@@ -135,12 +162,18 @@ impl Dashboard {
     }
 
     pub fn select(&mut self, index: usize, tx: &mut Tx) {
+        self.settings_open = false;
         if self.cards.is_empty() {
             return;
+        }
+        if self.menu_open {
+            self.menu_open = false;
+            tx.focus("disk-menu", true);
         }
         let index = index.min(self.cards.len() - 1);
         if index != self.selected {
             self.selected = index;
+            self.advanced = false;
             tx.scroll_to_instant(DETAIL_KEY, 0.0, 0.0);
         }
         tx.scroll_into_view(row_key(&self.cards[index].id));
@@ -167,13 +200,17 @@ pub fn on_key(state: &mut Dashboard, event: &KeyEvent, tx: &mut Tx) -> bool {
     let mods = event.mods;
     let plain = !(mods.cmd || mods.ctrl || mods.alt || mods.logo);
     match &event.key {
+        Key::Escape if state.menu_open => {
+            state.menu_open = false;
+            tx.focus("disk-menu", true);
+        }
         Key::Escape => tx.quit(),
         Key::Text(text) if plain && text == "q" => tx.quit(),
-        Key::Left if plain => state.step(false, tx),
-        Key::Right if plain => state.step(true, tx),
-        Key::Tab if plain => state.step(!mods.shift, tx),
-        Key::Up => state.scroll_by(-SCROLL_STEP, tx),
-        Key::Down => state.scroll_by(SCROLL_STEP, tx),
+        Key::Left if plain && !state.settings_open => state.step(false, tx),
+        Key::Right if plain && !state.settings_open => state.step(true, tx),
+
+        Key::Up if !state.settings_open => state.scroll_by(-SCROLL_STEP, tx),
+        Key::Down if !state.settings_open => state.scroll_by(SCROLL_STEP, tx),
         Key::Text(text) if plain && text == "k" => state.scroll_by(-SCROLL_STEP, tx),
         Key::Text(text) if plain && text == "j" => state.scroll_by(SCROLL_STEP, tx),
         _ => return false,
@@ -190,6 +227,7 @@ pub fn now_unix() -> u64 {
 struct Palette {
     theme: tok::Theme,
     accent: Color,
+    pending: Color,
     healthy: Color,
     attention: Color,
     unknown: Color,
@@ -214,6 +252,7 @@ impl Palette {
         Self {
             theme: tok::theme(dark),
             accent,
+            pending: brand_ink(dark),
             healthy,
             attention,
             unknown,
@@ -223,44 +262,111 @@ impl Palette {
     fn tone(&self, tone: Tone) -> Color {
         match tone {
             Tone::Healthy => self.healthy,
-            Tone::Attention => self.attention,
-            Tone::Unknown => self.unknown,
+            Tone::Critical => self.attention,
+            Tone::Attention => self.unknown,
+            Tone::Unknown => self.theme.text_secondary,
         }
     }
 }
 
+// The title uses a fixed blue independent of disk status and OS accent.
+fn brand_ink(dark: bool) -> Color {
+    if dark {
+        oklch(0.82, 0.10, 245.0)
+    } else {
+        oklch(0.40, 0.12, 245.0)
+    }
+}
 pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
-    let palette = Palette::new(cx.system_dark(), cx.accent());
-    let content = match state.cards.get(state.selected) {
-        Some(card) => row()
+    let dark = state.preferences.dark(cx.system_dark());
+    let reduced = state.preferences.reduced(
+        state
+            .system_motion_off
+            .unwrap_or_else(|| cx.system_reduced_motion()),
+    );
+    let palette = Palette::new(dark, cx.accent());
+    cx.caption_color(palette.theme.text);
+    cx.reduced_motion(reduced);
+    let compact = cx.layout_size("janela").is_some_and(|size| size[0] < 680.0);
+    let menu = row()
+        .key("disk-menu")
+        .role("button")
+        .focusable(true)
+        .expanded(state.menu_open)
+        .label(crate::locale::tr("Menu de discos", "Drive menu"))
+        .padding(8.0)
+        .cursor(Cursor::Pointer)
+        .on_press_tx(|s: &mut Dashboard, tx: &mut Tx| {
+            s.menu_open = !s.menu_open;
+            if s.menu_open
+                && let Some(id) = s.selected_id()
+            {
+                tx.focus(row_key(id), true);
+            }
+        })
+        .child(text(crate::locale::tr("☰  Discos", "☰  Drives")).color(palette.theme.text));
+    let main = if state.settings_open {
+        settings_page(state, &palette)
+    } else if let Some(card) = state.cards.get(state.selected) {
+        detail(card, &palette, &state.scroll, state.advanced)
+    } else {
+        empty(state.notice, &palette)
+    };
+    let content = if compact {
+        let panel = if state.menu_open {
+            sidebar(state, &palette)
+        } else {
+            main
+        };
+        col().grow(1.0).min_h(0.0).child(menu).child(panel)
+    } else {
+        row()
             .grow(1.0)
             .min_h(0.0)
             .child(sidebar(state, &palette))
-            .child(detail(card, &palette, &state.scroll)),
-        None => empty(state.notice, &palette),
+            .child(main)
     };
-    col()
+    let frame = if reduced {
+        col().instant_changes()
+    } else {
+        col()
+    };
+    frame
         .key("janela")
         .w_full()
         .h_full()
-        .fill(palette.theme.bg)
+        .fill(palette.theme.card)
+        .child(
+            row()
+                .h(40.0)
+                .window_drag()
+                .center_y()
+                .pl(cx.chrome_insets().leading + 16.0)
+                .pr(cx.chrome_insets().trailing)
+                .child(text("disksonar").font(BODY_STRONG).color(brand_ink(dark))),
+        )
         .child(content)
 }
 
+pub fn disk_key(id: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hash = DefaultHasher::new();
+    id.hash(&mut hash);
+    hash.finish()
+}
 fn row_key(id: &str) -> String {
-    format!("disco-{id}")
+    format!("disco-{:016x}", disk_key(id))
 }
 
 fn sidebar(state: &Dashboard, palette: &Palette) -> El {
     let t = palette.theme;
     let mut list = col().gap(4.0).padding(8.0);
     for (index, card) in state.cards.iter().enumerate() {
-        let selected = index == state.selected;
-        let dot = rune::el()
-            .w(8.0)
-            .h(8.0)
-            .radius(4.0)
-            .fill(card.tone().map_or(t.control_off, |tone| palette.tone(tone)));
+        let selected = !state.settings_open && index == state.selected;
+        let dot = rune::el().w(8.0).h(8.0).radius(4.0).fill(
+            card.tone()
+                .map_or(palette.pending, |tone| palette.tone(tone)),
+        );
         let marker = rune::el()
             .w(3.0)
             .h(16.0)
@@ -298,6 +404,7 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
         list = list.child(
             row()
                 .key(row_key(&card.id))
+                .focusable(true)
                 .role("tab")
                 .label(format!("{}, {}, {status}", card.list_name, card.subtitle))
                 .checked(selected)
@@ -315,8 +422,28 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
                 .cursor(Cursor::Pointer)
                 .on_press_tx(move |s: &mut Dashboard, tx: &mut Tx| s.select(index, tx))
                 .child(marker)
-                .child(dot)
-                .child(names),
+                .child(names)
+                .child(dot.self_start().mt(10.0)),
+        );
+    }
+    if state.cards.is_empty() && state.settings_open {
+        list = list.child(
+            row()
+                .key("dashboard-nav")
+                .role("button")
+                .focusable(true)
+                .label(crate::locale::tr("Discos", "Drives"))
+                .padding(12.0)
+                .on_press_tx(|s: &mut Dashboard, tx: &mut Tx| {
+                    s.settings_open = false;
+                    s.menu_open = false;
+                    tx.focus("settings-nav", true);
+                })
+                .child(
+                    text(crate::locale::tr("Discos", "Drives"))
+                        .font(BODY)
+                        .color(t.text),
+                ),
         );
     }
     let panel = col()
@@ -330,11 +457,155 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
             })
             .grow(1.0)
             .min_h(0.0),
+        )
+        .child(
+            row()
+                .key("settings-nav")
+                .role("button")
+                .focusable(true)
+                .cursor(Cursor::Pointer)
+                .padding(12.0)
+                .label(crate::locale::tr("Configurações", "Settings"))
+                .on_press_tx(|s: &mut Dashboard, tx: &mut Tx| {
+                    s.show_settings();
+                    tx.focus("theme-system", true);
+                })
+                .child(
+                    text(crate::locale::tr("Configurações", "Settings"))
+                        .font(BODY_STRONG)
+                        .color(t.text),
+                ),
         );
     row()
         .h_full()
         .child(panel)
         .child(rune::el().w(1.0).h_full().fill(t.separator))
+}
+
+#[derive(Clone, Copy)]
+enum Choice {
+    Theme(crate::settings::Theme),
+    Motion(crate::settings::Motion),
+}
+fn settings_page(state: &Dashboard, palette: &Palette) -> El {
+    use crate::{
+        locale::tr,
+        settings::{Motion, Theme},
+    };
+    let t = palette.theme;
+    let option = |key: &'static str, label: &'static str, choice: Choice| {
+        let checked = match choice {
+            Choice::Theme(v) => state.preferences.theme == v,
+            Choice::Motion(v) => state.preferences.motion == v,
+        };
+        row()
+            .key(key)
+            .role("radio")
+            .checked(checked)
+            .label(label)
+            .focusable(true)
+            .cursor(Cursor::Pointer)
+            .px(12.0)
+            .py(8.0)
+            .radius(6.0)
+            .fill(if checked {
+                t.control_track
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(t.hover)
+            .on_press_tx(move |s: &mut Dashboard, tx: &mut Tx| {
+                match choice {
+                    Choice::Theme(v) => s.preferences.theme = v,
+                    Choice::Motion(v) => {
+                        s.preferences.motion = v;
+                        tx.settle();
+                    }
+                }
+                s.save_failed = s
+                    .preferences_path
+                    .as_deref()
+                    .is_some_and(|p| s.preferences.save(p).is_err());
+            })
+            .child(
+                text(label)
+                    .font(if checked { BODY_STRONG } else { BODY })
+                    .color(t.text),
+            )
+    };
+    let group = |label: &'static str| {
+        col()
+            .role("radiogroup")
+            .label(label)
+            .mt(16.0)
+            .gap(3.0)
+            .child(text(label).font(BODY_STRONG).color(t.text))
+    };
+    let mut page = col()
+        .key("settings-page")
+        .min_w(0.0)
+        .min_h(0.0)
+        .grow(1.0)
+        .radius(12.0)
+        .mr(8.0)
+        .mb(8.0)
+        .padding(18.0)
+        .fill(t.bg)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(
+            text(tr("Configurações", "Settings"))
+                .font(SUBTITLE)
+                .color(t.text),
+        )
+        .child(
+            group(tr("Tema", "Theme"))
+                .child(option(
+                    "theme-system",
+                    tr("Sistema", "System"),
+                    Choice::Theme(Theme::System),
+                ))
+                .child(option(
+                    "theme-light",
+                    tr("Claro", "Light"),
+                    Choice::Theme(Theme::Light),
+                ))
+                .child(option(
+                    "theme-dark",
+                    tr("Escuro", "Dark"),
+                    Choice::Theme(Theme::Dark),
+                )),
+        )
+        .child(
+            group(tr("Animações", "Animations"))
+                .child(option(
+                    "motion-system",
+                    tr("Sistema", "System"),
+                    Choice::Motion(Motion::System),
+                ))
+                .child(option(
+                    "motion-on",
+                    tr("Ativadas", "On"),
+                    Choice::Motion(Motion::On),
+                ))
+                .child(option(
+                    "motion-off",
+                    tr("Desativadas", "Off"),
+                    Choice::Motion(Motion::Off),
+                )),
+        );
+    if state.save_failed {
+        page = page.child(
+            text(tr(
+                "Não foi possível salvar as preferências.",
+                "Could not save preferences.",
+            ))
+            .font(BODY)
+            .color(t.text),
+        );
+    }
+    page
 }
 
 fn empty(notice: Notice, palette: &Palette) -> El {
@@ -351,11 +622,10 @@ fn empty(notice: Notice, palette: &Palette) -> El {
     col().grow(1.0).min_h(0.0).center().child(message)
 }
 
-fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
+fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>, advanced: bool) -> El {
     let t = palette.theme;
     let mut page = col()
         .w_full()
-        .max_w(720.0)
         .padding(32.0)
         .child(
             text(card.title.clone())
@@ -372,7 +642,7 @@ fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
         );
     page = match &card.body {
         Body::Loading => page.child(
-            text("Consultando o disco…")
+            text(crate::locale::tr("Consultando o disco…", "Reading drive…"))
                 .key("estado")
                 .font(BODY)
                 .color(t.text_secondary)
@@ -386,11 +656,16 @@ fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
                 .wrap()
                 .mt(32.0),
         ),
-        Body::Health(health) => health_body(page, health, palette),
+        Body::Health(health) => health_body(page, health, palette, advanced),
     };
     let scroll = scroll.clone();
     col()
+        .radius(12.0)
+        .mr(8.0)
+        .mb(8.0)
+        .fill(t.bg)
         .key(DETAIL_KEY)
+        .ml(8.0)
         .grow(1.0)
         .min_w(0.0)
         .min_h(0.0)
@@ -403,7 +678,7 @@ fn detail(card: &Card, palette: &Palette, scroll: &Live<f32>) -> El {
         .child(page)
 }
 
-fn health_body(page: El, health: &Health, palette: &Palette) -> El {
+fn health_body(page: El, health: &Health, palette: &Palette, advanced: bool) -> El {
     let t = palette.theme;
     let tone = palette.tone(health.tone);
     let pill = row()
@@ -414,33 +689,45 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
         .fill(tone.alpha(PILL_TINT))
         .child(text(health.label).font(CAPTION_STRONG).color(tone));
     // With no usable evidence there is no number to show, only the pill.
-    let hero = row().mt(32.0).center_y().flex_wrap();
+    let hero = col().mt(24.0).child(pill.self_start());
     let hero = match &health.score {
-        Some(score) => hero
-            .child(text(score.clone()).key("nota").font(SCORE).color(tone))
+        Some(value) => hero
+            .child(text(value.clone()).key("nota").font(SCORE).color(tone))
             .child(
-                col()
-                    .gap(8.0)
-                    .ml(20.0)
-                    .child(pill)
-                    .child(text("saúde").font(CAPTION).color(t.text_secondary)),
+                text(crate::locale::tr("de saúde", "health"))
+                    .font(CAPTION)
+                    .color(t.text_secondary),
+            )
+            .child(
+                text(crate::locale::tr(
+                    "Resistência nominal restante do SSD",
+                    "Remaining rated SSD endurance",
+                ))
+                .font(CAPTION)
+                .color(t.text_secondary),
             ),
-        None => hero.child(pill),
+        None => hero,
     };
 
     let fact = |key: &'static str, label: &'static str, value: &str, style: TextStyle| {
-        row()
+        col()
             .key(key)
-            .gap(16.0)
-            .child(text(label).font(BODY).color(t.text_secondary).w(144.0))
+            .w(220.0)
+            .grow(1.0)
+            .padding(12.0)
+            .gap(4.0)
+            .radius(8.0)
+            .fill(t.card)
+            .child(text(label).font(CAPTION).color(t.text_secondary))
             .child(text(value.to_owned()).font(style).color(t.text).wrap())
     };
-    let facts = col()
+    let facts = row()
+        .flex_wrap()
         .mt(32.0)
         .gap(12.0)
         .child(fact(
             "vida",
-            "Vida estimada",
+            crate::locale::tr("Vida estimada", "Estimated endurance"),
             &health.lifetime,
             if health.lifetime_known {
                 BODY_STRONG
@@ -448,17 +735,27 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
                 BODY
             },
         ))
-        .child(fact("desgaste", "Desgaste", &health.wear, BODY))
+        .child(fact(
+            "desgaste",
+            crate::locale::tr("Desgaste", "Wear used"),
+            &health.wear,
+            BODY,
+        ))
         .child(fact(
             "temperatura",
-            "Temperatura",
+            crate::locale::tr("Temperatura", "Temperature"),
             &health.temperature,
             BODY,
         ))
-        .child(fact("ligado", "Tempo ligado", &health.power_on, BODY))
+        .child(fact(
+            "ligado",
+            crate::locale::tr("Tempo ligado", "Power-on time"),
+            &health.power_on,
+            BODY,
+        ))
         .child(fact(
             "leitura",
-            "Última leitura",
+            crate::locale::tr("Última leitura", "Last reading"),
             &health.last_reading,
             BODY,
         ));
@@ -479,8 +776,43 @@ fn health_body(page: El, health: &Health, palette: &Palette) -> El {
                 .mt(8.0),
         );
     }
-    if !health.attributes.is_empty() {
-        page = page.child(attributes(&health.attributes, palette));
+    if !health.attributes.is_empty() || !health.details.is_empty() {
+        page = page.child(
+            row()
+                .key("advanced")
+                .role("button")
+                .focusable(true)
+                .expanded(advanced)
+                .label(crate::locale::tr(
+                    "Informações avançadas",
+                    "Advanced information",
+                ))
+                .cursor(Cursor::Pointer)
+                .padding(12.0)
+                .on_press_tx(|state: &mut Dashboard, _: &mut Tx| state.advanced = !state.advanced)
+                .child(
+                    text(if advanced {
+                        crate::locale::tr("▾  Informações avançadas", "▾  Advanced information")
+                    } else {
+                        crate::locale::tr("▸  Informações avançadas", "▸  Advanced information")
+                    })
+                    .font(BODY_STRONG)
+                    .color(t.text),
+                ),
+        );
+        if advanced {
+            for (name, value) in &health.details {
+                page = page.child(
+                    text(format!("{name} · {value}"))
+                        .font(BODY)
+                        .color(t.text)
+                        .wrap(),
+                );
+            }
+            if !health.attributes.is_empty() {
+                page = page.child(attributes(&health.attributes, palette));
+            }
+        }
     }
     page
 }
@@ -506,14 +838,33 @@ fn attributes(rows: &[AttributeRow], palette: &Palette) -> El {
         .key("atributos")
         .mt(40.0)
         .gap(8.0)
-        .child(text("Atributos ATA").font(BODY_STRONG).color(t.text))
         .child(
-            text("Valores brutos definidos pelo fabricante, sem unidade atribuída.")
-                .font(CAPTION)
-                .color(t.text_secondary)
-                .wrap(),
+            text(crate::locale::tr("Atributos ATA", "ATA attributes"))
+                .font(BODY_STRONG)
+                .color(t.text),
         )
-        .child(line(["ID", "Atual", "Pior", "Bruto"], CAPTION, t.text_secondary).mt(8.0));
+        .child(
+            text(crate::locale::tr(
+                "Valores brutos definidos pelo fabricante, sem unidade atribuída.",
+                "Vendor-defined raw values. Units are unknown.",
+            ))
+            .font(CAPTION)
+            .color(t.text_secondary)
+            .wrap(),
+        )
+        .child(
+            line(
+                [
+                    "ID",
+                    crate::locale::tr("Atual", "Current"),
+                    crate::locale::tr("Pior", "Worst"),
+                    crate::locale::tr("Bruto", "Raw"),
+                ],
+                CAPTION,
+                t.text_secondary,
+            )
+            .mt(8.0),
+        );
     for attribute in rows {
         table = table.child(line(
             [

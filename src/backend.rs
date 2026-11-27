@@ -784,7 +784,112 @@ mod windows {
         Ok(get_u32(&buffer, 0).ok_or(13u32)? != 0)
     }
 
+    fn reliability(identity: &DiskIdentity) -> Option<crate::model::Reliability> {
+        use std::{
+            collections::HashMap,
+            sync::{Mutex, OnceLock},
+            time::{Duration, Instant},
+        };
+        type Entries = HashMap<String, (Instant, Option<crate::model::Reliability>)>;
+        static CACHE: OnceLock<Mutex<Entries>> = OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+        let retention = Duration::from_secs(120);
+        if let Ok(mut entries) = cache.lock() {
+            entries.retain(|_, (time, _)| time.elapsed() < retention);
+            if let Some((_, value)) = entries.get(&identity.id) {
+                return value.clone();
+            }
+        }
+        let value = read_reliability(identity);
+        if let Ok(mut entries) = cache.lock() {
+            entries.insert(identity.id.clone(), (Instant::now(), value.clone()));
+        }
+        value
+    }
+
+    fn read_reliability(identity: &DiskIdentity) -> Option<crate::model::Reliability> {
+        use std::os::windows::ffi::OsStringExt;
+        use std::{
+            os::windows::process::CommandExt,
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let mut buf = [0u16; 512];
+        // SAFETY: writable buffer with the supplied capacity in UTF-16 units.
+        let len = unsafe {
+            windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
+        } as usize;
+        if len == 0 || len >= buf.len() {
+            return None;
+        }
+        let system = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]));
+        let ps = system.join(r"WindowsPowerShell\v1.0");
+        let mut child = Command::new(ps.join("powershell.exe"))
+            .current_dir(&system)
+            .env_clear()
+            .env("SystemRoot", system.parent()?)
+            .env("WINDIR", system.parent()?)
+            .env("PATH", &system)
+            .env("PSModulePath", ps.join("Modules"))
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                include_str!("reliability.ps1"),
+            ])
+            .env("DISKSONAR_DISK_INTERFACE", interface_path(identity)?)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .creation_flags(0x08000000)
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(75))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        let counters: crate::model::Reliability =
+            serde_json::from_slice(&child.wait_with_output().ok()?.stdout).ok()?;
+        (counters != Default::default()).then_some(counters)
+    }
+
     pub fn query(identity: &DiskIdentity) -> Result<Telemetry, QueryError> {
+        let raw = query_raw(identity);
+        if raw.as_ref().is_ok_and(|t| {
+            t.endurance_percent.is_some() && t.temperature_c.is_some() && t.power_on_hours.is_some()
+        }) {
+            return raw;
+        }
+        if let Some(counters) = reliability(identity) {
+            let mut telemetry = raw.unwrap_or_else(|error| {
+                let mut t = Telemetry::default();
+                if error.state == QueryErrorState::Permission {
+                    t.overall_failure = QueryState::Failed {
+                        message: "5".into(),
+                    };
+                }
+                t
+            });
+            telemetry.apply_reliability(counters);
+            return Ok(telemetry);
+        }
+        raw
+    }
+    fn query_raw(identity: &DiskIdentity) -> Result<Telemetry, QueryError> {
         let name = interface_path(identity).ok_or_else(|| QueryError {
             state: QueryErrorState::Partial,
             message: "disk identity does not contain an interface path".to_owned(),

@@ -78,9 +78,25 @@ export function cargo(arch: Architecture, args: string[]) {
   run(["cargo", ...args], false, env);
 }
 
-export function build(arch: Architecture, name: string) {
-  cargo(arch, ["build", "--release", "--target", targets[arch], "--bin", name]);
-  const exe = join(root, "target", targets[arch], "release", name + ".exe");
-  if (!existsSync(exe)) throw Error("expected release executable was not produced: " + exe);
-  return exe;
+export const profiles = ["arm64", "x64", "x64-baseline"] as const;
+export type Profile = typeof profiles[number];
+
+export function build(profile: Profile, name: string) {
+  const arch = profile === "arm64" ? "arm64" : "x64";
+  const target = targets[arch];
+  const { env } = msvc(arch);
+  const cpu = { arm64: "generic", x64: "x86-64-v3", "x64-baseline": "x86-64" }[profile];
+  const directory = join(root, "target", "distribution", profile);
+  env.CARGO_ENCODED_RUSTFLAGS = "-Ctarget-cpu=" + cpu;
+  if (arch === "x64") {
+    const flag = profile === "x64" ? "/arch:AVX2" : "/arch:SSE2";
+    const suffix = target.replaceAll("-", "_");
+    env["CFLAGS_" + suffix] = flag;
+    env["CXXFLAGS_" + suffix] = flag;
+  }
+  console.log("Building", profile, "with Rust CPU", cpu, "and MSVC", env["CFLAGS_" + target.replaceAll("-", "_")] ?? "ARM64 default");
+  run(["cargo", "build", "--locked", "--release", "--features", "scenes", "--target", target,
+    "--target-dir", directory, "--bin", name], false, env);
+  const output = join(directory, target, "release");
+  return join(output, name + ".exe");
 }

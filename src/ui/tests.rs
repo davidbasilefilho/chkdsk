@@ -81,18 +81,12 @@ fn arrows_and_tab_switch_disks_and_stop_at_the_ends() {
     plain(&mut rt, Key::Left);
     assert_eq!(rt.state.selected, 0, "no wrap before the first disk");
     plain(&mut rt, Key::Tab);
-    assert_eq!(rt.state.selected, 1);
-    plain(&mut rt, Key::Right);
-    assert_eq!(rt.state.selected, 2);
-    press(
-        &mut rt,
-        Key::Tab,
-        Mods {
-            shift: true,
-            ..Mods::default()
-        },
+    assert_eq!(
+        rt.state.selected, 0,
+        "keyboard focus does not change selection"
     );
-    assert_eq!(rt.state.selected, 1, "Shift+Tab goes back");
+    plain(&mut rt, Key::Right);
+    assert_eq!(rt.state.selected, 1);
     plain(&mut rt, Key::Left);
     assert_eq!(rt.state.selected, 0);
     for _ in 0..6 {
@@ -104,10 +98,10 @@ fn arrows_and_tab_switch_disks_and_stop_at_the_ends() {
 #[test]
 fn clicking_a_disk_selects_it() {
     let mut rt = runtime(fixtures::dashboard(0), (1100.0, 720.0));
-    click(&mut rt, "disco-interface:usb-2");
+    click(&mut rt, &row_key("interface:usb-2"));
     assert_eq!(rt.state.selected, 2);
     assert!(screen(&rt).contains("Crucial MX500 500GB"));
-    click(&mut rt, "disco-interface:sata-1");
+    click(&mut rt, &row_key("interface:sata-1"));
     assert_eq!(rt.state.selected, 1);
     assert!(screen(&rt).contains("WDC WD10EZEX-08WN4A0"));
 }
@@ -141,7 +135,9 @@ fn quit_keys_ask_the_window_to_quit() {
 #[test]
 fn up_down_and_the_wheel_scroll_the_panel_and_a_new_disk_starts_at_the_top() {
     // The failing disk has the long ATA table, so its panel overflows a small window.
-    let mut rt = runtime(fixtures::dashboard(1), (760.0, 560.0));
+    let mut state = fixtures::dashboard(1);
+    state.advanced = true;
+    let mut rt = runtime(state, (760.0, 560.0));
     assert_eq!(rt.state.scroll.get(), 0.0);
     plain(&mut rt, Key::Down);
     let after_down = rt.state.scroll.get();
@@ -168,7 +164,7 @@ fn up_down_and_the_wheel_scroll_the_panel_and_a_new_disk_starts_at_the_top() {
 fn status_mapping_reaches_the_screen_with_its_color_tone() {
     let cases = [
         (0, "Saudável", Some(Tone::Healthy)),
-        (1, "Atenção", Some(Tone::Attention)),
+        (1, "Crítico", Some(Tone::Critical)),
         (2, "Indisponível", Some(Tone::Unknown)),
     ];
     for (index, label, tone) in cases {
@@ -207,7 +203,7 @@ fn healthy_disk_shows_score_estimate_and_readings() {
     for text in [
         "Samsung SSD 990 PRO 1TB",
         "NVMe  ·  931,5 GiB",
-        "96",
+        "93%",
         "saúde",
         "Vida estimada",
         "1488 dias",
@@ -294,7 +290,7 @@ fn fixtures_cover_the_four_states() {
         cards.iter().map(|card| card.tone()).collect::<Vec<_>>(),
         [
             Some(Tone::Healthy),
-            Some(Tone::Attention),
+            Some(Tone::Critical),
             Some(Tone::Unknown),
             None,
             Some(Tone::Unknown)
@@ -311,6 +307,7 @@ fn scrolled_on_a_long_panel() -> (Runtime<Dashboard>, Vec<DiskSnapshot>) {
     let mut dashboard = Dashboard::default();
     dashboard.apply(Update::Disks(disks.clone()), NOW);
     dashboard.selected = 1;
+    dashboard.advanced = true;
     let mut rt = runtime(dashboard, (760.0, 560.0));
     plain(&mut rt, Key::Down);
     plain(&mut rt, Key::Down);
@@ -343,7 +340,7 @@ fn a_selection_moved_by_an_update_opens_its_panel_at_the_top() {
 fn an_update_that_moves_the_selection_keeps_its_row_in_the_list() {
     let window_height = 560.0;
     let mut rt = runtime(pending_disks(12), (760.0, window_height));
-    let (_, y) = rt.find("disco-11").expect("the last row is laid out");
+    let (_, y) = rt.find(&row_key("11")).expect("the last row is laid out");
     assert!(
         y > window_height,
         "the last row starts below the window: {y}"
@@ -362,7 +359,9 @@ fn an_update_that_moves_the_selection_keeps_its_row_in_the_list() {
     });
     settle(&mut rt);
     assert_eq!(rt.state.selected, 11);
-    let (_, y) = rt.find("disco-0").expect("the selected row is laid out");
+    let (_, y) = rt
+        .find(&row_key("0"))
+        .expect("the selected row is laid out");
     assert!(y < window_height, "the selected row is on screen: {y}");
 }
 
@@ -419,7 +418,10 @@ fn disk_switching_ignores_ctrl_alt_and_super() {
             ..Mods::default()
         },
     );
-    assert_eq!(rt.state.selected, 0, "Shift+Tab still goes back");
+    assert_eq!(
+        rt.state.selected, 1,
+        "Shift+Tab moves focus without changing selection"
+    );
 }
 
 #[test]
@@ -432,7 +434,7 @@ fn list_rows_follow_the_disk_not_its_position() {
     });
     settle(&mut rt);
     assert_eq!(rt.state.selected, 4, "the selection follows its disk");
-    click(&mut rt, "disco-interface:usb-2");
+    click(&mut rt, &row_key("interface:usb-2"));
     assert_eq!(rt.state.cards[rt.state.selected].id, "interface:usb-2");
 }
 
@@ -442,7 +444,7 @@ fn the_list_says_each_status_in_words_and_has_no_shortcut_footer() {
     let shown = screen(&rt);
     for label in [
         "Saudável",
-        "Atenção",
+        "Crítico",
         "Indisponível",
         "Lendo…",
         "Samsung SSD 990 PRO 1TB, NVMe  ·  931,5 GiB, Saudável",
@@ -462,7 +464,7 @@ fn a_device_failure_verdict_is_shown_with_the_attention_color() {
     let Body::Health(health) = &rt.state.cards[1].body else {
         panic!("the failing disk has a reading");
     };
-    assert_eq!(health.status_tone, Some(Tone::Attention));
+    assert_eq!(health.status_tone, Some(Tone::Critical));
 }
 
 fn srgb_encode(linear: f32) -> f32 {
@@ -511,7 +513,9 @@ fn over_color(top: Color, bottom: Color, encoded: bool) -> Color {
 fn status_text_keeps_four_and_a_half_to_one_in_both_themes() {
     for (dark, name) in [(false, "claro"), (true, "escuro")] {
         let palette = Palette::new(dark, Color::WHITE);
+        assert!(contrast(brand_ink(dark), palette.theme.card) >= 4.5);
         for (tone, tone_name) in [
+            (Tone::Critical, "crítico"),
             (Tone::Healthy, "saudável"),
             (Tone::Attention, "atenção"),
             (Tone::Unknown, "indisponível"),
@@ -551,5 +555,73 @@ fn status_text_keeps_four_and_a_half_to_one_in_both_themes() {
             eprintln!("secondary {name} on {surface}: {ratio:.2}:1");
             assert!(ratio >= 4.5, "secondary {name} on {surface}: {ratio:.2}");
         }
+    }
+}
+
+#[test]
+fn macrovip_first_read_keeps_vendor_values_raw() {
+    let mut rt = runtime(fixtures::macrovip(), (1100.0, 720.0));
+    assert!(rt.find("nota").is_none());
+    assert!(!screen(&rt).contains("0000000042B6"));
+    click(&mut rt, "advanced");
+    assert!(screen(&rt).contains("0000000042B6"));
+}
+
+#[test]
+fn english_view_formats_units_and_accessible_text() {
+    crate::locale::TEST_ENGLISH.set(true);
+    let rt = runtime(fixtures::dashboard(0), (1100.0, 720.0));
+    let text = screen(&rt);
+    for expected in [
+        "Healthy",
+        "931.5 GiB",
+        "Last reading",
+        "1 day ago",
+        "Wear used",
+        "Advanced information",
+    ] {
+        assert!(text.contains(expected), "{expected}: {text}");
+    }
+    crate::locale::TEST_ENGLISH.set(false);
+}
+
+#[test]
+fn compact_menu_closes_on_escape_and_preserves_selection_across_motion_change() {
+    let mut rt = runtime(fixtures::dashboard(0), (440.0, 640.0));
+    settle(&mut rt);
+    let (x, y) = rt.find("disk-menu").expect("compact menu");
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+    rt.frame(FRAME);
+    rt.set_system_reduced_motion(true);
+    rt.frame(FRAME);
+    assert!(rt.state.menu_open);
+    plain(&mut rt, Key::Escape);
+    assert!(!rt.state.menu_open);
+    assert_eq!(rt.state.selected, 0);
+    assert!(rt.find("titulo").is_some());
+}
+
+#[test]
+fn settings_navigation_works_at_both_widths_without_writing_user_files() {
+    for width in [440.0, 1100.0] {
+        let mut rt = runtime(fixtures::dashboard(0), (width, 720.0));
+        settle(&mut rt);
+        if width < 680.0 {
+            click(&mut rt, "disk-menu");
+        }
+        click(&mut rt, "settings-nav");
+        assert!(rt.state.settings_open);
+        click(&mut rt, "theme-light");
+        assert!(!rt.state.preferences.dark(true));
+        click(&mut rt, "motion-off");
+        assert!(rt.state.preferences.reduced(false));
+        click(&mut rt, "motion-on");
+        assert!(!rt.state.preferences.reduced(true));
+        if width < 680.0 {
+            click(&mut rt, "disk-menu");
+        }
+        click(&mut rt, &row_key("interface:nvme-0"));
+        assert!(!rt.state.settings_open);
     }
 }
