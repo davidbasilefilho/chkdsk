@@ -6,7 +6,7 @@ Painel de saúde de discos para Windows, escrito em Rust, com uma janela nativa 
 
 ## Executar
 
-Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a nota em destaque, vida estimada, desgaste, temperatura, tempo ligado, última leitura e, em discos ATA, os atributos SMART brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. Releases incluem executáveis para Windows x64-baseline e ARM64. O runtime não requer Rust, mise ou acesso à rede.
+A GUI requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a nota em destaque, vida estimada, desgaste, temperatura, tempo ligado, última leitura e, em discos ATA, os atributos SMART brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. A TUI abre no terminal e usa o mesmo coletor e cálculo de saúde. Use ←/→ para escolher um disco, ↑/↓ para rolar e q ou Esc para sair. A opção `--fixture` imprime uma leitura de exemplo e encerra antes de iniciar a coleta. O runtime não requer Rust, mise ou acesso à rede.
 
 ## Pontuação e limites
 
@@ -54,15 +54,18 @@ mise run setup-hook
 mise run release
 ```
 
-`validation` confere formatação, regras de release, linkers MSVC, Clippy, testes x64 e compilação nas duas arquiteturas. Se você já instalou o hook antigo, execute `prek uninstall` antes de migrar. `setup-hook` instala o pre-commit local do hk. A cada commit, ele executa `mise run fmt` e `mise run clippy` no projeto inteiro, inclusive quando apenas a documentação muda. `release` gera builds otimizados; também existem `release-x64-baseline` e `release-arm64`.
+`validation` confere formatação, regras de release, linkers MSVC, Clippy, testes x64 e compilação nas duas arquiteturas. Se você já instalou o hook antigo, execute `prek uninstall` antes de migrar. `setup-hook` instala o pre-commit local do hk. A cada commit, ele executa `mise run fmt` e `mise run clippy` no projeto inteiro, inclusive quando apenas a documentação muda. `release` gera builds otimizados; as tarefas `release-arm64`, `release-x64` e `release-x64-baseline` compilam as duas interfaces de cada perfil.
 
 ## Releases
 
-Tags estáveis seguem exatamente `v{versão}` e não aceitam versão SemVer pré-lançamento. Builds de desenvolvimento usam `v{versão}-dev-{sha7}`. Os executáveis têm estes nomes (o sufixo `-dev-{sha7}` aparece somente em builds de desenvolvimento):
+Tags estáveis seguem exatamente `v{versão}` e não aceitam versão SemVer pré-lançamento. Builds de desenvolvimento usam `v{versão}-dev-{sha7}`. Cada pacote contém seis executáveis independentes com o prefixo `chkdsk-{versão}[-dev-{sha7}]-` e um arquivo `SHA256SUMS.txt`.
 
-```text
-chkdsk-{versão}[-dev-{sha7}]-windows-x64-baseline.exe
-chkdsk-{versão}[-dev-{sha7}]-windows-arm64.exe
-```
+| Perfil | Terminal | Janela gráfica | Requisito de CPU |
+| --- | --- | --- | --- |
+| ARM64 | `tui-windows-arm64.exe` | `gui-windows-arm64.exe` | Windows ARM64, AArch64 com NEON; Rust usa o alvo MSVC ARM64 genérico. |
+| x64 | `tui-windows-x64.exe` | `gui-windows-x64.exe` | x86-64-v3 com AVX/AVX2 e suporte do sistema ao estado AVX. Inclui SSE3, SSSE3, SSE4.1/4.2, POPCNT, CMPXCHG16B, F16C, FMA, BMI1/2, LZCNT e MOVBE. |
+| x64-baseline | `tui-windows-x64-baseline.exe` | `gui-windows-x64-baseline.exe` | Alvo genérico x86-64 com SSE2; dispensa AVX. Aplicam-se também os requisitos mínimos do Windows instalado. |
 
-`mise run release-check` valida localmente regras SemVer, nomes dos artefatos e mapeamentos de arquitetura sem publicar.
+Na dúvida sobre a CPU x64, escolha o baseline. Rust usa `-Ctarget-cpu=x86-64-v3` ou `-Ctarget-cpu=x86-64` em compilações separadas. O código C/C++ compilado com MSVC recebe `/arch:AVX2` ou `/arch:SSE2` para o mesmo alvo. Rotinas especializadas de dependências podem selecionar instruções adicionais em tempo de execução pela CPU. Bun executa as tarefas de desenvolvimento; os binários distribuídos são nativos Rust. [Perfis de geração de código do Rust](https://doc.rust-lang.org/rustc/codegen-options/index.html#target-cpu) · [Seleção de ISA no MSVC](https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64)
+
+Para ensaiar o pacote sem publicar, execute `mise exec -- bun scripts/release.ts package --mode dev --sha (git rev-parse HEAD) --output dist/release` no PowerShell. Use um diretório de saída vazio. O empacotamento e a publicação conferem os seis nomes, seus hashes, os cabeçalhos PE, os subsistemas gráfico/console e o perfil de CPU compilado. A CI do PR executa os arquivos empacotados com fixtures em runners Windows x64 e ARM64. Os fluxos dev e estável reutilizam essas verificações antes de publicar.

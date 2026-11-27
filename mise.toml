@@ -44,14 +44,19 @@ description = "Install the repository pre-commit hook"
 run = "hk install --mise"
 
 [tasks.release]
-description = "Build optimized x64-baseline and ARM64 executables"
+description = "Build six optimized terminal and GUI executables"
 run = [
   { task = "release-x64-baseline" },
+  { task = "release-x64" },
   { task = "release-arm64" },
 ]
 
 [tasks.release-x64-baseline]
-description = "Build the optimized x64-baseline executable"
+description = "Build the baseline x64 executables"
+run = "bun scripts/release.ts build --architecture x64-baseline"
+
+[tasks.release-x64]
+description = "Build the modern x64 executables"
 run = "bun scripts/release.ts build --architecture x64"
 
 [tasks.release-arm64]

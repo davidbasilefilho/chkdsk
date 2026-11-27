@@ -19,3 +19,69 @@ jobs:
         with:
           install: true
       - run: mise run validation
+
+  distribution:
+    if: github.event_name == 'pull_request'
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
+      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: jdx/mise-action@v5
+      - name: Build and verify the development distribution
+        run: mise exec -- bun scripts/release.ts package --mode dev --sha $env:SOURCE_SHA --output dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-dev-${{ env.SOURCE_SHA }}
+          path: dist/release/
+          if-no-files-found: error
+
+  smoke:
+    needs: distribution
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            profiles: x64,x64-baseline
+          - runner: windows-11-arm
+            profiles: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-dev-${{ github.event.pull_request.head.sha }}
+      - name: Run the packaged terminal and graphical interfaces
+        env:
+          PROFILES: ${{ matrix.profiles }}
+        run: |
+          foreach ($line in Get-Content SHA256SUMS.txt) {
+            $hash, $name = $line -split '  ', 2
+            if ((Get-FileHash -Algorithm SHA256 $name).Hash -ne $hash) { throw "Checksum mismatch for $name" }
+          }
+          foreach ($profile in $env:PROFILES.Split(',')) {
+            $gui = (Get-Item "*-gui-windows-$profile.exe").FullName
+            $tui = (Get-Item "*-tui-windows-$profile.exe").FullName
+            foreach ($exe in @($gui, $tui)) {
+              $stamp = & $exe --build-profile | Out-String
+              if ($LASTEXITCODE -or $stamp.Trim() -ne "chkdsk-cpu:$profile;") { throw "Profile mismatch: $exe" }
+            }
+            $text = & $tui --fixture | Out-String
+            if ($LASTEXITCODE -or $text -notmatch 'Temperatura' -or $text -notmatch 'NVMe') { throw "Terminal fixture failed" }
+            $image = "fixture-$profile.png"
+            & $gui --scene saudavel --snap $image --size 1100x720 --scale 1 --theme dark | Out-Host
+            if ($LASTEXITCODE -or !(Test-Path $image)) { throw "Graphical fixture failed" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixture-${{ matrix.runner }}
+          path: fixture-*.png
+          if-no-files-found: error

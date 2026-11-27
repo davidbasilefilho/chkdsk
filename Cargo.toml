@@ -2,9 +2,11 @@
 name = "chkdsk"
 version = "0.1.0"
 edition = "2024"
+default-run = "chkdsk"
 publish = false
 
 [dependencies]
+crossterm = "0.29"
 # Rune has no crates.io release; pin the exact `dev` commit.
 rune = { git = "https://github.com/anomalyco/rune", rev = "757bcb1d1da1b3f80484f36ef610b83ddbcc6003", default-features = false, features = ["accessibility"] }
 serde = { version = "1", features = ["derive"] }

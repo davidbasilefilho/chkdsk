@@ -1,17 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
-#![cfg_attr(not(windows), allow(dead_code))]
-
-mod backend;
-mod collector;
-#[cfg(any(test, feature = "scenes"))]
-mod fixtures;
-mod health;
-mod history;
-mod model;
-mod parse;
-mod present;
-mod ui;
-
+#[cfg(feature = "scenes")]
+use chkdsk::fixtures;
+use chkdsk::{collector, ui};
 use rune::{App, AppSpec};
 
 const TITLE: &str = concat!("chkdsk v", env!("CARGO_PKG_VERSION"));
@@ -29,6 +19,10 @@ const SCENES: &[ui::Scene] = fixtures::SCENES;
 const SCENES: &[ui::Scene] = &[];
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--build-profile") {
+        println!("{}", chkdsk::CPU_PROFILE);
+        return;
+    }
     if std::env::args().any(|arg| arg == "--version") {
         println!("chkdsk {}", env!("CARGO_PKG_VERSION"));
         return;
