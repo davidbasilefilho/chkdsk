@@ -4,16 +4,28 @@ on:
   workflow_run:
     workflows: [validation]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      validation_run:
+        description: Exact completed validation run to recover without rebuilding
+        required: true
+        type: string
+      validation_attempt:
+        description: Exact attempt number of the completed run
+        required: true
+        type: string
 
 permissions: {}
 
 jobs:
   publish:
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       (github.event.workflow_run.event == 'pull_request' ||
-       (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'dev'))
+       (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'dev'))))
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -30,6 +42,6 @@ jobs:
       - name: Publish the verified preview
         env:
           GH_TOKEN: ${{ github.token }}
-          VALIDATION_RUN: ${{ github.event.workflow_run.id }}
-          VALIDATION_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          VALIDATION_RUN: ${{ github.event.workflow_run.id || inputs.validation_run }}
+          VALIDATION_ATTEMPT: ${{ github.event.workflow_run.run_attempt || inputs.validation_attempt }}
         run: bun scripts/preview-release.ts
