@@ -110,7 +110,13 @@ mod windows {
     };
     use windows_sys::Win32::{
         Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
-        System::IO::DeviceIoControl,
+        System::{
+            IO::DeviceIoControl,
+            Ioctl::{
+                IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                IOCTL_STORAGE_PREDICT_FAILURE, IOCTL_STORAGE_QUERY_PROPERTY,
+            },
+        },
     };
 
     const DIGCF_PRESENT: u32 = 0x0000_0002;
@@ -122,11 +128,7 @@ mod windows {
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
     const OPEN_EXISTING: u32 = 3;
-    const IOCTL_STORAGE_QUERY_PROPERTY: u32 = ctl_code(0x2d, 0x0500, 0, 0);
-    const IOCTL_DISK_GET_LENGTH_INFO: u32 = ctl_code(0x07, 0x0017, 0, 1);
-    const IOCTL_STORAGE_GET_DEVICE_NUMBER: u32 = ctl_code(0x2d, 0x0420, 0, 0);
     const IOCTL_ATA_PASS_THROUGH: u32 = ctl_code(0x04, 0x040b, 0, 3);
-    const IOCTL_STORAGE_PREDICT_FAILURE: u32 = ctl_code(0x2d, 0x0440, 0, 1);
     const STORAGE_DEVICE_PROPERTY: u32 = 0;
     const STORAGE_DEVICE_SEEK_PENALTY_PROPERTY: u32 = 7;
     const STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY: u32 = 49;
@@ -903,6 +905,11 @@ mod windows {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn storage_failure_prediction_uses_the_sdk_control_code() {
+            assert_eq!(IOCTL_STORAGE_PREDICT_FAILURE, 0x002d_1100);
+        }
 
         #[test]
         fn smart_data_and_return_status_task_file_fixtures_are_distinct() {
