@@ -1,0 +1,48 @@
+name: Verify channel installation on Windows
+on: push
+permissions:
+  contents: read
+  actions: read
+jobs:
+  check:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      SOURCE_SHA: 6c078b4004bfa09eee97d65a3834d75e62da7b16
+      MISE_DISABLE_TOOLS: rust,bun,hk,github:llvm/llvm-project
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: jdx/mise-action@v5
+        with:
+          install: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.5
+      - name: Wait for immutable input
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run watch 46028663768 --exit-status --interval 45
+      - name: Resolve and install two live channels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($variant in @("pr-13,tui,x64-baseline","pr,gui,x64")) {
+            $channel,$ui,$profile = $variant.Split(",")
+            $lines = mise run channel-install $channel $ui $profile
+            $lines | Out-Host
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $spec = ($lines | Select-String -Pattern '^mise x (\S+) -- ').Matches.Groups[1].Value
+            if (!$spec.Contains($env:SOURCE_SHA)) { throw "Unexpected mise pin" }
+            "$ui=$spec" >> $env:GITHUB_ENV
+          }
+      - name: Run installed executable through mise
+        run: |
+          $text = mise x $env:tui -- chkdsk-tui.exe --fixture | Out-String
+          if ($LASTEXITCODE -or $text -notmatch 'Temperatura') { throw "Installed TUI failed" }
+          $version = mise x $env:gui -- chkdsk-gui.exe --version | Out-String
+          if ($LASTEXITCODE -or $version.Trim() -ne 'chkdsk 0.1.0') { throw "Installed GUI failed" }
