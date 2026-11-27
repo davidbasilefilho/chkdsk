@@ -10,14 +10,25 @@ Cada release no formato atual contém três executáveis nativos distintos e `SH
 
 C/C++ usa o MSVC para a arquitetura correspondente. Em x64, a compilação usa `/arch:AVX2` ou `/arch:SSE2`, conforme o perfil. [Geração de código Rust](https://doc.rust-lang.org/rustc/codegen-options/index.html#target-cpu) · [Arquiteturas MSVC](https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64)
 
+## Instalar a estável v0.0.1
+
+A estável aprovada ainda usa o nome `chkdsk` e os executáveis são de console. Baixe o executável correspondente e o manifesto da mesma release.
+
+- [Windows x64 baseline](https://github.com/davidbasilefilho/disksonar/releases/download/v0.0.1/chkdsk-0.0.1-windows-x64-baseline.exe)
+- [Windows ARM64](https://github.com/davidbasilefilho/disksonar/releases/download/v0.0.1/chkdsk-0.0.1-windows-arm64.exe)
+- [Manifesto SHA256SUMS.txt](https://github.com/davidbasilefilho/disksonar/releases/download/v0.0.1/SHA256SUMS.txt)
+
+Na pasta dos downloads, execute `Get-FileHash -Algorithm SHA256 .\chkdsk-0.0.1-windows-x64-baseline.exe` no PowerShell. Para ARM64, use o nome do arquivo ARM64. Compare o hash inteiro com a linha do mesmo arquivo em `SHA256SUMS.txt` antes de executar.
+
+A `v0.0.1` tem também um executável legado x86. Ela nunca teve um executável x64 moderno (x86-64-v3). Em Windows x64, use o baseline. O instalador `latest` do mise exige os três perfis do formato atual, por isso a instalação da `v0.0.1` é feita pelo download direto. [Release v0.0.1](https://github.com/davidbasilefilho/disksonar/releases/tag/v0.0.1)
+
 ## Instalar com mise
 
-Use um checkout confiável de [disksonar em main](https://github.com/davidbasilefilho/disksonar/tree/main), com mise, Bun e GitHub CLI autenticado para ler Actions e Contents. Selecione o canal e o perfil:
+Para instalar uma pré-release de `dev` ou de um PR elegível, use um checkout confiável de [disksonar em main](https://github.com/davidbasilefilho/disksonar/tree/main), com mise, Bun e GitHub CLI autenticado para ler Actions e Contents.
 
 ```powershell
 mise run channel-install dev x64-baseline
 mise run channel-install pr arm64
-mise run channel-install latest x64
 ```
 
 Para um PR específico, troque `pr` por `pr-N`, com o número do PR no lugar de `N`. O instalador verifica os três arquivos e o manifesto, instala o perfil solicitado e imprime um comando `mise x` com o caminho local da versão. Use a linha anterior se precisar voltar a uma versão já instalada. [Versões locais do mise](https://mise.jdx.dev/dev-tools/versions.html)
@@ -27,7 +38,7 @@ Para um PR específico, troque `pr` por `pr-N`, com o número do PR no lugar de 
 | `dev` | Pré-release do HEAD atual da branch `dev`, vinculada à validação desse push |
 | `pr-N` | Pré-release do HEAD atual de um PR aberto e fora de rascunho, no próprio repositório e com base `main` ou `dev` |
 | `pr` | O HEAD publicado elegível com a data de commit mais recente. Em empate, o maior número de PR vence |
-| `latest` | Release estável aprovada no ponteiro `channels/latest.json` de `main` |
+| `latest` | Release do ponteiro `channels/latest.json` de `main`, instalável pelo mise quando a estável aprovada usar o formato atual |
 
 O instalador reconfirma a seleção após o download. A ordem da página de Releases e a hora de conclusão da CI não determinam nenhum canal. Releases históricas anteriores ao formato atual continuam disponíveis na [página de Releases](https://github.com/davidbasilefilho/disksonar/releases).
 
