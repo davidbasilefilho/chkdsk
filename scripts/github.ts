@@ -11,7 +11,7 @@ export interface Release {
 }
 
 export function publishRelease(repo: string, tag: string, sha: string, prerelease: boolean, notes: string,
-  files: string[], command = run, sleep = Bun.sleepSync) {
+  files: string[], command = run, sleep = Bun.sleepSync, checkCurrent = () => {}) {
   const endpoint = "repos/" + repo + "/releases";
   function api<T>(args: string[]): T {
     return JSON.parse(command(["gh", "api", ...args], true));
@@ -27,6 +27,8 @@ export function publishRelease(repo: string, tag: string, sha: string, prereleas
   }
   const identity = { tag_name: tag, name: tag, target_commitish: sha, prerelease };
   const fields = Object.entries(identity).flatMap(([key, value]) => [typeof value === "boolean" ? "-F" : "-f", key + "=" + value]);
+  if (prerelease) fields.push("-f", "make_latest=false");
+  checkCurrent();
   let id = lookup();
   let created: Release | undefined;
   if (id === undefined) {
@@ -97,6 +99,7 @@ export function publishRelease(repo: string, tag: string, sha: string, prereleas
   release = fetchRelease();
   verifyIdentity(release, true);
   verifyRemote(release);
+  checkCurrent();
   api(["--method", "PATCH", url, ...fields, "-F", "draft=false"]);
   verifyIdentity(fetchRelease(), false);
   console.log("published verified release " + tag);
