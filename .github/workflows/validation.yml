@@ -68,6 +68,7 @@ jobs:
           foreach ($line in Get-Content SHA256SUMS.txt) {
             $hash, $name = $line -split '  ', 2
             if ((Get-FileHash -Algorithm SHA256 $name).Hash -ne $hash) { throw "Checksum mismatch for $name" }
+            Write-Output $line
           }
           foreach ($profile in $env:PROFILES.Split(',')) {
             $gui = (Get-Item "*-windows-$profile.exe").FullName
