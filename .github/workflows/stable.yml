@@ -1,100 +1,77 @@
-name: stable
+name: stable release
 
-# Merging the dev -> main pull request (a squash merge) publishes the stable
-# release automatically: v<version> comes from Cargo.toml, which the pull request
-# check forced above the previous stable tag. Release runs are never cancelled.
-# Signing and the unsigned-release decision live in release.yml.
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Approved stable tag in channels/latest.json
+        required: true
+        type: string
+      sha:
+        description: Full target commit of the approved tag
+        required: true
+        type: string
 
-# One group per commit: a shared queue would silently drop all but the newest
-# pending run when merges to main arrive in quick succession.
+permissions:
+  contents: read
 concurrency:
-  group: stable-${{ github.sha }}
+  group: stable-promotion
   cancel-in-progress: false
-
-permissions: {}
+env:
+  STABLE_TAG: ${{ inputs.tag }}
+  STABLE_SHA: ${{ inputs.sha }}
 
 jobs:
-  # Refuses a tag that already exists at another commit or a version that does
-  # not rise above the latest stable tag; skips when this commit is already released.
-  plan:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    outputs:
-      skip: ${{ steps.plan.outputs.skip }}
-      sha: ${{ steps.plan.outputs.sha }}
-      tag: ${{ steps.plan.outputs.tag }}
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    env:
+      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
+      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 0
           persist-credentials: false
-      - id: plan
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.5
+      - name: Check reviewed pointer, tag, ancestry and dispatch ref
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/release.py plan-stable
-
-  validation:
-    needs: plan
-    if: ${{ needs.plan.outputs.skip == 'false' }}
-    uses: ./.github/workflows/validation.yml
-    with:
-      ref: ${{ needs.plan.outputs.sha }}
-    permissions:
-      contents: read
-
-  release:
-    needs: [plan, validation]
-    uses: ./.github/workflows/release.yml
-    with:
-      mode: stable
-      sha: ${{ needs.plan.outputs.sha }}
-      tag: ${{ needs.plan.outputs.tag }}
-    secrets:
-      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
-    permissions:
-      contents: write
-      actions: read
-
-  # dev -> main is squash-merged, so main's release commit is not an ancestor of
-  # dev. Recording it with a no-op merge keeps the next dev -> main diff to new work.
-  backmerge:
-    needs: [plan, release]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.release.result == 'success' || needs.plan.outputs.skip == 'true') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    env:
-      RELEASED_SHA: ${{ needs.plan.outputs.sha }}
-      RELEASED_TAG: ${{ needs.plan.outputs.tag }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        run: bun scripts/stable-approval.ts
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: dev
-          fetch-depth: 0
+          ref: ${{ inputs.sha }}
           persist-credentials: false
-      - name: Merge the release commit into dev without changing dev's content
+      - uses: jdx/mise-action@v5
+      - run: mise exec -- bun scripts/release.ts package --mode stable --tag $env:STABLE_TAG --sha $env:STABLE_SHA --output dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stable-${{ inputs.sha }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: stable
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: stable-${{ inputs.sha }}
+          path: dist/release
+      - name: Recheck promotion and verify all bytes before publishing
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git fetch --no-tags origin "$RELEASED_SHA"
-          if git merge-base --is-ancestor "$RELEASED_SHA" HEAD; then
-            echo "dev already contains $RELEASED_SHA"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git merge -s ours --no-edit -m "chore: merge main into dev after $RELEASED_TAG" "$RELEASED_SHA"
-          # The token travels in the environment (GIT_CONFIG_*), never in argv, where
-          # any process on the runner could read it.
-          header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          echo "::add-mask::$header"
-          if ! GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="$header" git push origin HEAD:dev; then
-            echo "::error::Could not push the back-merge to dev. Allow github-actions to push to dev (branch protection bypass), or merge main into dev locally with 'git merge -s ours' and a merge commit; a squash-merged pull request cannot record the ancestry."
-            exit 1
-          fi
+          bun scripts/stable-approval.ts
+          bun scripts/release.ts publish --mode stable --tag "$STABLE_TAG" --sha "$STABLE_SHA" --assets-dir dist/release

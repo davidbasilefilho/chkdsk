@@ -1,73 +1,53 @@
-# chkdsk
+# disksonar
 
-Painel de saúde de discos para Windows, escrito em Rust, com uma janela nativa em português brasileiro (pt_BR), desenhada com [rune](https://github.com/anomalyco/rune). Consulta telemetria SMART/Health, apresenta uma nota heurística conservadora e mantém histórico local para tendências de desgaste. O aplicativo não depende de serviços externos durante a execução.
+Painel de saúde de discos para Windows, escrito em Rust, com uma janela nativa em português brasileiro ou inglês, conforme a ordem dos idiomas de exibição do Windows, desenhada com [rune](https://github.com/anomalyco/rune). Consulta telemetria SMART/Health, apresenta o estado informado pelo diagnóstico e mantém histórico local para tendências de desgaste. O aplicativo não depende de serviços externos durante a execução.
 
-> Este projeto não é o `chkdsk` do Windows. Não verifica nem repara sistemas de arquivos, não agenda reparos e não substitui `chkdsk.exe`; também não executa varredura de superfície. Para evitar conflito com a ferramenta do sistema, inicie o executável deste projeto pelo caminho completo.
+> O disksonar consulta a telemetria de saúde dos discos. Para verificar ou reparar sistemas de arquivos, use o utilitário de sistema do Windows.
 
 ## Executar
 
-Requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. A janela desenha a própria barra de título, com o nome **chkdsk** e a ação **Exportar**; o Windows continua cuidando de redimensionar, dos layouts de encaixe, do menu da janela (clique direito na barra ou Alt+Espaço) e do maximizar com duplo clique. À esquerda, sobre o fundo da janela, ficam os discos, com um ponto de cor para o estado de cada um; à direita, num painel elevado e recuado das bordas, o disco selecionado, com a nota em percentual, vida estimada, desgaste, temperatura, tempo ligado, última leitura e os avisos de saúde. A seção **Avançado**, fechada ao abrir, guarda o barramento, o firmware, o número de série, as fontes dos dados, os contadores SMART comuns de discos ATA sem perfil de modelo (ciclos de energia, setores realocados e pendentes, erros de CRC) e, em discos ATA, os atributos SMART com limites e valores brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. Cada release traz três executáveis: `x64` (compilado para `x86-64-v3`, exige CPU com AVX2, a partir de Haswell/Excavator), `x64-baseline` (`x86-64-v2`, para qualquer CPU aceita pelo Windows 11 24H2 e para as que não têm AVX2) e `arm64`. Na dúvida, use `x64-baseline`. Não há build de 32 bits (o rune não compila para i686) nem `arm64-baseline`. O runtime não requer Rust, mise ou acesso à rede.
+A GUI requer Windows 10/11 com GPU compatível com DirectX 12 ou Vulkan. Basta abrir o executável: ele abre uma janela, sem console, que acompanha o tema claro ou escuro do sistema. À esquerda ficam os discos, com um ponto de cor para o estado de cada um; à direita, o painel do disco selecionado, com a resistência nominal restante quando medida, vida estimada, desgaste, temperatura, tempo ligado, última leitura e, em discos ATA, os atributos SMART brutos. Os discos são redescobertos a cada 15 segundos, com no máximo quatro consultas simultâneas em segundo plano. O runtime não requer Rust, mise ou acesso à rede.
+
+O painel mostra a porcentagem de resistência restante quando há desgaste medido. Em SSDs NVMe, a origem é Percentage Used. Quando uma leitura direta está incompleta, o painel também consulta os contadores de confiabilidade do Windows associados ao mesmo caminho de disco. Um desgaste informado de zero é diferente de um campo ausente. A especificação pública do MACROVIP MV240GB não documenta as unidades dos atributos SMART por firmware. O valor bruto de 09 fica em **Informações avançadas**. [Ficha do fabricante](https://macrovip.com/en/produto/ssd-macrovip-premium-240gb-2-5-sata-3-mv240gb/)
+
+Quando uma consulta requer privilégios adicionais, o aplicativo oferece uma tentativa de elevação pelo consentimento normal do Windows. Se o usuário cancelar, a janela continua disponível com os dados obtidos. As cenas de teste e capturas usam somente fixtures.
 
 ## Pontuação e limites
 
-- A nota de 0 a 100 é determinística e heurística: não é probabilidade de falha, certificação, medição de desgaste nem previsão de vida restante. **Saudável** exige evidência utilizável, nota acima de 50 e nenhum aviso; **Atenção** vale para a nota até 50 e para sinais degradados, sem falha declarada, **Limitada** para um SSD sem fonte de desgaste (nenhum perfil de modelo, nenhum contador alterado): a janela mostra um selo neutro e explica que o disco não informa desgaste, sem exibir nota nem chamá-lo de saudável (a exportação JSON guarda a nota com sua confiança; no CSV ela fica vazia); e **Crítico** para falha declarada pelo dispositivo ou por um limiar pré-falha (a cor também muda: âmbar para Atenção, vermelho para Crítico); a janela lista cada motivo; **Indisponível** significa que não há evidência suficiente para calcular uma nota, e nenhuma nota é exibida (o zero interno nunca aparece).
-- Para NVMe, a nota considera o desgaste usado (limita a nota a `100 − desgaste`), a reserva disponível e os avisos críticos do dispositivo; condições críticas aplicam limites máximos. Erros de mídia (`media_errors` acima de zero) limitam a nota a 70 e deduzem até 30 pontos por ordem de grandeza decimal; o bit 5, de região de memória persistente, limita a nota a 70. Esses dois sinais avisam, mas isoladamente não marcam falha. O tipo do disco, quando a descoberta não o identifica, vem de um log NVMe lido com sucesso.
-- Para ATA/SATA, o aplicativo consulta SMART READ DATA e tenta ler SMART READ THRESHOLDS, por pass-through ATA nativo e com o IOCTL SMART legado como alternativa quando a resposta falha ou vem malformada. Os atributos são mostrados com valores normalizados atuais e piores, limite declarado e valor bruto. Um limiar atingido limita a nota a 20; só vira falha quando a flag pré-falha (bit 0) está marcada ou o dispositivo relata falha global. Ficar até 10 pontos normalizados acima do limiar limita a nota a 70 e gera aviso, sem declarar falha. Linhas com ID duplicado são ambíguas e não entram na avaliação. Um status global SMART de “sem falha”, sozinho, não produz nota.
-- Para ATA sem perfil de modelo (HDD ou SSD), vale o layout padrão do smartmontools: há um índice de contadores brutos somente para os IDs ATA comuns 5 (setores realocados), 10 (tentativas de giro, só HDD), 187 (erros incorrigíveis reportados), 197 (setores pendentes) e 198 (setores incorrigíveis offline). Nesses discos, 187 acima de zero é um aviso leve (base 5, coeficiente 3, teto 20, em vez da linha da tabela); 5 a partir de 100, 197 e 198 a partir de 10, ou o valor normalizado de 5, 197 ou 198 no limite declarado, são críticos (nota até 20, atenção). O ID 199 (erros de CRC na interface) só avisa que o cabo ou o adaptador pode ser o problema e não altera a nota; os IDs 1, 9, 12 e 188 nunca entram na nota, e atributos de vida útil de SSD (169, 173, 177, 202, 231, 232, 233, 0xA4-0xA8) só entram com perfil de modelo. O ID 5 só é usado quando a codificação raw16 é inequívoca; se uma codificação necessária for ambígua, a nota do HDD fica indisponível (salvo se outra evidência crítica independente já determinar atenção), mas os avisos interpretáveis continuam. Por contador não zero, a dedução heurística é `base + coeficiente × floor(log10(contagem))`, limitada pelo teto; as deduções se combinam de forma multiplicativa, `nota × (100 − dedução)/100` para cada classe:
+- A nota de 0 a 100 é determinística, mas não representa probabilidade de falha nem certificação do disco. Com evidência utilizável, notas acima de 50 são classificadas como saudáveis e notas até 50 como atenção; sem evidência utilizável, o estado é **Indisponível** e nenhuma nota é exibida.
+- Para NVMe, a heurística considera percentual de desgaste usado, reserva disponível e avisos críticos reportados pelo dispositivo; condições críticas aplicam limites máximos à nota. Não há padrão portátil confiável para interpretar universalmente atributos ATA brutos: eles podem ser exibidos, mas não afetam a nota sem mapeamento específico e verificado por modelo.
+- A ETA é uma extrapolação indicativa até 100% de desgaste usado, baseada no segmento atual de histórico desde a leitura mais antiga após o último reset/regressão do contador até a mais recente. Exige pelo menos 24 horas entre observações e aumento positivo de até dez pontos percentuais por dia; leituras iguais, regressivas ou dados insuficientes não estabelecem tendência. HDDs não recebem previsão. A ETA não prevê falhas nem garante vida útil.
+- O histórico fica em `%APPDATA%\disksonar\historico.json` (ou na pasta temporária do usuário quando `%APPDATA%` não está definido). Na primeira execução sem histórico próprio, lê o histórico anterior de `%APPDATA%\chkdsk\historico.json` e salva as novas amostras em `disksonar`. O arquivo anterior é preservado. Mantém até 35 dias por disco: amostras por hora nos sete dias mais recentes e por dia antes disso. Uma regressão do contador de desgaste descarta o histórico anterior daquele disco para iniciar uma nova linha de base.
+- O aplicativo não altera discos e normalmente não precisa de privilégios elevados. Windows, driver, controlador ou adaptador USB podem bloquear consultas SMART; elevar privilégios não torna disponível uma telemetria que o dispositivo ou controlador não fornece.
 
-  | ID ATA | Sinal | Base | Coeficiente | Teto |
-  | --- | --- | ---: | ---: | ---: |
-  | 5 | Setores realocados | 4 | 3 | 25 |
-  | 10 | Tentativas de giro | 10 | 4 | 35 |
-  | 187 | Erros incorrigíveis reportados | 20 | 8 | 55 |
-  | 197 | Setores pendentes | 25 | 10 | 65 |
-  | 198 | Setores incorrigíveis offline | 30 | 10 | 70 |
+## Configurações
 
-  Os pesos são escolhas heurísticas do projeto, não calibração empírica nem probabilidade; contadores relacionados podem penalizar o mesmo problema duas vezes. Um contador não zero reduz a nota e avisa, mas não prova falha física.
-- Em SSD, o desgaste usado do NVMe e o atributo ATA 202 nos perfis exatos de Crucial MX300, MX500 e BX500 limitam a nota a `100 − desgaste`. O perfil lê o valor bruto de 48 bits como percentual usado e limita valores acima de 100 a 100%; assim, 100% de desgaste dá nota zero e aviso, sem classificar o disco como falho. Não há mapeamento verificado para outros fabricantes (como o atributo 177 da Samsung) nem inferência de vida útil a partir de outros IDs brutos.
-- Temperatura, horas ligadas e ciclos de energia só aparecem quando decodificados por um layout suportado: o log de saúde NVMe, o perfil estreito WD10EZEX e, em ATA sem perfil de modelo, o layout padrão do smartmontools (ID 9: 24 bits baixos do valor bruto; ID 12: 48 bits; ID 194, ou 190 se faltar: byte baixo, entre 1 e 100 °C). Se SMART não trouxer temperatura, a propriedade de temperatura do Windows a completa; zero conta como não informado. IDs duplicados e codificações desconhecidas permanecem indisponíveis.
-- Em discos USB, quando o Windows não repassa o SMART, o aplicativo tenta pass-through SCSI/ATA (SAT, comandos de 16 e de 12 bytes). Se o adaptador não traduz esses comandos, o disco aparece só com identidade, barramento e capacidade, a mensagem “SMART indisponível por este adaptador USB” e nenhuma nota.
-- A ETA de desgaste é uma extrapolação indicativa até 100% de desgaste usado, baseada no segmento atual de histórico desde a leitura mais antiga após o último reset/regressão do contador até a mais recente. Exige aumento positivo observado ao longo do tempo; leituras iguais, regressivas ou dados insuficientes não estabelecem tendência. HDDs não recebem previsão. A ETA não prevê falhas nem garante vida útil.
-- O histórico fica em `%APPDATA%\chkdsk\historico.json` (ou na pasta temporária do usuário quando `%APPDATA%` não está definido). Mantém até 35 dias por disco: amostras por hora nos sete dias mais recentes e por dia antes disso. Uma regressão do contador de desgaste descarta o histórico anterior daquele disco para iniciar uma nova linha de base.
-- O aplicativo não altera discos. Ao abrir normalmente, pede elevação pelo UAC do Windows e se reinicia como administrador, uma única vez, após a confirmação; se a elevação for cancelada, ele avisa e fecha. `chkdsk.exe --version` só imprime a versão, e as capturas sem janela (`--snap`) não pedem elevação. Windows, driver, controlador ou adaptador USB ainda podem bloquear consultas SMART; elevar privilégios não torna disponível uma telemetria que o dispositivo ou controlador não fornece.
+Abra **Configurações** na barra lateral ou no menu da janela compacta. Tema aceita Sistema, Claro e Escuro. Animações aceita Sistema, Ativadas e Desativadas. As duas preferências começam em Sistema e ficam em `%APPDATA%\disksonar\settings.json`. As alterações se aplicam na janela aberta. O idioma acompanha a preferência de exibição do Windows.
 
 ## Controles
 
-- `←` / `→`: alternar entre discos. `Tab` / `Shift+Tab` percorrem os discos e, depois do último, **Avançado** (quando o disco tem a seção) e **Exportar**, voltando ao primeiro disco; o item com foco mostra um anel, e `Espaço` ou `Enter` o aciona.
+- `←` / `→` : alternar entre discos.
 - `↑` / `↓` (ou `k` / `j`): rolar o painel do disco; `Page Up`, `Page Down`, `Home` e `End` também rolam.
-- Clique em um disco da lista para selecioná-lo; a roda do mouse rola o painel sob o ponteiro. A barra de rolagem fina aparece só quando o conteúdo não cabe: arraste a barra, ou clique na trilha para rolar uma página.
-- `A` ou um clique em **Avançado**: abrir e fechar os detalhes técnicos (só nos discos que têm a seção).
-- `Ctrl+E` ou o botão **Exportar**: salvar todos os discos em um arquivo (veja abaixo).
+- Clique em um disco da lista para selecioná-lo; a roda do mouse rola o painel sob o ponteiro.
 - `q` ou `Esc`: sair. Fechar a janela também encerra o aplicativo.
-
-Com a opção do Windows que desliga animações (Configurações › Acessibilidade › Efeitos visuais › Efeitos de animação), os movimentos viram cortes e as transições, um desvanecer curto.
-
-## Exportar
-
-**Exportar** abre a janela Salvar do Windows, que oferece JSON e CSV, e grava todos os discos listados; sem extensão digitada, o filtro escolhido define o formato e a extensão (e, nesse caso, o aplicativo pergunta antes de substituir um arquivo que já existe). O arquivo é gravado por inteiro em um temporário na mesma pasta e movido para o destino, então uma falha nunca deixa um arquivo pela metade. A barra de título mostra o nome do arquivo salvo ou o motivo da falha (não foi possível gravar o arquivo, preparar os dados ou iniciar a exportação, ou a exportação foi interrompida). Cancelar a janela não grava nem avisa nada. Fora do Windows o botão fica desativado.
-
-- **JSON**: um objeto com a versão do aplicativo, a data da exportação e `disks`, com, por disco, identidade (modelo, série, firmware, barramento, tipo, capacidade em bytes), estado, nota, veredito, avisos, valores de telemetria, atributos SMART (`id`, `name`, `flags`, `current`, `worst`, `threshold`, `raw`) e as amostras de histórico guardadas em `%APPDATA%\chkdsk\historico.json`.
-- **CSV**: uma linha por disco, com `model,kind,capacity_bytes,score_percent,status,wear_percent,temperature_c,power_on_hours,last_reading_utc`. UTF-8 com BOM (o Excel abre os acentos corretamente), separador vírgula, campos entre aspas conforme a RFC 4180 e linhas terminadas em CRLF. Textos que o dispositivo informa e que começariam com `=`, `+`, `-` ou `@` recebem um apóstrofo na frente, para que planilhas não os executem como fórmula.
 
 ## Desenvolvimento
 
-O ambiente de desenvolvimento usa [mise](https://mise.jdx.dev/) para provisionar Rust estável, `rustfmt`, Clippy, Python 3.12, `prek` e uma distribuição LLVM portátil fixada no projeto. LLVM não é necessário para executar o aplicativo. A compilação Windows requer os componentes do Visual Studio Build Tools (toolset MSVC e Windows SDK) para x64 e ARM64; mise instala os componentes Rust, mas não substitui o linker/SDK MSVC.
+O ambiente de desenvolvimento usa [mise](https://mise.jdx.dev/) para provisionar Rust estável, `rustfmt`, Clippy, Bun para as tarefas TypeScript de build e release, `hk` e uma distribuição LLVM portátil fixada no projeto. LLVM não é necessário para executar o aplicativo. A compilação Windows requer os componentes do Visual Studio Build Tools (toolset MSVC e Windows SDK) para x64 e ARM64; mise instala os componentes Rust, mas não substitui o linker/SDK MSVC.
 
 Na raiz do repositório, em PowerShell:
 
 ```powershell
 mise install
-mise exec -- cargo run -p chkdsk
+mise exec -- cargo run
 ```
 
-O build usa [rune](https://github.com/anomalyco/rune) fixado em um commit exato (`rev` em `[workspace.dependencies]` do `Cargo.toml` da raiz); atualize-o de propósito, nunca por branch. Fora do Windows o aplicativo compila e os testes rodam, mas a lista de discos fica vazia (a coleta nativa é só para Windows) e a janela Salvar da exportação não existe. No Linux, o rune precisa de `libxkbcommon-dev` e `libwayland-dev`; para renderizar sem GPU, `mesa-vulkan-drivers` com `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+O build usa [rune](https://github.com/anomalyco/rune) fixado em um commit exato (`rev` em `Cargo.toml`); atualize-o de propósito, nunca por branch. Fora do Windows o aplicativo compila e os testes rodam, mas a lista de discos fica vazia (a coleta nativa é só para Windows). No Linux, o rune precisa de `libxkbcommon-dev` e `libwayland-dev`; para renderizar sem GPU, `mesa-vulkan-drivers` com `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
 
-O código é um workspace Cargo em `crates/`: `chkdsk-core` (modelo, leitura dos dados SMART/NVMe, pontuação de saúde e histórico; lógica pura, sem dependências de plataforma), `chkdsk-windows` (acesso nativo aos discos e elevação UAC, com stubs fora do Windows) e `chkdsk` (o executável: coleta, textos, janela, exportação e as cenas de exemplo). Comandos que valem para tudo usam `--workspace`, por exemplo `cargo test --workspace`.
-
-Capturas sem disco real (discos de exemplo em `crates/chkdsk/src/fixtures.rs`; cenas: `saudavel`, `atencao`, `atencao-leve`, `ssd-generico`, `usb-sem-smart`, `indisponivel`, `carregando`, `falha`, `dados-insuficientes`, `avancado-aberto`, `exportado`, `exportar-falhou`, `vazio`, `procurando`, `descoberta`; `--script` reproduz cliques, teclas e `{"focus":false}`; com `CHKDSK_SIM_CAPTION=1` a captura simula os botões de janela do Windows, reservando o espaço deles na barra de título):
+Capturas sem disco real (discos de exemplo em `src/fixtures.rs`; cenas: `saudavel`, `atencao`, `indisponivel`, `carregando`, `falha`, `vazio`, `procurando`, `descoberta`):
 
 ```powershell
-cargo run -p chkdsk --features scenes -- --snap captura.png --scene saudavel --size 1100x720 --scale 2 --theme dark
+cargo run --features scenes -- --snap captura.png --scene saudavel --size 1100x720 --scale 2 --theme dark
 ```
 
 Validação e compilação:
@@ -82,63 +62,54 @@ mise run setup-hook
 mise run release
 ```
 
-`validation` confere formatação, regras de release, linkers MSVC, Clippy, testes x64 e compilação nas duas arquiteturas (no Windows, com o MSVC). `setup-hook` instala o hook local do `prek`, que verifica `rustfmt`. `release` gera os três executáveis otimizados em `dist/release` com os nomes de um build de desenvolvimento; também existem `release-x64`, `release-x64-baseline` e `release-arm64`. Cada variante usa o próprio diretório `target/<variante>`, porque `x64` e `x64-baseline` diferem em `-C target-cpu` e não podem compartilhar artefatos.
-
-No Linux (e no CI), `mise run ci-linux` roda formatação, a autoverificação de `scripts/release.py`, Clippy no host, Clippy para `x86_64` e `aarch64` MSVC com [cargo-xwin](https://github.com/rust-cross/cargo-xwin) (`mise run clippy-xwin`) e `cargo test --workspace` (`mise run tests-host`). Isso exige `clang`, `lld`, `llvm` e as bibliotecas do rune descritas acima; o cargo-xwin baixa o CRT e o SDK do Windows na primeira execução. O perfil `release` usa LTO completo (`fat`), uma unidade de codegen e `strip` (menor executável medido: 19,7 MB contra 21,6 MB do perfil padrão), mantendo `panic = "unwind"` (o coletor depende de `catch_unwind`).
-
-### CI e fluxo de branches
-
-Todo PR vai para `dev`; só `dev` vai para `main`. Os merges são squash, então o workflow de release registra `main` em `dev` com um merge `-s ours` (veja abaixo). Nenhum outro branch dispara workflows, e PRs cujo branch de origem é `holyagent/**` ou de checkpoint (`checkpoint/**`, `*/checkpoint/*`) não executam nada.
-
-| Workflow | Quando | O que faz |
-| --- | --- | --- |
-| `dev` | push em `dev`; PR para `dev` ou `main` | `plan` decide o que rodar; `validation`; `prerelease` (no PR para `main`, só depois do job `version`); `checks` reúne o resultado de todos |
-| `validation` | chamado por `dev` e `stable` | `linux` (fmt, Clippy host e xwin, testes, autoverificação) e `windows` (testes no Windows) |
-| `release` | chamado por `dev` e `stable` | `config` (decide a assinatura), `build` (x64, x64-baseline e arm64, em paralelo), `sign` (quando configurado), `publish` |
-| `stable` | push em `main` | `plan`, `validation`, `release` e `backmerge` |
-
-O job `plan` pula tudo quando o PR só muda documentação (`*.md`, `docs/`, `LICENSE`) em relação à base do PR inteiro (`pull_request.base.sha`, não só o último push), quando um push em `dev` já é coberto por um PR aberto de `dev` e, nos pré-releases, para PRs de forks e commits que já têm release. A verificação é feita dentro dos jobs, e não por `paths-ignore`, para que o check obrigatório continue reportando.
-
-**Check obrigatório.** Configure como obrigatório em `dev` e em `main` somente o check `checks` (job `checks` do workflow `dev`, exibido como `dev / checks (pull_request)`). Ele roda sempre e só fica verde quando `plan` teve sucesso e `version`, `validation` e `prerelease` tiveram sucesso ou foram pulados de propósito (segundo as saídas de `plan`); falha ou cancelamento de qualquer job o deixa vermelho. Não exija `validation / linux`, `validation / windows` nem `version` separadamente: eles não existem quando o job é pulado, e um check obrigatório ausente bloqueia o PR para sempre.
-
-**Concorrência.** Cada push em `dev` e em `main` tem o próprio grupo (por SHA), então nenhuma execução é cancelada nem descartada da fila. Um PR cancela as execuções anteriores do mesmo PR; como a publicação é retomável (rascunho primeiro, assets verificados antes de publicar, rascunho existente reaproveitado), cancelar uma execução durante a publicação deixa no máximo um rascunho não publicado, que a poda nunca apaga.
-
-#### Assinatura com SignPath (opcional)
-
-O job `config` decide a assinatura uma vez, e a publicação exige essa decisão:
-
-- `signed`: push em `dev` ou `main` com a variável `SIGNPATH_ORGANIZATION_ID` e o segredo `SIGNPATH_API_TOKEN` definidos. O job `sign` envia os três `.exe` ao [SignPath](https://signpath.io) antes de gerar os checksums, e se a assinatura falhar ou for pulada nada é publicado.
-- `unconfigured`: nem a variável nem o segredo existem. Os executáveis saem sem assinatura (também em releases estáveis) e as notas do release dizem isso. Definir só um dos dois faz o job `config` falhar.
-- `disabled`: execuções de PR rodam código não revisado; nunca assinam e nunca recebem o segredo (o workflow `dev` o repassa vazio fora de pushes), e as notas do release dizem que o build não é assinado.
-
-Em *Settings > Secrets and variables > Actions*, defina:
-
-- variável `SIGNPATH_ORGANIZATION_ID`: ID da organização;
-- variável `SIGNPATH_PROJECT_SLUG`: slug do projeto;
-- variável `SIGNPATH_SIGNING_POLICY_SLUG`: slug da política de assinatura;
-- variável `SIGNPATH_ARTIFACT_CONFIGURATION_SLUG`: slug da configuração de artefato (um zip com `*.exe` na raiz);
-- segredo `SIGNPATH_API_TOKEN`: token da API.
-
-No SignPath, o projeto precisa confiar neste repositório como *trusted build system* (GitHub.com). PRs, de forks ou não, nunca assinam.
+`validation` confere formatação, regras de release, linkers MSVC, Clippy, testes x64 e compilação nas duas arquiteturas. Se você já instalou o hook antigo, execute `prek uninstall` antes de migrar. `setup-hook` instala o pre-commit local do hk. A cada commit, ele executa `mise run fmt` e `mise run clippy` no projeto inteiro, inclusive quando apenas a documentação muda. `release` gera builds otimizados; as tarefas `release-arm64`, `release-x64` e `release-x64-baseline` compilam as duas interfaces de cada perfil.
 
 ## Releases
 
-O projeto segue [ZeroVer](https://0ver.org/): a versão major é sempre `0` (`0.y.z`, sem sufixos), e `[workspace.package] version` no `Cargo.toml` da raiz é a única fonte da versão.
+Tags estáveis seguem exatamente `v{versão}` e não aceitam versão SemVer pré-lançamento. Builds de desenvolvimento usam `v{versão}-dev-{sha7}`. Cada pacote contém três executáveis independentes com o prefixo `disksonar-{versão}[-dev-{sha7}]-` e um arquivo `SHA256SUMS.txt`.
 
-- **Pré-releases.** Cada commit de um push em `dev` ou da ponta de um PR (para `dev` ou `main`) gera, no máximo uma vez, um pré-release `v{versão}-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}` (por exemplo `v0.1.0-dev.2026-11-10.12-45-02.g50eb54a`). Data e hora são as do commit, em UTC; como os campos têm largura fixa, a ordem alfabética e a ordem de precedência SemVer são cronológicas dentro de uma mesma versão, e todos ficam abaixo da tag estável `v{versão}` dessa versão. Depois de publicar, o workflow apaga os pré-releases de desenvolvimento já publicados (e suas tags) além dos 10 mais recentes; o release que acabou de ser publicado, os rascunhos e os releases estáveis nunca são apagados.
-- **Versão.** Um PR para `main` só pode sair de `dev` e precisa elevar a versão para um valor ZeroVer maior que a última tag estável `v*`; o job `version`, que o check `checks` exige, falha caso contrário.
-- **Release estável.** O merge em `main` cria a tag `v{versão}` (se ainda não existir), compila, verifica, assina (se configurado; sem SignPath configurado, publica sem assinatura e avisa nas notas) e publica automaticamente. Se a tag já existe em outro commit, o release é recusado. Em seguida, o job `backmerge` faz `git merge -s ours` do commit de release em `dev`; se `dev` não aceitar o push de `github-actions`, o job falha com instruções.
+| Perfil | Executável (sufixo) | Requisitos |
+| --- | --- | --- |
+| ARM64 | `windows-arm64.exe` | Windows ARM64, AArch64 com NEON; Rust usa o alvo MSVC ARM64 genérico. |
+| x64 | `windows-x64.exe` | x86-64-v3 com AVX/AVX2 e suporte do sistema ao estado AVX. Inclui SSE3, SSSE3, SSE4.1/4.2, POPCNT, CMPXCHG16B, F16C, FMA, BMI1/2, LZCNT e MOVBE. |
+| x64-baseline | `windows-x64-baseline.exe` | Alvo genérico x86-64 com SSE2; dispensa AVX. Aplicam-se também os requisitos mínimos do Windows instalado. |
 
-Os executáveis têm estes nomes (o sufixo `-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}` aparece somente em builds de desenvolvimento) e vêm com `SHA256SUMS.txt`:
+Na dúvida sobre a CPU x64, escolha o baseline. Rust usa `-Ctarget-cpu=x86-64-v3` ou `-Ctarget-cpu=x86-64` em compilações separadas. O código C/C++ compilado com MSVC recebe `/arch:AVX2` ou `/arch:SSE2` para o mesmo alvo. Rotinas especializadas de dependências podem selecionar instruções adicionais em tempo de execução pela CPU. Bun executa as tarefas de desenvolvimento; os binários distribuídos são nativos Rust. [Perfis de geração de código do Rust](https://doc.rust-lang.org/rustc/codegen-options/index.html#target-cpu) · [Seleção de ISA no MSVC](https://learn.microsoft.com/en-us/cpp/build/reference/arch-x64)
 
-```text
-chkdsk-{versão}[-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}]-windows-x64.exe
-chkdsk-{versão}[-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}]-windows-x64-baseline.exe
-chkdsk-{versão}[-dev.{AAAA-MM-DD}.{HH-MM-SS}.g{sha7}]-windows-arm64.exe
+Para ensaiar o pacote sem publicar, execute `mise exec -- bun scripts/release.ts package --mode dev --sha (git rev-parse HEAD) --output dist/release` no PowerShell. Use um diretório de saída vazio. O empacotamento e a publicação conferem os três nomes, seus hashes, os cabeçalhos PE, o subsistema gráfico e o perfil de CPU compilado. A CI do PR executa os arquivos empacotados com fixtures em runners Windows x64 e ARM64. Os fluxos dev e estável reutilizam essas verificações antes de publicar.
+
+### Instalação por canal com mise
+
+Em um checkout **confiável de `main`**, instale o mise e o GitHub CLI (`gh`). Para artefatos do Actions, autentique o CLI com acesso de leitura a Actions e Contents. No Windows, o instalador usa o `tar.exe` do sistema. Escolha o canal e o perfil de CPU.
+
+```powershell
+mise run channel-install latest x64-baseline
+mise run channel-install dev arm64
+mise run channel-install pr-13 x64
+mise run channel-install pr x64-baseline
 ```
 
-`mise run release-check` valida localmente as regras de tag, ZeroVer, planejamento, o check obrigatório, poda, notas de assinatura, `--locked` e nomes de artefatos, sem publicar.
+Cada comando verifica os três executáveis e o manifesto e instala o perfil escolhido em um diretório identificado pelo SHA, ID do artefato ou release e perfil de CPU. O instalador imprime um comando PowerShell `mise x 'github:davidbasilefilho/disksonar@path:…' -- disksonar.exe` com o caminho completo. O mise usa esse diretório mesmo quando o catálogo de versões ainda está desatualizado. Acrescente `--version` para conferir. Para atualizar, execute o instalador novamente. Para voltar, use a linha de uma instalação anterior. [Versões locais do mise](https://mise.jdx.dev/dev-tools/versions.html) · [API de artefatos do GitHub](https://docs.github.com/en/rest/actions/artifacts).
 
-## Licença
+| Canal | Fonte verificada na instalação |
+| --- | --- |
+| `latest` | Ponteiro aprovado em `channels/latest.json` de `main`, tag estável, commit pertencente a `main` e release publicada com quatro assets (três executáveis e o manifesto). |
+| `dev` | HEAD atual da branch real `dev`, com o build e os dois testes nativos verdes no evento **push** desse SHA. |
+| `pr-N` | HEAD atual do PR aberto N, fora de rascunho, no próprio repositório, para `main` ou `dev`. Requer uma execução **pull_request** associada ao número, base e SHA. |
+| `pr` | Entre os PRs elegíveis e verificados acima, o de maior data de **committer** do HEAD. Em caso de empate, vence o maior número de PR. |
 
-Este projeto é distribuído sob a licença MIT. Veja o arquivo [LICENSE](LICENSE).
+Os canais de teste consultam a API em modo leitura. O identificador do artefato, o SHA completo e o digest SHA-256 do ZIP vinculam a instalação à execução. A resolução se repete após o download. Se outra execução, novo commit ou fechamento do PR mudar a seleção, a instalação para. Uma conclusão atrasada não escreve um alias remoto. Artefatos expirados e mudanças incompatíveis no workflow exigem nova validação ou atualização do checkout confiável. Uma versão instalada é identificada por SHA, ID do artefato/release, interface e perfil. A posição da release na página do GitHub e a data do upload não participam da seleção.
+
+**Ativação de dev.** A branch existente `dev` tem histórico próprio. Depois do merge desta mudança, reconcilie o novo `main` com `dev` em um PR separado, preservando os commits exclusivos e substituindo os workflows antigos de publicação de `dev`. O primeiro push validado desse resultado ativa o canal. Para rollback de `dev`, reverta em Git e valide o novo HEAD. A mesma regra vale para atualizar ou reverter o código de um PR.
+
+**Promoção estável.** Configure o environment `stable` com aprovação obrigatória e restrição à branch `main`, proteja `main` e as tags estáveis contra reescrita. Depois de aprovação explícita, use uma tag SemVer estável no commit de `main` escolhido e revise o par tag/SHA em `channels/latest.json` via PR. Execute `stable release` manualmente a partir de `main` com esses valores. O job de escrita usa a fonte confiável do dispatch e confere a origem novamente antes de publicar. Para rollback do canal, revise o ponteiro em `main` para uma release anterior elegível. Isso não requer editar essa release. O ponteiro inicial conserva `v0.0.1`: a instalação de três variantes fica indisponível enquanto a estável aprovada usar o formato antigo.
+
+**Teste.** `mise run release-check` cobre seleção, ordenação, ref/artefato obsoleto e o formato dos pacotes. Para um teste conectado, use `mise run channel-install pr-N x64-baseline` depois da CI verde e execute a linha impressa com `--scene saudavel --snap teste.png`. A expiração dos artefatos de teste segue a retenção do Actions; as releases estáveis usam os assets do GitHub Releases.
+
+## Exportação e licença
+
+Na barra de título, **Exportar** salva a leitura dos discos listados em JSON ou CSV. O JSON inclui identidade, fontes, atributos ATA e o histórico local. O CSV usa UTF-8 com BOM e protege campos informados pelo dispositivo contra interpretação como fórmulas de planilha. A exportação grava somente o arquivo escolhido no diálogo do Windows e mantém o destino intacto se a gravação falhar. Identificadores dos discos podem aparecer nesse arquivo quando o usuário decide exportar.
+
+A sondagem ATA tenta ler os limites declarados pelo dispositivo e, em adaptadores USB compatíveis, pode consultar pelo protocolo SAT. Em modelos e firmwares sem mapeamento confirmado, os valores brutos continuam disponíveis na seção avançada e no JSON, sem inferir unidades ou datas. A leitura de temperatura também pode vir da propriedade de armazenamento do Windows.
+
+O código é distribuído sob a [licença MIT](LICENSE).
