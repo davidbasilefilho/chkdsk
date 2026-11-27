@@ -80,7 +80,7 @@ Para ensaiar o pacote sem publicar, execute `mise exec -- bun scripts/release.ts
 
 ### Instalação por canal com mise
 
-Em um checkout **confiável de `main`**, instale o mise e o GitHub CLI (`gh`). Para artefatos do Actions, autentique o CLI com acesso de leitura a Actions e Contents. No Windows, o instalador usa o `tar.exe` do sistema. Escolha o canal e o perfil de CPU.
+Em um checkout **confiável de `main`**, instale o mise e o GitHub CLI (`gh`). Autentique o CLI com acesso de leitura a Actions e Contents. Escolha o canal e o perfil de CPU.
 
 ```powershell
 mise run channel-install latest x64-baseline
@@ -100,11 +100,13 @@ Cada comando verifica os três executáveis e o manifesto e instala o perfil esc
 
 Os canais de teste consultam a API em modo leitura. O identificador do artefato, o SHA completo e o digest SHA-256 do ZIP vinculam a instalação à execução. A resolução se repete após o download. Se outra execução, novo commit ou fechamento do PR mudar a seleção, a instalação para. Uma conclusão atrasada não escreve um alias remoto. Artefatos expirados e mudanças incompatíveis no workflow exigem nova validação ou atualização do checkout confiável. Uma versão instalada é identificada por SHA, ID do artefato/release, interface e perfil. A posição da release na página do GitHub e a data do upload não participam da seleção.
 
-**Ativação de dev.** A branch existente `dev` tem histórico próprio. Depois do merge desta mudança, reconcilie o novo `main` com `dev` em um PR separado, preservando os commits exclusivos e substituindo os workflows antigos de publicação de `dev`. O primeiro push validado desse resultado ativa o canal. Para rollback de `dev`, reverta em Git e valide o novo HEAD. A mesma regra vale para atualizar ou reverter o código de um PR.
+**Ativação de dev.** A branch existente `dev` tem histórico próprio. O canal acompanha somente o HEAD validado da branch dev. A publicação é feita pelo workflow confiável da branch padrão. Para rollback de `dev`, reverta em Git e valide o novo HEAD. A mesma regra vale para atualizar ou reverter o código de um PR.
 
 **Promoção estável.** Configure o environment `stable` com aprovação obrigatória e restrição à branch `main`, proteja `main` e as tags estáveis contra reescrita. Depois de aprovação explícita, use uma tag SemVer estável no commit de `main` escolhido e revise o par tag/SHA em `channels/latest.json` via PR. Execute `stable release` manualmente a partir de `main` com esses valores. O job de escrita usa a fonte confiável do dispatch e confere a origem novamente antes de publicar. Para rollback do canal, revise o ponteiro em `main` para uma release anterior elegível. Isso não requer editar essa release. O ponteiro inicial conserva `v0.0.1`: a instalação de três variantes fica indisponível enquanto a estável aprovada usar o formato antigo.
 
-**Teste.** `mise run release-check` cobre seleção, ordenação, ref/artefato obsoleto e o formato dos pacotes. Para um teste conectado, use `mise run channel-install pr-N x64-baseline` depois da CI verde e execute a linha impressa com `--scene saudavel --snap teste.png`. A expiração dos artefatos de teste segue a retenção do Actions; as releases estáveis usam os assets do GitHub Releases.
+**Pré-releases no GitHub.** Depois da validação completa, um workflow da branch padrão publica o pacote imutável como `v{versão}-dev-{sha40}` ou `v{versão}-pr-{número}-{sha40}`. Ele confere novamente o HEAD, a execução, o ZIP e o manifesto antes de publicar. PRs de forks, fechados ou em rascunho ficam fora. O mise baixa os executáveis da pré-release do HEAD verificado, mesmo com várias pré-releases na página de Releases. O ZIP da CI só intermedeia a passagem do pacote já validado para o publicador e os testes nativos. [Gatilho e permissões do GitHub Actions](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run)
+
+**Teste.** `mise run release-check` cobre seleção, ordenação, ref/artefato obsoleto e o formato dos pacotes. Para um teste conectado, use `mise run channel-install pr-N x64-baseline` depois da CI verde e execute a linha impressa com `--scene saudavel --snap teste.png`. Os executáveis instaláveis vêm do GitHub Releases.
 
 ## Exportação e licença
 
