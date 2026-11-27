@@ -1,0 +1,15 @@
+amends "package://github.com/jdx/hk/releases/download/v2.14.0/hk@2.14.0#/Config.pkl"
+
+fail_fast = false
+
+hooks {
+  ["pre-commit"] {
+    stash = "git"
+    fix = false
+    stage = false
+    steps {
+      ["rustfmt"] { check = "mise run fmt" }
+      ["clippy"] { check = "mise run clippy" }
+    }
+  }
+}

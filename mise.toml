@@ -1,8 +1,8 @@
 [tools]
 rust = { version = "stable", components = ["rustfmt", "clippy"], targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] }
-python = "3.12"
+bun = "1.4.5"
 "github:llvm/llvm-project" = { version = "llvmorg-23.1.2", matching = "clang+llvm", matching_regex = "\\.tar\\.xz$" }
-prek = "latest"
+hk = "2.14.0"
 
 [tasks.fmt]
 description = "Check Rust formatting"
@@ -10,48 +10,26 @@ run = "cargo fmt --all -- --check"
 
 [tasks.clippy]
 description = "Lint every target and feature for x64 and ARM64"
-run = "python scripts/release.py clippy"
+run = "bun scripts/release.ts clippy"
 
 [tasks.tests]
 description = "Run the complete x64 Windows test suite"
-run = "python scripts/release.py tests"
-
-[tasks.clippy-host]
-description = "Lint every target and feature for the host platform"
-run = "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings"
-
-[tasks.clippy-xwin]
-description = "Cross-lint the x64 and ARM64 Windows targets with cargo-xwin (runs on Linux)"
-run = "python scripts/release.py xwin-clippy"
-
-[tasks.tests-host]
-description = "Run the workspace tests on the host platform (Windows-only code is stubbed out)"
-run = "cargo test --locked --workspace --all-features"
+run = "bun scripts/release.ts tests"
 
 [tasks.compile]
 description = "Compile every Cargo target and feature for x64 and ARM64"
-run = "python scripts/release.py compile"
+run = "bun scripts/release.ts compile"
 
 [tasks.release-check]
-description = "Self-check release tags, version rules, planning, pruning and Windows target mapping"
-run = "python scripts/release.py self-check"
+description = "Self-check release naming and Windows target mapping"
+run = "bun scripts/release.ts self-check"
 
 [tasks.linker-check]
 description = "Verify the x64 and ARM64 MSVC environment and linkers"
-run = "python scripts/release.py linker-check"
-
-[tasks.ci-linux]
-description = "Checks CI runs on Linux: formatting, host and xwin lint, host tests, release script self-check"
-run = [
-  { task = "fmt" },
-  { task = "release-check" },
-  { task = "clippy-host" },
-  { task = "clippy-xwin" },
-  { task = "tests-host" },
-]
+run = "bun scripts/release.ts linker-check"
 
 [tasks.validation]
-description = "Run formatting, lint, tests, all-architecture compilation, and release checks on Windows"
+description = "Run formatting, lint, tests, all-architecture compilation, and release checks"
 run = [
   { task = "fmt" },
   { task = "release-check" },
@@ -63,24 +41,44 @@ run = [
 
 [tasks.setup-hook]
 description = "Install the repository pre-commit hook"
-run = "prek install"
+run = "hk install --mise"
 
 [tasks.release]
-description = "Build the optimized x64, x64-baseline and ARM64 executables for the current commit"
+description = "Build three optimized GUI executables"
 run = [
-  { task = "release-x64" },
   { task = "release-x64-baseline" },
+  { task = "release-x64" },
   { task = "release-arm64" },
 ]
 
-[tasks.release-x64]
-description = "Build the x64 (x86-64-v3, AVX2) executable into dist/release"
-run = "python scripts/release.py build --mode dev --variant x64"
-
 [tasks.release-x64-baseline]
-description = "Build the x64-baseline (x86-64-v2) executable into dist/release"
-run = "python scripts/release.py build --mode dev --variant x64-baseline"
+description = "Build the baseline x64 executables"
+run = "bun scripts/release.ts build --architecture x64-baseline"
+
+[tasks.release-x64]
+description = "Build the modern x64 executables"
+run = "bun scripts/release.ts build --architecture x64"
 
 [tasks.release-arm64]
-description = "Build the ARM64 executable into dist/release"
-run = "python scripts/release.py build --mode dev --variant arm64"
+description = "Build the optimized ARM64 executable"
+run = "bun scripts/release.ts build --architecture arm64"
+
+[tasks.package-dev]
+description = "Package the complete development release using the current commit"
+run = 'bun scripts/release.ts package --mode dev --sha "{{ env.GITHUB_SHA }}" --output dist/release'
+
+[tasks.publish-dev]
+description = "Verify and publish the development release for the current commit"
+run = 'bun scripts/release.ts publish --mode dev --sha "{{ env.GITHUB_SHA }}" --assets-dir dist/release'
+
+[tasks.package-stable]
+description = "Validate the current tag and package the complete stable release"
+run = 'bun scripts/release.ts package --mode stable --tag "{{ env.GITHUB_REF_NAME }}" --sha "{{ env.GITHUB_SHA }}" --output dist/release'
+
+[tasks.publish-stable]
+description = "Verify and publish the stable release for the current tag and commit"
+run = 'bun scripts/release.ts publish --mode stable --tag "{{ env.GITHUB_REF_NAME }}" --sha "{{ env.GITHUB_SHA }}" --assets-dir dist/release'
+
+[tasks.channel-install]
+description = "Install a verified Windows channel and variant as an immutable mise version"
+run = "bun scripts/channel-install.ts"

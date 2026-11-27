@@ -1,0 +1,47 @@
+name: preview release
+
+on:
+  workflow_run:
+    workflows: [validation]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      validation_run:
+        description: Exact completed validation run to recover without rebuilding
+        required: true
+        type: string
+      validation_attempt:
+        description: Exact attempt number of the completed run
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'pull_request' ||
+       (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'dev'))))
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.5
+      - name: Publish the verified preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATION_RUN: ${{ github.event.workflow_run.id || inputs.validation_run }}
+          VALIDATION_ATTEMPT: ${{ github.event.workflow_run.run_attempt || inputs.validation_attempt }}
+        run: bun scripts/preview-release.ts

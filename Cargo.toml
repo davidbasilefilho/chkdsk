@@ -1,29 +1,41 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/disksonar-core", "crates/disksonar-windows"]
 
-[workspace.package]
+[package]
+name = "disksonar"
 version = "0.1.0"
 edition = "2024"
+default-run = "disksonar"
 publish = false
 license = "MIT"
 
-# Measured with `cargo xwin build --release -p chkdsk --target x86_64-pc-windows-msvc`:
-# default profile 21.56 MB in 293 s; thin LTO 20.82 MB in 519 s; fat LTO 19.74 MB in 417 s
-# (both with codegen-units = 1 and strip). Fat LTO was smallest and no slower.
-[profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true
-# Stays "unwind": the collector relies on catch_unwind.
-panic = "unwind"
-
-[workspace.dependencies]
-chkdsk-core = { path = "crates/chkdsk-core" }
-chkdsk-windows = { path = "crates/chkdsk-windows" }
+[dependencies]
+disksonar-core = { path = "crates/disksonar-core" }
+disksonar-windows = { path = "crates/disksonar-windows" }
 # Rune has no crates.io release; pin the exact `dev` commit.
 rune = { git = "https://github.com/anomalyco/rune", rev = "757bcb1d1da1b3f80484f36ef610b83ddbcc6003", default-features = false, features = ["accessibility"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-windows-sys = "=0.61.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_System_LibraryLoader",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+# Fixture disks for `--snap out.png --scene saudavel` and friends; no effect on the window.
+scenes = []

@@ -1,81 +1,148 @@
 name: validation
 
-# Reusable gate called by dev.yml (pushes and pull requests) and stable.yml
-# (releases); it has no triggers of its own, so a commit is validated once per run.
 on:
-  workflow_call:
-    inputs:
-      ref:
-        description: Commit to validate
-        required: true
-        type: string
-
-permissions: {}
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  # CI needs neither the portable LLVM (the runner packages cover xwin) nor the commit hook.
-  MISE_DISABLE_TOOLS: github:llvm/llvm-project,prek
+  push:
+    branches: ["**"]
+  pull_request:
 
 jobs:
-  # Everything that does not execute Windows code: formatting, lint for the host
-  # and (through cargo-xwin) both Windows targets, host tests, release script self-check.
-  linux:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ inputs.ref }}
-          persist-credentials: false
-      - name: Install system packages
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends clang lld llvm libxkbcommon-dev libwayland-dev
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
-        with:
-          install: true
-          cache: true
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: cargo-xwin
-      - name: Cache the Windows CRT and SDK downloaded by cargo-xwin
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/cargo-xwin
-          key: xwin-${{ runner.os }}-v1
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: linux
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' }}
-      - run: mise run ci-linux
-
-  # The only part that needs a Windows machine: the Windows-only code paths.
-  windows:
+  validation:
     runs-on: windows-2022
-    timeout-minutes: 40
     permissions:
       contents: read
     env:
       MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
       MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
           persist-credentials: false
-      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+      - uses: jdx/mise-action@v5
         with:
           install: true
-          cache: true
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: mise run validation
+
+  distribution:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/dev'
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      MISE_RUSTUP_HOME: 'C:\Users\runneradmin\AppData\Local\mise\rustup'
+      MISE_CARGO_HOME: 'C:\Users\runneradmin\AppData\Local\mise\cargo'
+    steps:
+      - uses: actions/checkout@v4
         with:
-          key: windows-tests
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' }}
-      - run: mise run tests
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: jdx/mise-action@v5
+      - name: Build and verify the development distribution
+        run: mise exec -- bun scripts/release.ts package --mode dev --sha $env:SOURCE_SHA --output dist/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-dev-${{ env.SOURCE_SHA }}
+          path: dist/release/
+          if-no-files-found: error
+
+  smoke:
+    needs: distribution
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            profiles: x64,x64-baseline
+          - runner: windows-11-arm
+            profiles: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-dev-${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Run the packaged graphical interface
+        env:
+          PROFILES: ${{ matrix.profiles }}
+        run: |
+          foreach ($line in Get-Content SHA256SUMS.txt) {
+            $hash, $name = $line -split '  ', 2
+            if ((Get-FileHash -Algorithm SHA256 $name).Hash -ne $hash) { throw "Checksum mismatch for $name" }
+            Write-Output $line
+          }
+          foreach ($profile in $env:PROFILES.Split(',')) {
+            $gui = (Get-Item "*-windows-$profile.exe").FullName
+            $stamp = & $gui --build-profile | Out-String
+            if ($LASTEXITCODE -or $stamp.Trim() -ne "disksonar-cpu:$profile;") { throw "Profile mismatch: $gui" }
+            foreach ($scene in @("saudavel", "macrovip", "settings")) {
+              foreach ($size in @("1100x720", "440x640")) {
+                $image = "fixture-$scene-$profile-$size.png"
+                & $gui --scene $scene --snap $image --size $size --scale 1 --theme dark | Out-Host
+                if ($LASTEXITCODE -or !(Test-Path $image)) { throw "Graphical fixture failed: $image" }
+              }
+            }
+          }
+      - name: Exercise the fixture window on an interactive desktop
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class FixtureWindow {
+              [StructLayout(LayoutKind.Sequential)] public struct Bounds { public int Left, Top, Right, Bottom; }
+              [DllImport("user32.dll")] public static extern IntPtr GetShellWindow();
+              [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out Bounds rect);
+              [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr dc, uint flags);
+              [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int cmd);
+              [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hwnd);
+              [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+          }
+          '@
+          if (![Environment]::UserInteractive -or [FixtureWindow]::GetShellWindow() -eq [IntPtr]::Zero) {
+            "Interactive desktop unavailable. The packaged off-screen captures ran separately." >> $env:GITHUB_STEP_SUMMARY
+            return
+          }
+          $profile = "${{ matrix.profiles }}".Split(",")[0]
+          $exe = (Get-Item "*-windows-$profile.exe").FullName
+          foreach ($size in @("440x640","1100x720")) {
+            $child = Start-Process $exe -ArgumentList "--scene settings --size $size --theme dark" -PassThru
+            try {
+              $limit = (Get-Date).AddSeconds(30)
+              do {
+                Start-Sleep -Milliseconds 200
+                $child.Refresh()
+              } until ($child.MainWindowTitle -ceq "disksonar" -or $child.HasExited -or (Get-Date) -gt $limit)
+              if ($child.HasExited -or $child.MainWindowTitle -cne "disksonar") { throw "Fixture window did not open" }
+              $hwnd = $child.MainWindowHandle
+              $bounds = New-Object FixtureWindow+Bounds
+              if (![FixtureWindow]::GetWindowRect($hwnd,[ref]$bounds)) { throw "Could not locate fixture window" }
+              $bmp = [Drawing.Bitmap]::new($bounds.Right-$bounds.Left,$bounds.Bottom-$bounds.Top)
+              $graphics = [Drawing.Graphics]::FromImage($bmp)
+              try {
+                $dc = $graphics.GetHdc()
+                try { if (![FixtureWindow]::PrintWindow($hwnd,$dc,2)) { throw "Fixture window capture failed" } }
+                finally { $graphics.ReleaseHdc($dc) }
+                $bmp.Save((Join-Path $PWD "fixture-native-$profile-$size.png"),[Drawing.Imaging.ImageFormat]::Png)
+              } finally { $graphics.Dispose(); $bmp.Dispose() }
+              foreach ($mode in @(3,9,6,9)) {
+                [void][FixtureWindow]::ShowWindowAsync($hwnd,$mode)
+                $limit = (Get-Date).AddSeconds(3)
+                do {
+                  Start-Sleep -Milliseconds 100
+                  $ok = switch ($mode) {
+                    3 { [FixtureWindow]::IsZoomed($hwnd) }
+                    6 { [FixtureWindow]::IsIconic($hwnd) }
+                    9 { ![FixtureWindow]::IsIconic($hwnd) -and ![FixtureWindow]::IsZoomed($hwnd) }
+                  }
+                } until ($ok -or (Get-Date) -gt $limit)
+                if (!$ok) { throw "Window transition failed: $mode" }
+              }
+              if (!$child.CloseMainWindow() -or !$child.WaitForExit(5000)) { throw "Window did not close" }
+            } finally { if (!$child.HasExited) { $child.Kill() }; $child.Dispose() }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixture-${{ matrix.runner }}
+          path: fixture-*.png
+          if-no-files-found: error
