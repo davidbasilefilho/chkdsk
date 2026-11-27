@@ -1,0 +1,81 @@
+name: Verify release channels on Windows
+on: push
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            profiles: x64,x64-baseline
+          - runner: windows-11-arm
+            profiles: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 65
+    env:
+      CHANNEL: pr-15
+      SOURCE_SHA: 0047b57abcfe771ab07f1b9b5809eff5f9fa2c73
+      VALIDATION_RUN: 46043571708
+      PROFILES: ${{ matrix.profiles }}
+      MISE_DISABLE_TOOLS: rust,bun,hk,github:llvm/llvm-project
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: jdx/mise-action@v5
+        with:
+          install: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.5
+      - name: Wait for verified distribution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run watch $env:VALIDATION_RUN --exit-status --interval 40
+      - name: Wait for the GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v0.1.0-$env:CHANNEL-$env:SOURCE_SHA"
+          $deadline = (Get-Date).AddMinutes(6)
+          do {
+            $json = gh api "repos/davidbasilefilho/disksonar/releases/tags/$tag" 2>$null
+            if (!$LASTEXITCODE) { break }
+            Start-Sleep -Seconds 12
+          } while ((Get-Date) -lt $deadline)
+          if ($LASTEXITCODE) { throw "Published preview release missing" }
+          $release = $json | ConvertFrom-Json
+          if (!$release.prerelease -or $release.draft -or $release.target_commitish -cne $env:SOURCE_SHA -or $release.assets.Count -ne 4) { throw "Unexpected release identity" }
+          $release.html_url | Out-Host
+      - name: Install and run the profiles for the verified channel HEAD
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = "davidbasilefilho/disksonar"
+          $realHead = if ($env:CHANNEL -eq "dev") {
+            gh api "repos/$repo/branches/dev" --jq ".commit.sha"
+          } else {
+            gh api "repos/$repo/pulls/$($env:CHANNEL.Substring(3))" --jq .head.sha
+          }
+          if ($LASTEXITCODE -or $realHead -cne $env:SOURCE_SHA) { throw "Channel moved" }
+          $channels = @($env:CHANNEL)
+          if ($env:CHANNEL -ne "dev") { $channels += "pr" }
+          foreach ($channel in $channels) {
+          foreach ($profile in $env:PROFILES.Split(",")) {
+            $lines = mise run channel-install $channel $profile
+            $lines | Out-Host
+            if ($LASTEXITCODE) { throw "Install failed for $profile" }
+            $spec = ($lines | Select-String -Pattern "^mise x '(.+)' -- disksonar\.exe$").Matches.Groups[1].Value
+            if (!$spec.Contains($env:SOURCE_SHA)) { throw "Unexpected mise pin" }
+            $stamp = mise x $spec -- disksonar.exe --build-profile | Out-String
+            if ($LASTEXITCODE -or $stamp.Trim() -cne "disksonar-cpu:${profile};") { throw "CPU profile mismatch" }
+            $png = "installed-$channel-$profile.png"
+            mise x $spec -- disksonar.exe --scene settings --snap $png --size 440x640 | Out-Host
+            if ($LASTEXITCODE -or !(Test-Path $png)) { throw "Installed fixture failed" }
+          }
+          }
