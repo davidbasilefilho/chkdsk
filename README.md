@@ -80,7 +80,7 @@ Para ensaiar o pacote sem publicar, execute `mise exec -- bun scripts/release.ts
 
 ### Instalação por canal com mise
 
-Em um checkout **confiável de `main`**, instale o mise e o GitHub CLI (`gh`). Para artefatos do Actions, autentique o CLI com acesso de leitura a Actions e Contents. No Windows, o instalador usa o `tar.exe` do sistema. Escolha explicitamente a interface e a CPU:
+Em um checkout **confiável de `main`**, instale o mise e o GitHub CLI (`gh`). Para artefatos do Actions, autentique o CLI com acesso de leitura a Actions e Contents. No Windows, o instalador usa o `tar.exe` do sistema. Escolha o canal e o perfil de CPU.
 
 ```powershell
 mise run channel-install latest x64-baseline
@@ -89,7 +89,7 @@ mise run channel-install pr-13 x64
 mise run channel-install pr x64-baseline
 ```
 
-Cada comando verifica os três arquivos e o manifesto e registra **apenas a variante escolhida** como uma versão local do backend GitHub usando `mise link`. O comando imprime a linha `mise x github:davidbasilefilho/disksonar@… -- disksonar.exe` com o identificador imutável. Acrescente `--version` para conferir. Para atualizar, rode novamente o instalador do canal. Para voltar, execute a linha de uma instalação anterior. Consulte [mise link](https://mise.jdx.dev/cli/link.html) e a [API de artefatos do GitHub](https://docs.github.com/en/rest/actions/artifacts).
+Cada comando verifica os três executáveis e o manifesto e instala o perfil escolhido em um diretório identificado pelo SHA, ID do artefato ou release e perfil de CPU. O instalador imprime um comando PowerShell `mise x 'github:davidbasilefilho/disksonar@path:…' -- disksonar.exe` com o caminho completo. O mise usa esse diretório mesmo quando o catálogo de versões ainda está desatualizado. Acrescente `--version` para conferir. Para atualizar, execute o instalador novamente. Para voltar, use a linha de uma instalação anterior. [Versões locais do mise](https://mise.jdx.dev/dev-tools/versions.html) · [API de artefatos do GitHub](https://docs.github.com/en/rest/actions/artifacts).
 
 | Canal | Fonte verificada na instalação |
 | --- | --- |

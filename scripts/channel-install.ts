@@ -87,14 +87,14 @@ function install(args: string[]) {
         if (!existsSync(target) || digest(join(target, "bin", binName)) !== digest(source)) throw error;
       }
     } finally { rmSync(staging, { recursive: true, force: true }); }
-    const tool = "github:" + repository + "@" + key;
-    // Do not replace an unrelated installation, even if another process won the race.
-    const existing = Bun.spawnSync(["mise", "where", tool]);
-    if (existing.exitCode === 0) {
-      if (realpathSync(existing.stdout.toString().trim()) !== realpathSync(target)) throw Error("Conflicting mise installation");
-    } else execFileSync("mise", ["link", tool, target], { stdio: "inherit" });
+    // A path version uses the verified installation directly. A synthetic version
+    // registered with mise link can still trigger a remote versions lookup.
+    const tool = "github:" + repository + "@path:" + realpathSync(target);
+    const installed = execFileSync("mise", ["where", tool], { encoding: "utf8" }).trim();
+    if (realpathSync(installed) !== realpathSync(target)) throw Error("Unexpected mise installation path");
     console.log(selected.channel, selected.sha, name, digest(source));
-    console.log("mise x " + tool + " -- " + binName);
+    // PowerShell single-quoted argument, including paths with spaces or apostrophes.
+    console.log("mise x '" + tool.replaceAll("'", "''") + "' -- " + binName);
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 if (import.meta.main) {
