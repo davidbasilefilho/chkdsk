@@ -8,7 +8,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 60
     env:
-      SOURCE_SHA: 70e34d4c94e400c402760e7540bb0bae220221d6
+      SOURCE_SHA: 5c8aaf79863fd33b1260bb4bfef7f06e1c125742
       MISE_DISABLE_TOOLS: rust,bun,hk,github:llvm/llvm-project
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -25,7 +25,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh run watch 46034420632 --exit-status --interval 45
+          gh run watch 46037830493 --exit-status --interval 45
       - name: Resolve and install two live channels
         env:
           GH_TOKEN: ${{ github.token }}
@@ -36,20 +36,17 @@ jobs:
             $lines = mise run channel-install $channel $profile
             $lines | Out-Host
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
-            $spec = ($lines | Select-String -Pattern '^mise x (\S+) -- ').Matches.Groups[1].Value
+            $spec = ($lines | Select-String -Pattern  "^mise x '(.+)' -- disksonar\.exe$").Matches.Groups[1].Value
             if (!$spec.Contains($env:SOURCE_SHA)) { throw "Unexpected mise pin" }
             "$($profile.Replace('-','_'))=$spec" >> $env:GITHUB_ENV
           }
       - name: Run installed executable through mise
         run: |
           foreach ($spec in @($env:x64_baseline, $env:x64)) {
-            $key = $spec.Split("@")[-1]
-            $root = Join-Path $env:LOCALAPPDATA "disksonar/packages/$key"
-            $spec = "github:davidbasilefilho/disksonar@path:$root"
-            Get-FileHash (Join-Path $root bin/disksonar.exe)
+            $key = Split-Path -Leaf ($spec.Split("@path:")[-1])
             $version = mise x $spec -- disksonar.exe --version | Out-String
             if ($LASTEXITCODE -or $version.Trim() -ne 'disksonar 0.1.0') { throw "Installed GUI failed" }
             $image = "installed-" + $key + ".png"
             mise x $spec -- disksonar.exe --scene settings --snap $image --size 440x640 | Out-Host
-            if ($LASTEXITCODE) { throw "Installed fixture failed" }
+            if ($LASTEXITCODE -or !(Test-Path $image)) { throw "Installed fixture failed" }
           }
