@@ -8,7 +8,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 60
     env:
-      SOURCE_SHA: ae8e8abf7ba53de56f7c86f4fd0e25df911cd76c
+      SOURCE_SHA: 70e34d4c94e400c402760e7540bb0bae220221d6
       MISE_DISABLE_TOOLS: rust,bun,hk,github:llvm/llvm-project
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -25,7 +25,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh run watch 46031144016 --exit-status --interval 45
+          gh run watch 46034420632 --exit-status --interval 45
       - name: Resolve and install two live channels
         env:
           GH_TOKEN: ${{ github.token }}
@@ -43,9 +43,9 @@ jobs:
       - name: Run installed executable through mise
         run: |
           foreach ($spec in @($env:x64_baseline, $env:x64)) {
-            $version = mise x $spec -- chkdsk-dashboard.exe --version | Out-String
-            if ($LASTEXITCODE -or $version.Trim() -ne 'chkdsk 0.1.0') { throw "Installed GUI failed" }
+            $version = mise x $spec -- disksonar.exe --version | Out-String
+            if ($LASTEXITCODE -or $version.Trim() -ne 'disksonar 0.1.0') { throw "Installed GUI failed" }
             $image = "installed-" + $spec.Split("@")[-1] + ".png"
-            mise x $spec -- chkdsk-dashboard.exe --scene macrovip --snap $image --size 440x640 | Out-Host
+            mise x $spec -- disksonar.exe --scene settings --snap $image --size 440x640 | Out-Host
             if ($LASTEXITCODE) { throw "Installed fixture failed" }
           }
