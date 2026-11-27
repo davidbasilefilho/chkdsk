@@ -20,16 +20,26 @@ function fixture() {
     .map(name => ({name,conclusion:"success"}));
   const release = {id:40,tag_name:"v1.0.0",target_commitish:sha,prerelease:false,draft:false,
     assets:names.map((name,id) => ({id,name,state:"uploaded",digest}))};
-  const state = { branch:sha, workflowBlob:blob, expired:false, linked:true, date:"2026-01-02T00:00:00Z" };
+  const state = { branch:sha, workflowBlob:blob, expired:false, linked:true, unpublished:"", date:"2026-01-02T00:00:00Z" };
   const api = {
+    find(path: string) { return this.get(path); },
     get(path: string) {
       if (path === "branches/main" || path === "branches/dev") return {commit:{sha:state.branch}};
       if (path.startsWith("contents/channels/latest.json")) return {content:Buffer.from(JSON.stringify({tag:"v1.0.0",sha})).toString("base64")};
       if (path.startsWith("contents/" + workflow)) return {sha:state.workflowBlob};
       if (path.startsWith("contents/Cargo.toml")) return {content:Buffer.from('[package]\nname="disksonar"\nversion="1.0.0"').toString("base64")};
       if (path.startsWith("pulls/")) return pulls[Number(path.split("/")[1])-1];
-      if (path.startsWith("releases/tags/")) return release;
-      if (path.startsWith("commits/refs/tags/")) return {sha};
+      if (path === "releases/tags/v1.0.0") return release;
+      if (path.startsWith("releases/tags/")) {
+        const tag = path.split("/").at(-1)!;
+        const head = tag.split("-").at(-1)!;
+        const run = runs.find(r => r.head_sha === head);
+        if (!run || state.unpublished === head) return undefined;
+        return { ...release, tag_name:tag, target_commitish:head, prerelease:true,
+          body:"[validation](https://github.com/" + repository + "/actions/runs/" + run.id + ")",
+          assets:assetPaths("", "disksonar", "1.0.0", "dev", head).map((name,id) => ({id,name,state:"uploaded",digest})) };
+      }
+      if (path.startsWith("commits/refs/tags/")) return {sha: path === "commits/refs/tags/v1.0.0" ? sha : path.split("-").at(-1)};
       if (path.startsWith("compare/")) return {status:"ahead"};
       if (path.startsWith("commits/")) return {commit:{committer:{date:path.endsWith(newer) ? "2026-01-03" : "2026-01-01"}}};
       throw Error(path);
@@ -82,14 +92,14 @@ test("aggregate orders eligible HEADs by commit time, ignoring run IDs/completio
 test("reject unknown workflow, expired/cross-run artifacts and artifacts from a previous attempt", () => {
   const f = fixture();
   f.state.workflowBlob="other";
-  expect(() => select(f.api,"dev")).toThrow("producer");
+  expect(() => select(f.api,"dev",true)).toThrow("producer");
   f.state.workflowBlob=blob;
   f.state.expired=true;
-  expect(() => select(f.api,"dev")).toThrow("expired");
+  expect(() => select(f.api,"dev",true)).toThrow("expired");
   f.state.expired=false; f.state.linked=false;
-  expect(() => select(f.api,"dev")).toThrow();
+  expect(() => select(f.api,"dev",true)).toThrow();
   f.state.linked=true; f.state.date="2025-01-01";
-  expect(() => select(f.api,"dev")).toThrow();
+  expect(() => select(f.api,"dev",true)).toThrow();
 });
 
 test("a new HEAD or artifact while downloading cannot replace the selected version", () => {
@@ -112,4 +122,14 @@ test("only successful same-repository dev pushes and PR validation runs can trig
   expect(publicationChannel({ ...pr, conclusion: "cancelled" }, repository)).toBeUndefined();
   expect(publicationChannel({ ...pr, head_sha: dev.head_sha }, repository)).toBeUndefined();
   expect(publicationChannel({ ...pr, path: ".github/workflows/other.yml" }, repository)).toBeUndefined();
+});
+
+test("preview installation uses published assets. Expired CI artifacts are irrelevant", () => {
+  const f = fixture();
+  f.state.expired = true;
+  expect(select(f.api,"dev").assets?.length).toBe(4);
+  expect(select(f.api,"dev").artifact).toBeUndefined();
+  f.state.unpublished = newer;
+  expect(() => select(f.api,"pr-2")).toThrow("No verified release");
+  expect(select(f.api,"pr").channel).toBe("pr-1");
 });

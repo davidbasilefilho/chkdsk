@@ -6,16 +6,24 @@ import { join } from "node:path";
 import { digest, verifyAssets } from "./assets";
 import { repository, select, type Api, type Selection } from "./channels";
 
+class MissingResource extends Error {}
 const maxSize = 128 * 1024 * 1024;
 function gh(route: string, flags: string[] = []) {
   try {
     return execFileSync("gh", ["api", ...flags, "repos/" + repository + "/" + route],
       { maxBuffer: maxSize, stdio: ["ignore", "pipe", "pipe"] });
-  } catch { throw Error("GitHub request failed: " + route + " (check read access and availability)"); }
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "stderr" in error
+      && String(error.stderr).includes("(HTTP 404)")) throw new MissingResource(route);
+    throw Error("GitHub request failed: " + route + " (check read access and availability)"); }
 }
 
 export const api: Api = {
   get: route => JSON.parse(gh(route).toString()),
+  find<T>(route: string): T | undefined {
+    try { return this.get<T>(route); }
+    catch (error) { if (!(error instanceof MissingResource)) throw error; }
+  },
   pages<T>(route: string, key?: string): T[] {
     const result: T[] = [];
     for (let page = 1; ; page++) {

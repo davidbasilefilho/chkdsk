@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { api, checkCurrent, download } from "./channel-install";
-import { publicationChannel, repository, select, Unavailable, type Run, type Selection } from "./channels";
+import { previewTag, publicationChannel, repository, select, Unavailable, type Run, type Selection } from "./channels";
 import { publishRelease } from "./github";
 
 const id = Number(process.env.VALIDATION_RUN);
@@ -14,7 +14,7 @@ if (!channel || trigger.id !== id) {
   console.log("Validation run is outside the preview release policy");
   process.exit(0);
 }
-const resolve = () => select(api, channel);
+const resolve = () => select(api, channel, true);
 let selection: Selection;
 try { selection = resolve(); }
 catch (error) {
@@ -29,7 +29,7 @@ if (selection.sha !== trigger.head_sha || selection.artifact?.run !== id
 }
 const version = selection.names[0].match(/^disksonar-(.+)-dev-[a-f0-9]{7}-windows-arm64\.exe$/)?.[1];
 if (!version) throw Error("Unexpected preview asset name");
-const tag = "v" + version + "-" + channel + "-" + selection.sha;
+const tag = previewTag(channel, version, selection.sha);
 const gitTagRoute = "git/matching-refs/tags/" + tag;
 function checkTag(expectFound: boolean) {
   const refs = api.get<{ref: string; object: {type: string; sha: string}}[]>(gitTagRoute)
