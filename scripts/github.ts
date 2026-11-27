@@ -64,7 +64,7 @@ export function publishRelease(repo: string, tag: string, sha: string, prereleas
     const expected = digest(file);
     if (typeof asset.digest === "string" && /^sha256:[a-f0-9]{64}$/i.test(asset.digest))
       return asset.digest.toLowerCase() === "sha256:" + expected;
-    const dir = mkdtempSync(join(tmpdir(), "chkdsk-asset-"));
+    const dir = mkdtempSync(join(tmpdir(), "disksonar-asset-"));
     try {
       command(["gh", "release", "download", tag, "--repo", repo, "--pattern", basename(file), "--dir", dir]);
       return digest(join(dir, basename(file))) === expected;

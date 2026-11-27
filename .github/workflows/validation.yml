@@ -72,8 +72,8 @@ jobs:
           foreach ($profile in $env:PROFILES.Split(',')) {
             $gui = (Get-Item "*-windows-$profile.exe").FullName
             $stamp = & $gui --build-profile | Out-String
-            if ($LASTEXITCODE -or $stamp.Trim() -ne "chkdsk-cpu:$profile;") { throw "Profile mismatch: $gui" }
-            foreach ($scene in @("saudavel", "macrovip")) {
+            if ($LASTEXITCODE -or $stamp.Trim() -ne "disksonar-cpu:$profile;") { throw "Profile mismatch: $gui" }
+            foreach ($scene in @("saudavel", "macrovip", "settings")) {
               foreach ($size in @("1100x720", "440x640")) {
                 $image = "fixture-$scene-$profile-$size.png"
                 & $gui --scene $scene --snap $image --size $size --scale 1 --theme dark | Out-Host

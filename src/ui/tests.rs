@@ -513,6 +513,7 @@ fn over_color(top: Color, bottom: Color, encoded: bool) -> Color {
 fn status_text_keeps_four_and_a_half_to_one_in_both_themes() {
     for (dark, name) in [(false, "claro"), (true, "escuro")] {
         let palette = Palette::new(dark, Color::WHITE);
+        assert!(contrast(brand_ink(dark), palette.theme.card) >= 4.5);
         for (tone, tone_name) in [
             (Tone::Critical, "crítico"),
             (Tone::Healthy, "saudável"),
@@ -599,4 +600,28 @@ fn compact_menu_closes_on_escape_and_preserves_selection_across_motion_change() 
     assert!(!rt.state.menu_open);
     assert_eq!(rt.state.selected, 0);
     assert!(rt.find("titulo").is_some());
+}
+
+#[test]
+fn settings_navigation_works_at_both_widths_without_writing_user_files() {
+    for width in [440.0, 1100.0] {
+        let mut rt = runtime(fixtures::dashboard(0), (width, 720.0));
+        settle(&mut rt);
+        if width < 680.0 {
+            click(&mut rt, "disk-menu");
+        }
+        click(&mut rt, "settings-nav");
+        assert!(rt.state.settings_open);
+        click(&mut rt, "theme-light");
+        assert!(!rt.state.preferences.dark(true));
+        click(&mut rt, "motion-off");
+        assert!(rt.state.preferences.reduced(false));
+        click(&mut rt, "motion-on");
+        assert!(!rt.state.preferences.reduced(true));
+        if width < 680.0 {
+            click(&mut rt, "disk-menu");
+        }
+        click(&mut rt, &row_key("interface:nvme-0"));
+        assert!(!rt.state.settings_open);
+    }
 }

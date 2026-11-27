@@ -9,7 +9,7 @@ const sha = "1".repeat(40), older = "2".repeat(40), newer = "3".repeat(40);
 const digest = "sha256:" + "4".repeat(64);
 const contents = readFileSync(workflow, "utf8").replaceAll("\r\n", "\n");
 const blob = createHash("sha1").update("blob " + Buffer.byteLength(contents) + "\0" + contents).digest("hex");
-const names = assetPaths("", "chkdsk", "1.0.0", "stable", sha);
+const names = assetPaths("", "disksonar", "1.0.0", "stable", sha);
 const ref = (ref: string, sha: string) => ({ ref, sha, repo: {full_name: repository} });
 function fixture() {
   const pulls = [older, newer].map((s,i) => ({number: i+1, state:"open", draft:false, base:ref("main",sha), head:ref("feature"+i,s)}));
@@ -26,7 +26,7 @@ function fixture() {
       if (path === "branches/main" || path === "branches/dev") return {commit:{sha:state.branch}};
       if (path.startsWith("contents/channels/latest.json")) return {content:Buffer.from(JSON.stringify({tag:"v1.0.0",sha})).toString("base64")};
       if (path.startsWith("contents/" + workflow)) return {sha:state.workflowBlob};
-      if (path.startsWith("contents/Cargo.toml")) return {content:Buffer.from('[package]\nname="chkdsk"\nversion="1.0.0"').toString("base64")};
+      if (path.startsWith("contents/Cargo.toml")) return {content:Buffer.from('[package]\nname="disksonar"\nversion="1.0.0"').toString("base64")};
       if (path.startsWith("pulls/")) return pulls[Number(path.split("/")[1])-1];
       if (path.startsWith("releases/tags/")) return release;
       if (path.startsWith("commits/refs/tags/")) return {sha};

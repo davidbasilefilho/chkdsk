@@ -252,7 +252,7 @@ pub fn spawn(deliver: impl FnMut(Update) + Send + 'static) {
 }
 
 fn run(path: PathBuf, mut deliver: impl FnMut(Update)) {
-    let history = load_history(&path);
+    let history = load_initial_history(&path);
     let mut collector = Collector::new(history, spawn_history_writer(path));
     let (sender, receiver) = mpsc::channel();
     let mut next_discovery = Instant::now();
@@ -323,8 +323,20 @@ pub fn history_path() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("chkdsk")
+        .join("disksonar")
         .join("historico.json")
+}
+
+// The legacy snapshot remains intact. Only a genuinely absent destination can
+// inherit it. The writer commits future snapshots atomically at the new path.
+fn load_initial_history(path: &Path) -> History {
+    if let Err(error) = std::fs::metadata(path)
+        && error.kind() == std::io::ErrorKind::NotFound
+        && let Some(base) = path.parent().and_then(Path::parent)
+    {
+        return load_history(&base.join("chkdsk").join("historico.json"));
+    }
+    load_history(path)
 }
 
 fn load_history(path: &Path) -> History {
@@ -350,11 +362,11 @@ fn history_writer_loop(receiver: Receiver<History>, path: &Path) {
         while let Ok(next) = receiver.try_recv() {
             newest = next;
         }
-        let _ = write_history_snapshot(path, &newest);
+        let _ = write_snapshot(path, &newest);
     }
 }
 
-fn write_history_snapshot(path: &Path, history: &History) -> std::io::Result<()> {
+pub(crate) fn write_snapshot(path: &Path, history: &impl serde::Serialize) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -486,16 +498,48 @@ mod tests {
     }
 
     #[test]
+    fn migration_reads_legacy_only_until_the_new_history_exists() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "disksonar-migration-{}-{nonce}",
+            std::process::id()
+        ));
+        let old = base.join("chkdsk/historico.json");
+        let new = base.join("disksonar/historico.json");
+        let history = History {
+            version: 3,
+            samples: vec![],
+        };
+        write_snapshot(&old, &history).unwrap();
+        let bytes = std::fs::read(&old).unwrap();
+        assert_eq!(load_initial_history(&new).version, 3);
+        write_snapshot(
+            &new,
+            &History {
+                version: 4,
+                samples: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(load_initial_history(&new).version, 4);
+        assert_eq!(std::fs::read(&old).unwrap(), bytes);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn history_snapshots_are_serialized_atomic_and_end_at_the_newest_state() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "chkdsk-history-{}-{unique}.json",
+            "disksonar-history-{}-{unique}.json",
             std::process::id()
         ));
-        write_history_snapshot(
+        write_snapshot(
             &path,
             &History {
                 version: 0,

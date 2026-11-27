@@ -81,7 +81,7 @@ impl Card {
             .map(str::trim)
             .filter(|model| !model.is_empty());
         let kind = match identity.kind {
-            DiskKind::Hdd => "HD",
+            DiskKind::Hdd => crate::locale::tr("HD", "HDD"),
             DiskKind::Ssd => "SSD",
             DiskKind::Nvme => "NVMe",
             DiskKind::Unknown => crate::locale::tr("Tipo desconhecido", "Unknown type"),

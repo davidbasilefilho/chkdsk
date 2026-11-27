@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 
-const repo = "davidbasilefilho/chkdsk";
+const repo = "davidbasilefilho/disksonar";
 export function requireStableApproval() {
   const pointer = JSON.parse(readFileSync("channels/latest.json", "utf8"));
   const { STABLE_SHA: sha, STABLE_TAG: tag, GITHUB_SHA: workflowSha } = process.env;

@@ -73,7 +73,7 @@ function main([command, ...argv]: string[]) {
     if (process.env.STABLE_SHA !== sha || process.env.STABLE_TAG !== tag) throw Error("Stable arguments differ from dispatch approval");
     requireStableApproval();
   }
-  publishRelease(repo, tag, sha, dev, dev ? `Development build for commit ${sha.slice(0, 7)}.` : `Stable chkdsk release ${version}.`, files);
+  publishRelease(repo, tag, sha, dev, dev ? `Development build for commit ${sha.slice(0, 7)}.` : `Stable disksonar release ${version}.`, files);
 }
 
 try { main(process.argv.slice(2)); }

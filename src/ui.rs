@@ -65,6 +65,11 @@ impl Notice {
 }
 
 pub struct Dashboard {
+    pub preferences: crate::settings::Settings,
+    pub system_motion_off: Option<bool>,
+    pub preferences_path: Option<std::path::PathBuf>,
+    settings_open: bool,
+    save_failed: bool,
     pub cards: Vec<Card>,
     pub selected: usize,
     advanced: bool,
@@ -77,6 +82,11 @@ pub struct Dashboard {
 impl Default for Dashboard {
     fn default() -> Self {
         Self {
+            preferences: Default::default(),
+            system_motion_off: None,
+            preferences_path: None,
+            settings_open: false,
+            save_failed: false,
             cards: Vec::new(),
             selected: 0,
             advanced: false,
@@ -88,6 +98,10 @@ impl Default for Dashboard {
 }
 
 impl Dashboard {
+    pub fn show_settings(&mut self) {
+        self.settings_open = true;
+        self.menu_open = false;
+    }
     /// Take what the collector found. The selected disk stays selected while it
     /// is still there. True when something visible changed.
     pub fn apply(&mut self, update: Update, now: u64) -> bool {
@@ -148,6 +162,7 @@ impl Dashboard {
     }
 
     pub fn select(&mut self, index: usize, tx: &mut Tx) {
+        self.settings_open = false;
         if self.cards.is_empty() {
             return;
         }
@@ -191,11 +206,11 @@ pub fn on_key(state: &mut Dashboard, event: &KeyEvent, tx: &mut Tx) -> bool {
         }
         Key::Escape => tx.quit(),
         Key::Text(text) if plain && text == "q" => tx.quit(),
-        Key::Left if plain => state.step(false, tx),
-        Key::Right if plain => state.step(true, tx),
+        Key::Left if plain && !state.settings_open => state.step(false, tx),
+        Key::Right if plain && !state.settings_open => state.step(true, tx),
 
-        Key::Up => state.scroll_by(-SCROLL_STEP, tx),
-        Key::Down => state.scroll_by(SCROLL_STEP, tx),
+        Key::Up if !state.settings_open => state.scroll_by(-SCROLL_STEP, tx),
+        Key::Down if !state.settings_open => state.scroll_by(SCROLL_STEP, tx),
         Key::Text(text) if plain && text == "k" => state.scroll_by(-SCROLL_STEP, tx),
         Key::Text(text) if plain && text == "j" => state.scroll_by(SCROLL_STEP, tx),
         _ => return false,
@@ -252,9 +267,24 @@ impl Palette {
     }
 }
 
+// The title uses a fixed blue independent of disk status and OS accent.
+fn brand_ink(dark: bool) -> Color {
+    if dark {
+        oklch(0.82, 0.10, 245.0)
+    } else {
+        oklch(0.40, 0.12, 245.0)
+    }
+}
 pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
-    let palette = Palette::new(cx.system_dark(), cx.accent());
-    cx.reduced_motion(cx.system_reduced_motion());
+    let dark = state.preferences.dark(cx.system_dark());
+    let reduced = state.preferences.reduced(
+        state
+            .system_motion_off
+            .unwrap_or_else(|| cx.system_reduced_motion()),
+    );
+    let palette = Palette::new(dark, cx.accent());
+    cx.caption_color(palette.theme.text);
+    cx.reduced_motion(reduced);
     let compact = cx.layout_size("janela").is_some_and(|size| size[0] < 680.0);
     let menu = row()
         .key("disk-menu")
@@ -273,23 +303,28 @@ pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
             }
         })
         .child(text(crate::locale::tr("☰  Discos", "☰  Drives")).color(palette.theme.text));
-    let content = match state.cards.get(state.selected) {
-        Some(card) if compact => {
-            let panel = if state.menu_open {
-                sidebar(state, &palette)
-            } else {
-                detail(card, &palette, &state.scroll, state.advanced)
-            };
-            col().grow(1.0).min_h(0.0).child(menu).child(panel)
-        }
-        Some(card) => row()
+    let main = if state.settings_open {
+        settings_page(state, &palette)
+    } else if let Some(card) = state.cards.get(state.selected) {
+        detail(card, &palette, &state.scroll, state.advanced)
+    } else {
+        empty(state.notice, &palette)
+    };
+    let content = if compact {
+        let panel = if state.menu_open {
+            sidebar(state, &palette)
+        } else {
+            main
+        };
+        col().grow(1.0).min_h(0.0).child(menu).child(panel)
+    } else {
+        row()
             .grow(1.0)
             .min_h(0.0)
             .child(sidebar(state, &palette))
-            .child(detail(card, &palette, &state.scroll, state.advanced)),
-        None => empty(state.notice, &palette),
+            .child(main)
     };
-    let frame = if cx.system_reduced_motion() {
+    let frame = if reduced {
         col().instant_changes()
     } else {
         col()
@@ -306,7 +341,7 @@ pub fn view(state: &Dashboard, cx: &mut Cx<Dashboard>) -> El {
                 .center_y()
                 .pl(cx.chrome_insets().leading + 16.0)
                 .pr(cx.chrome_insets().trailing)
-                .child(text("chkdsk").font(BODY_STRONG).color(palette.theme.text)),
+                .child(text("disksonar").font(BODY_STRONG).color(brand_ink(dark))),
         )
         .child(content)
 }
@@ -325,12 +360,13 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
     let t = palette.theme;
     let mut list = col().gap(4.0).padding(8.0);
     for (index, card) in state.cards.iter().enumerate() {
-        let selected = index == state.selected;
-        let dot = rune::el()
-            .w(8.0)
-            .h(8.0)
-            .radius(4.0)
-            .fill(card.tone().map_or(t.control_off, |tone| palette.tone(tone)));
+        let selected = !state.settings_open && index == state.selected;
+        let dot = rune::el().w(8.0).h(8.0).radius(4.0).fill(
+            card.tone()
+                .map_or(brand_ink(palette.theme.bg == tok::theme(true).bg), |tone| {
+                    palette.tone(tone)
+                }),
+        );
         let marker = rune::el()
             .w(3.0)
             .h(16.0)
@@ -390,6 +426,26 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
                 .child(dot.self_start().mt(10.0)),
         );
     }
+    if state.cards.is_empty() && state.settings_open {
+        list = list.child(
+            row()
+                .key("dashboard-nav")
+                .role("button")
+                .focusable(true)
+                .label(crate::locale::tr("Discos", "Drives"))
+                .padding(12.0)
+                .on_press_tx(|s: &mut Dashboard, tx: &mut Tx| {
+                    s.settings_open = false;
+                    s.menu_open = false;
+                    tx.focus("settings-nav", true);
+                })
+                .child(
+                    text(crate::locale::tr("Discos", "Drives"))
+                        .font(BODY)
+                        .color(t.text),
+                ),
+        );
+    }
     let panel = col()
         .key("discos")
         .w(SIDEBAR_WIDTH)
@@ -401,11 +457,155 @@ fn sidebar(state: &Dashboard, palette: &Palette) -> El {
             })
             .grow(1.0)
             .min_h(0.0),
+        )
+        .child(
+            row()
+                .key("settings-nav")
+                .role("button")
+                .focusable(true)
+                .cursor(Cursor::Pointer)
+                .padding(12.0)
+                .label(crate::locale::tr("Configurações", "Settings"))
+                .on_press_tx(|s: &mut Dashboard, tx: &mut Tx| {
+                    s.show_settings();
+                    tx.focus("theme-system", true);
+                })
+                .child(
+                    text(crate::locale::tr("Configurações", "Settings"))
+                        .font(BODY_STRONG)
+                        .color(t.text),
+                ),
         );
     row()
         .h_full()
         .child(panel)
         .child(rune::el().w(1.0).h_full().fill(t.separator))
+}
+
+#[derive(Clone, Copy)]
+enum Choice {
+    Theme(crate::settings::Theme),
+    Motion(crate::settings::Motion),
+}
+fn settings_page(state: &Dashboard, palette: &Palette) -> El {
+    use crate::{
+        locale::tr,
+        settings::{Motion, Theme},
+    };
+    let t = palette.theme;
+    let option = |key: &'static str, label: &'static str, choice: Choice| {
+        let checked = match choice {
+            Choice::Theme(v) => state.preferences.theme == v,
+            Choice::Motion(v) => state.preferences.motion == v,
+        };
+        row()
+            .key(key)
+            .role("radio")
+            .checked(checked)
+            .label(label)
+            .focusable(true)
+            .cursor(Cursor::Pointer)
+            .px(12.0)
+            .py(8.0)
+            .radius(6.0)
+            .fill(if checked {
+                t.control_track
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(t.hover)
+            .on_press_tx(move |s: &mut Dashboard, tx: &mut Tx| {
+                match choice {
+                    Choice::Theme(v) => s.preferences.theme = v,
+                    Choice::Motion(v) => {
+                        s.preferences.motion = v;
+                        tx.settle();
+                    }
+                }
+                s.save_failed = s
+                    .preferences_path
+                    .as_deref()
+                    .is_some_and(|p| s.preferences.save(p).is_err());
+            })
+            .child(
+                text(label)
+                    .font(if checked { BODY_STRONG } else { BODY })
+                    .color(t.text),
+            )
+    };
+    let group = |label: &'static str| {
+        col()
+            .role("radiogroup")
+            .label(label)
+            .mt(16.0)
+            .gap(3.0)
+            .child(text(label).font(BODY_STRONG).color(t.text))
+    };
+    let mut page = col()
+        .key("settings-page")
+        .min_w(0.0)
+        .min_h(0.0)
+        .grow(1.0)
+        .radius(12.0)
+        .mr(8.0)
+        .mb(8.0)
+        .padding(18.0)
+        .fill(t.bg)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(
+            text(tr("Configurações", "Settings"))
+                .font(SUBTITLE)
+                .color(t.text),
+        )
+        .child(
+            group(tr("Tema", "Theme"))
+                .child(option(
+                    "theme-system",
+                    tr("Sistema", "System"),
+                    Choice::Theme(Theme::System),
+                ))
+                .child(option(
+                    "theme-light",
+                    tr("Claro", "Light"),
+                    Choice::Theme(Theme::Light),
+                ))
+                .child(option(
+                    "theme-dark",
+                    tr("Escuro", "Dark"),
+                    Choice::Theme(Theme::Dark),
+                )),
+        )
+        .child(
+            group(tr("Animações", "Animations"))
+                .child(option(
+                    "motion-system",
+                    tr("Sistema", "System"),
+                    Choice::Motion(Motion::System),
+                ))
+                .child(option(
+                    "motion-on",
+                    tr("Ativadas", "On"),
+                    Choice::Motion(Motion::On),
+                ))
+                .child(option(
+                    "motion-off",
+                    tr("Desativadas", "Off"),
+                    Choice::Motion(Motion::Off),
+                )),
+        );
+    if state.save_failed {
+        page = page.child(
+            text(tr(
+                "Não foi possível salvar as preferências.",
+                "Could not save preferences.",
+            ))
+            .font(BODY)
+            .color(t.text),
+        );
+    }
+    page
 }
 
 fn empty(notice: Notice, palette: &Palette) -> El {
@@ -510,13 +710,19 @@ fn health_body(page: El, health: &Health, palette: &Palette, advanced: bool) -> 
     };
 
     let fact = |key: &'static str, label: &'static str, value: &str, style: TextStyle| {
-        row()
+        col()
             .key(key)
-            .gap(16.0)
-            .child(text(label).font(BODY).color(t.text_secondary).w(144.0))
+            .w(220.0)
+            .grow(1.0)
+            .padding(12.0)
+            .gap(4.0)
+            .radius(8.0)
+            .fill(t.card)
+            .child(text(label).font(CAPTION).color(t.text_secondary))
             .child(text(value.to_owned()).font(style).color(t.text).wrap())
     };
-    let facts = col()
+    let facts = row()
+        .flex_wrap()
         .mt(32.0)
         .gap(12.0)
         .child(fact(

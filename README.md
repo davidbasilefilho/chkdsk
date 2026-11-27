@@ -1,8 +1,8 @@
-# chkdsk
+# disksonar
 
 Painel de saúde de discos para Windows, escrito em Rust, com uma janela nativa em português brasileiro ou inglês, conforme a ordem dos idiomas de exibição do Windows, desenhada com [rune](https://github.com/anomalyco/rune). Consulta telemetria SMART/Health, apresenta o estado informado pelo diagnóstico e mantém histórico local para tendências de desgaste. O aplicativo não depende de serviços externos durante a execução.
 
-> Este projeto não é o `chkdsk` do Windows. Não verifica nem repara sistemas de arquivos, não agenda reparos e não substitui `chkdsk.exe`; também não executa varredura de superfície. Para evitar conflito com a ferramenta do sistema, inicie o executável deste projeto pelo caminho completo.
+> O disksonar consulta a telemetria de saúde dos discos. Para verificar ou reparar sistemas de arquivos, use o utilitário de sistema do Windows.
 
 ## Executar
 
@@ -17,8 +17,12 @@ Quando uma consulta requer privilégios adicionais, o aplicativo oferece uma ten
 - A nota de 0 a 100 é determinística, mas não representa probabilidade de falha nem certificação do disco. Com evidência utilizável, notas acima de 50 são classificadas como saudáveis e notas até 50 como atenção; sem evidência utilizável, o estado é **Indisponível** e nenhuma nota é exibida.
 - Para NVMe, a heurística considera percentual de desgaste usado, reserva disponível e avisos críticos reportados pelo dispositivo; condições críticas aplicam limites máximos à nota. Não há padrão portátil confiável para interpretar universalmente atributos ATA brutos: eles podem ser exibidos, mas não afetam a nota sem mapeamento específico e verificado por modelo.
 - A ETA é uma extrapolação indicativa até 100% de desgaste usado, baseada no segmento atual de histórico desde a leitura mais antiga após o último reset/regressão do contador até a mais recente. Exige pelo menos 24 horas entre observações e aumento positivo de até dez pontos percentuais por dia; leituras iguais, regressivas ou dados insuficientes não estabelecem tendência. HDDs não recebem previsão. A ETA não prevê falhas nem garante vida útil.
-- O histórico fica em `%APPDATA%\chkdsk\historico.json` (ou na pasta temporária do usuário quando `%APPDATA%` não está definido). Mantém até 35 dias por disco: amostras por hora nos sete dias mais recentes e por dia antes disso. Uma regressão do contador de desgaste descarta o histórico anterior daquele disco para iniciar uma nova linha de base.
+- O histórico fica em `%APPDATA%\disksonar\historico.json` (ou na pasta temporária do usuário quando `%APPDATA%` não está definido). Na primeira execução sem histórico próprio, lê o histórico anterior de `%APPDATA%\chkdsk\historico.json` e salva as novas amostras em `disksonar`. O arquivo anterior é preservado. Mantém até 35 dias por disco: amostras por hora nos sete dias mais recentes e por dia antes disso. Uma regressão do contador de desgaste descarta o histórico anterior daquele disco para iniciar uma nova linha de base.
 - O aplicativo não altera discos e normalmente não precisa de privilégios elevados. Windows, driver, controlador ou adaptador USB podem bloquear consultas SMART; elevar privilégios não torna disponível uma telemetria que o dispositivo ou controlador não fornece.
+
+## Configurações
+
+Abra **Configurações** na barra lateral ou no menu da janela compacta. Tema aceita Sistema, Claro e Escuro. Animações aceita Sistema, Ativadas e Desativadas. As duas preferências começam em Sistema e ficam em `%APPDATA%\disksonar\settings.json`. As alterações se aplicam na janela aberta. O idioma acompanha a preferência de exibição do Windows.
 
 ## Controles
 
@@ -62,7 +66,7 @@ mise run release
 
 ## Releases
 
-Tags estáveis seguem exatamente `v{versão}` e não aceitam versão SemVer pré-lançamento. Builds de desenvolvimento usam `v{versão}-dev-{sha7}`. Cada pacote contém três executáveis independentes com o prefixo `chkdsk-{versão}[-dev-{sha7}]-` e um arquivo `SHA256SUMS.txt`.
+Tags estáveis seguem exatamente `v{versão}` e não aceitam versão SemVer pré-lançamento. Builds de desenvolvimento usam `v{versão}-dev-{sha7}`. Cada pacote contém três executáveis independentes com o prefixo `disksonar-{versão}[-dev-{sha7}]-` e um arquivo `SHA256SUMS.txt`.
 
 | Perfil | Executável (sufixo) | Requisitos |
 | --- | --- | --- |
@@ -85,7 +89,7 @@ mise run channel-install pr-13 x64
 mise run channel-install pr x64-baseline
 ```
 
-Cada comando verifica os três arquivos e o manifesto e registra **apenas a variante escolhida** como uma versão local do backend GitHub usando `mise link`. O comando imprime a linha `mise x github:davidbasilefilho/chkdsk@… -- chkdsk-dashboard.exe` com o identificador imutável. Acrescente `--version` para conferir. Para atualizar, rode novamente o instalador do canal. Para voltar, execute a linha de uma instalação anterior. O nome com a interface evita colisão com o utilitário de sistema. Consulte [mise link](https://mise.jdx.dev/cli/link.html) e a [API de artefatos do GitHub](https://docs.github.com/en/rest/actions/artifacts).
+Cada comando verifica os três arquivos e o manifesto e registra **apenas a variante escolhida** como uma versão local do backend GitHub usando `mise link`. O comando imprime a linha `mise x github:davidbasilefilho/disksonar@… -- disksonar.exe` com o identificador imutável. Acrescente `--version` para conferir. Para atualizar, rode novamente o instalador do canal. Para voltar, execute a linha de uma instalação anterior. Consulte [mise link](https://mise.jdx.dev/cli/link.html) e a [API de artefatos do GitHub](https://docs.github.com/en/rest/actions/artifacts).
 
 | Canal | Fonte verificada na instalação |
 | --- | --- |

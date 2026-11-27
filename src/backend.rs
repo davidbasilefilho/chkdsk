@@ -785,6 +785,29 @@ mod windows {
     }
 
     fn reliability(identity: &DiskIdentity) -> Option<crate::model::Reliability> {
+        use std::{
+            collections::HashMap,
+            sync::{Mutex, OnceLock},
+            time::{Duration, Instant},
+        };
+        type Entries = HashMap<String, (Instant, Option<crate::model::Reliability>)>;
+        static CACHE: OnceLock<Mutex<Entries>> = OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+        let retention = Duration::from_secs(120);
+        if let Ok(mut entries) = cache.lock() {
+            entries.retain(|_, (time, _)| time.elapsed() < retention);
+            if let Some((_, value)) = entries.get(&identity.id) {
+                return value.clone();
+            }
+        }
+        let value = read_reliability(identity);
+        if let Ok(mut entries) = cache.lock() {
+            entries.insert(identity.id.clone(), (Instant::now(), value.clone()));
+        }
+        value
+    }
+
+    fn read_reliability(identity: &DiskIdentity) -> Option<crate::model::Reliability> {
         use std::os::windows::ffi::OsStringExt;
         use std::{
             os::windows::process::CommandExt,
@@ -818,7 +841,7 @@ mod windows {
                 "-Command",
                 include_str!("reliability.ps1"),
             ])
-            .env("CHKDSK_DISK_INTERFACE", interface_path(identity)?)
+            .env("DISKSONAR_DISK_INTERFACE", interface_path(identity)?)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .stdout(Stdio::piped())

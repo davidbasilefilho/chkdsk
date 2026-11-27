@@ -1,7 +1,7 @@
 //! Fixture disks for headless captures and tests: one healthy NVMe with a
 //! lifetime estimate, one disk that needs attention, one whose health is
 //! unknown because the query was denied, one still loading and one that failed.
-//! `chkdsk --snap out.png --scene saudavel` renders them without a disk.
+//! `disksonar --snap out.png --scene saudavel` renders them without a disk.
 
 use crate::{
     collector::{DiskSnapshot, Reading, Update, ready_reading},
@@ -17,6 +17,10 @@ const DAY: u64 = 86_400;
 // Only the `scenes` feature puts it in the binary; tests build the same fixtures directly.
 #[cfg_attr(not(feature = "scenes"), allow(dead_code))]
 pub const SCENES: &[Scene] = &[
+    ("settings", |s| {
+        *s = dashboard(0);
+        s.show_settings();
+    }),
     ("macrovip", |s| *s = macrovip()),
     ("saudavel", |s| *s = dashboard(0)),
     ("atencao", |s| *s = dashboard(1)),

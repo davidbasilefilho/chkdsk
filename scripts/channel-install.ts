@@ -68,14 +68,14 @@ function install(args: string[]) {
     throw Error("Usage: mise run channel-install CHANNEL arm64|x64|x64-baseline");
   const selected = select(api, channel);
   const key = [selected.sha, selected.artifact?.id ?? selected.release, profile].join("-");
-  const store = join(process.env.LOCALAPPDATA ?? join(homedir(), ".local", "share"), "chkdsk", "packages");
+  const store = join(process.env.LOCALAPPDATA ?? join(homedir(), ".local", "share"), "disksonar", "packages");
   const target = join(store, key);
-  const temp = mkdtempSync(join(tmpdir(), "chkdsk-download-"));
+  const temp = mkdtempSync(join(tmpdir(), "disksonar-download-"));
   try {
     download(selected, temp);
     const name = selected.names.find(n => n.endsWith("-windows-" + profile + ".exe"))!;
     const source = join(temp, name);
-    const binName = "chkdsk-dashboard.exe";
+    const binName = "disksonar.exe";
     mkdirSync(store, { recursive: true });
     const staging = mkdtempSync(join(store, ".install-"));
     try {

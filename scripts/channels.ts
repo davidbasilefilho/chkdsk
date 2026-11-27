@@ -4,7 +4,7 @@ import { basename, join } from "node:path";
 import { assetPaths } from "./assets";
 import { root } from "./windows";
 
-export const repository = "davidbasilefilho/chkdsk";
+export const repository = "davidbasilefilho/disksonar";
 export const workflow = ".github/workflows/validation.yml";
 const requiredJobs = ["validation", "distribution", "smoke (windows-2022, x64,x64-baseline)", "smoke (windows-11-arm, arm64)"];
 export interface Api {
@@ -72,8 +72,8 @@ function preview(api: Api, channel: string, sha: string, branch: string, pull?: 
     && a.workflow_run.repository_id === a.workflow_run.head_repository_id
     && Date.parse(a.created_at) >= Date.parse(run.run_started_at), "Unverified or expired artifact");
   const pkg = (Bun.TOML.parse(textAt(api, "Cargo.toml", sha)) as {package: {name: string; version: string}}).package;
-  requireChannel(pkg.name === "chkdsk" && /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(pkg.version), "Unexpected package identity");
-  return { channel, sha, names: assetPaths("", "chkdsk", pkg.version, "dev", sha).map(f => basename(f)),
+  requireChannel(pkg.name === "disksonar" && /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(pkg.version), "Unexpected package identity");
+  return { channel, sha, names: assetPaths("", "disksonar", pkg.version, "dev", sha).map(f => basename(f)),
     artifact: { id: a.id, digest: a.digest, run: run.id } };
 }
 
@@ -91,7 +91,7 @@ export function select(api: Api, channel: string): Selection {
     requireChannel(!release.draft && !release.prerelease && release.tag_name === tag && release.target_commitish === sha
       && api.get<{sha: string}>("commits/refs/tags/" + tag).sha === sha
       && ["ahead", "identical"].includes(api.get<{status: string}>("compare/" + sha + "..." + main).status), "Stable source mismatch");
-    const names = assetPaths("", "chkdsk", tag.slice(1), "stable", sha).map(f => basename(f));
+    const names = assetPaths("", "disksonar", tag.slice(1), "stable", sha).map(f => basename(f));
     requireChannel(release.assets.length === names.length && names.every(n =>
       release.assets.filter(a => a.name === n && a.state === "uploaded" && sha256.test(a.digest)).length === 1),
       "Approved stable release has no verified three-executable distribution");

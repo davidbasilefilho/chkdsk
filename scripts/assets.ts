@@ -50,7 +50,7 @@ export function verifyAssets(dir: string, files: string[]) {
       throw Error("expected " + profile + " PE header: " + basename(files[index]));
     if (data.readUInt16LE(offset + 24) !== 0x20b || data.readUInt16LE(offset + 92) !== 2)
       throw Error("unexpected PE subsystem for " + basename(files[index]));
-    const stamps = profiles.filter(p => data.includes(Buffer.from("chkdsk-cpu:" + p + ";")));
+    const stamps = profiles.filter(p => data.includes(Buffer.from("disksonar-cpu:" + p + ";")));
     if (stamps.length !== 1 || stamps[0] !== profile) throw Error("incorrect compiled CPU profile: " + basename(files[index]));
     const hash = digest(files[index]);
     if (seen.has(hash)) throw Error("duplicate executable: " + basename(files[index]));

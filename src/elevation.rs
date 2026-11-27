@@ -16,7 +16,8 @@ use windows_sys::Win32::{
     UI::{
         Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
         WindowsAndMessaging::{
-            EnumWindows, GetWindowThreadProcessId, IsWindowVisible, SW_SHOWNORMAL,
+            EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+            SW_SHOWNORMAL,
         },
     },
 };
@@ -61,13 +62,24 @@ unsafe extern "system" fn find_window(hwnd: HWND, data: LPARAM) -> i32 {
         GetWindowThreadProcessId(hwnd, &mut pid);
     }
     if pid == search.pid && unsafe { IsWindowVisible(hwnd) } != 0 {
-        search.found = true;
-        return 0;
+        let mut title = [0u16; 64];
+        let mut class = [0u16; 64];
+        let title_len =
+            unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) } as usize;
+        let class_len =
+            unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) } as usize;
+        if String::from_utf16_lossy(&title[..title_len]) == super::TITLE
+            && class_len > 0
+            && String::from_utf16_lossy(&class[..class_len]) != "#32770"
+        {
+            search.found = true;
+            return 0;
+        }
     }
     1
 }
 
-pub fn relaunch(selection: u64, theme: Option<&str>) -> bool {
+pub fn relaunch(selection: u64, arguments: &str) -> bool {
     if elevated() != Some(false) {
         return false;
     }
@@ -76,11 +88,7 @@ pub fn relaunch(selection: u64, theme: Option<&str>) -> bool {
     };
     let file: Vec<_> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
     let verb: Vec<_> = "runas".encode_utf16().chain(Some(0)).collect();
-    let mut args = format!("--resume-drive={selection:016x}");
-    if let Some(theme @ ("dark" | "light" | "system")) = theme {
-        args.push_str(" --theme ");
-        args.push_str(theme);
-    }
+    let args = format!("--resume-drive={selection:016x} {arguments}");
     let params: Vec<_> = args.encode_utf16().chain(Some(0)).collect();
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,

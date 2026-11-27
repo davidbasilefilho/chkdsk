@@ -11,13 +11,13 @@ const tag = "v1.2.3-dev-abcdef0";
 let dir: string, files: string[];
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "chkdsk-test-"));
-  files = assetPaths(dir, "chkdsk", "1.2.3", "dev", sha);
+  dir = mkdtempSync(join(tmpdir(), "disksonar-test-"));
+  files = assetPaths(dir, "disksonar", "1.2.3", "dev", sha);
   for (const [index, profile] of profiles.entries()) {
     const pe = Buffer.alloc(256);
     pe.write("MZ"); pe.writeUInt32LE(64, 60); pe.write("PE", 64); pe.writeUInt16LE(profile === "arm64" ? 0xaa64 : 0x8664, 68);
     pe.writeUInt16LE(0x20b, 88); pe.writeUInt16LE(2, 156);
-    pe.write("chkdsk-cpu:" + profile + ";", 180);
+    pe.write("disksonar-cpu:" + profile + ";", 180);
     writeFileSync(files[index], pe);
   }
   writeFileSync(files[profiles.length], checksums(files));
@@ -50,8 +50,8 @@ test("tags, filenames, SHA and SemVer", () => {
   expect(() => tagFor("dev", "1.2.3+meta", sha)).toThrow();
   expect(() => tagFor("dev", "1.2.3", "no-sha")).toThrow();
   for (const mode of ["dev", "stable"] as const) {
-    const prefix = mode === "dev" ? "chkdsk-1.2.3-dev-abcdef0" : "chkdsk-1.2.3";
-    expect(assetPaths(dir, "chkdsk", "1.2.3", mode, sha).map(file => basename(file))).toEqual([
+    const prefix = mode === "dev" ? "disksonar-1.2.3-dev-abcdef0" : "disksonar-1.2.3";
+    expect(assetPaths(dir, "disksonar", "1.2.3", mode, sha).map(file => basename(file))).toEqual([
       ...["windows-arm64", "windows-x64", "windows-x64-baseline"].map(suffix => prefix + "-" + suffix + ".exe"),
       "SHA256SUMS.txt",
     ]);
